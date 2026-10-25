@@ -8,18 +8,36 @@ struct ContentView: View {
     @StateObject private var detection = DetectionViewModel()
     @StateObject private var history = HistoryViewModel()
     @StateObject private var settings = SettingsViewModel()
+    @State private var selectedTab: Int = 0
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             detectionTab
                 .tabItem { Label("检测", systemImage: "shield.checkered") }
+                .tag(0)
             historyTab
                 .tabItem { Label("历史", systemImage: "clock.arrow.circlepath") }
+                .tag(1)
             settingsTab
                 .tabItem { Label("设置", systemImage: "gearshape") }
+                .tag(2)
         }
         .onAppear {
             detection.startIfNeeded()
+            history.reload()
+            #if DEBUG
+            // 冒烟测试入口：`simctl launch <udid> <bundle-id> --auto-detect`
+            // 会在启动后自动跑一次检测，用于验证“检测 → 保存 → 历史”链路。
+            if ProcessInfo.processInfo.arguments.contains("--auto-detect") {
+                detection.detect(config: settings.currentConfig())
+            }
+            if ProcessInfo.processInfo.arguments.contains("--show-history") {
+                selectedTab = 1
+            }
+            #endif
+        }
+        // 检测完成后会自动保存；保存成功即刷新历史列表。
+        .onChange(of: detection.lastSavedPath) { _ in
             history.reload()
         }
     }
@@ -49,13 +67,27 @@ struct ContentView: View {
                 .buttonStyle(ReportActionButtonStyle(prominent: true))
                 .disabled(detection.isDetecting)
                 if detection.lastDTO != nil {
-                    Button("保存报告") {
-                        if detection.save(config: settings.currentConfig()) != nil {
-                            history.reload()
+                    if detection.lastSavedPath != nil {
+                        Label("已保存到历史记录", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    } else if detection.saveError == nil {
+                        // 自动保存失败前，保留手动重试入口。
+                        Button("保存报告") {
+                            _ = detection.save(config: settings.currentConfig())
                         }
+                        .buttonStyle(ReportActionButtonStyle(prominent: false))
+                        .disabled(detection.isDetecting)
                     }
-                    .buttonStyle(ReportActionButtonStyle(prominent: false))
-                    .disabled(detection.isDetecting)
+                }
+                if let saveError = detection.saveError {
+                    VStack(spacing: 8) {
+                        Text(saveError).font(.caption).foregroundColor(.red)
+                        Button("重试保存") {
+                            _ = detection.save(config: settings.currentConfig())
+                        }
+                        .buttonStyle(ReportActionButtonStyle(prominent: false))
+                    }
                 }
                 Spacer()
             }
@@ -128,7 +160,7 @@ struct ContentView: View {
                 }
             }
             .onAppear { history.reload() }
-            .sheet(isPresented: $history.showDetail) {
+            .sheet(isPresented: $history.showDetail, onDismiss: { history.dismissDetail() }) {
                 if let dto = history.selectedDTO {
                     ScrollView {
                         resultView(dto: dto).padding()

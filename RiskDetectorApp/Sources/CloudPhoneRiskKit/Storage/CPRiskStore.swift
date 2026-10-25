@@ -138,8 +138,11 @@ public final class CPRiskStore: NSObject {
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         )
+        // 只统计报告文件：每份报告旁边还有一个 `.meta.json` 摘要缓存，
+        // 若把它也算进 maxFiles，实际只能保留一半数量的报告。
+        let reportItems = items.filter { !$0.lastPathComponent.hasSuffix(".meta.json") }
         // 先按修改时间升序排序，前缀即为最旧的文件。
-        let sorted = try items.sorted { a, b in
+        let sorted = try reportItems.sorted { a, b in
             let ad = (try a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let bd = (try b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return ad < bd
@@ -148,6 +151,10 @@ public final class CPRiskStore: NSObject {
         for url in sorted.prefix(sorted.count - maxFiles) {
             do {
                 try fm.removeItem(at: url)
+                // 同步清理摘要缓存（约定路径为 `<report>.meta.json`），
+                // 避免留下指向已删除报告的孤儿 meta。
+                let metaURL = URL(fileURLWithPath: url.path + ".meta.json")
+                try? fm.removeItem(at: metaURL)
             } catch {
                 Logger.log("store.retention: failed to remove \(url.lastPathComponent) error=\(error.localizedDescription)")
             }

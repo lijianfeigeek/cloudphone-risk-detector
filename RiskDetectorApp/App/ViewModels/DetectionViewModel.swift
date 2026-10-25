@@ -55,6 +55,10 @@ public class DetectionViewModel: ObservableObject {
     @Published public var state: DetectionState = .idle
     @Published public var lastDTO: RiskReportDTO?
     @Published public var showResults: Bool = false
+    /// 本次检测自动保存后的报告路径；nil 表示尚未保存或保存失败。
+    @Published public var lastSavedPath: String?
+    /// 保存失败原因（成功后为 nil），供界面展示。
+    @Published public var saveError: String?
 
     // MARK: - Derived (UI convenience)
     public var riskLevel: RiskLevel? {
@@ -86,15 +90,20 @@ public class DetectionViewModel: ObservableObject {
     /// - Parameter config: 检测配置（来自 SettingsViewModel）
     public func detect(config: RiskAppConfig? = nil) {
         state = .detecting
+        lastSavedPath = nil
+        saveError = nil
 
         #if canImport(CloudPhoneRiskAppCore)
         let cfg = config ?? .default
         RiskDetectionService.shared.evaluateAsync(config: cfg) { [weak self] report in
             DispatchQueue.main.async {
-                self?.lastReport = report
-                self?.lastDTO = RiskReportMapper.dto(from: report)
-                self?.state = .completed
-                self?.showResults = true
+                guard let self else { return }
+                self.lastReport = report
+                self.lastDTO = RiskReportMapper.dto(from: report)
+                self.state = .completed
+                self.showResults = true
+                // 检测完成后自动入库，历史页无需用户再点一次“保存”。
+                self.save(config: cfg)
             }
         }
         #else
@@ -111,11 +120,20 @@ public class DetectionViewModel: ObservableObject {
     @discardableResult
     public func save(config: RiskAppConfig? = nil) -> String? {
         #if canImport(CloudPhoneRiskAppCore)
-        guard let report = lastReport, let dto = lastDTO else { return nil }
+        guard let report = lastReport, let dto = lastDTO else {
+            saveError = "没有可保存的检测结果"
+            return nil
+        }
         let cfg = config ?? .default
-        guard let path = RiskDetectionService.shared.save(report: report, config: cfg) else { return nil }
+        guard let path = RiskDetectionService.shared.save(report: report, config: cfg) else {
+            lastSavedPath = nil
+            saveError = "报告保存失败（加密密钥不可用或磁盘写入失败）"
+            return nil
+        }
         // Write meta for fast History loading
         RiskReportSummaryIO.writeMeta(for: dto, reportPath: path)
+        lastSavedPath = path
+        saveError = nil
         return path
         #else
         return nil
@@ -127,6 +145,8 @@ public class DetectionViewModel: ObservableObject {
         state = .idle
         lastDTO = nil
         showResults = false
+        lastSavedPath = nil
+        saveError = nil
         #if canImport(CloudPhoneRiskAppCore)
         lastReport = nil
         #endif

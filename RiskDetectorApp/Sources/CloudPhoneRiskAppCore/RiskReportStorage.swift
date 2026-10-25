@@ -25,13 +25,51 @@ public enum RiskReportStorage {
     cachesDirectories: [URL],
     temporaryDirectory: URL
   ) -> URL {
+    // 必须与 CPRiskStore 使用同一个目录前缀：
+    //   保存侧：Application Support/CloudPhoneRiskKit/reports
+    //   读取侧：Application Support/CloudPhoneRiskKit/reports
+    // 否则报告写成功后，历史列表仍然为空。
     if let applicationSupportDirectory = applicationSupportDirectories.first {
-      return applicationSupportDirectory
+      return applicationSupportDirectory.appendingPathComponent(
+        "CloudPhoneRiskKit", isDirectory: true)
     }
     if let cachesDirectory = cachesDirectories.first {
       return cachesDirectory.appendingPathComponent("CloudPhoneRiskKit", isDirectory: true)
     }
     return temporaryDirectory.appendingPathComponent("CloudPhoneRiskKit", isDirectory: true)
+  }
+
+  /// 旧版本（修复前）把报告写在 `Application Support/reports`，
+  /// 与新目录 `Application Support/CloudPhoneRiskKit/reports` 不一致。
+  /// 列表时同时扫描旧目录，避免升级后用户看到“历史记录消失”。
+  private static func legacyReportsDirectoryURL() -> URL? {
+    guard
+      let applicationSupportDirectory = FileManager.default.urls(
+        for: .applicationSupportDirectory, in: .userDomainMask
+      ).first
+    else { return nil }
+    return applicationSupportDirectory.appendingPathComponent("reports", isDirectory: true)
+  }
+
+  /// 返回需要扫描的报告目录（主目录 + 旧目录，去重）。
+  private static func reportDirectories() -> [URL] {
+    #if DEBUG
+      // 测试注入目录时只扫描注入目录，避免读到本机真实报告。
+      if testBaseDirectoryOverride != nil {
+        return (try? reportsDirectoryURL()).map { [$0] } ?? []
+      }
+    #endif
+
+    var directories: [URL] = []
+    if let primary = try? reportsDirectoryURL() {
+      directories.append(primary)
+    }
+    if let legacy = legacyReportsDirectoryURL(),
+      !directories.contains(where: { $0.standardizedFileURL == legacy.standardizedFileURL })
+    {
+      directories.append(legacy)
+    }
+    return directories
   }
 
   public static func reportsDirectoryURL() throws -> URL {
@@ -52,8 +90,19 @@ public enum RiskReportStorage {
   }
 
   public static func list() -> [StoredRiskReport] {
-    guard let dir = try? reportsDirectoryURL() else { return [] }
-    return list(in: dir)
+    var seen = Set<String>()
+    var merged: [StoredRiskReport] = []
+    for dir in reportDirectories() {
+      for report in list(in: dir) where seen.insert(report.path).inserted {
+        merged.append(report)
+      }
+    }
+    // 多个目录合并后重新按修改时间倒序，保证最近保存的排在最前。
+    return merged.sorted { (a, b) in
+      let ad = a.modifiedAt ?? .distantPast
+      let bd = b.modifiedAt ?? .distantPast
+      return ad > bd
+    }
   }
 
   public static func list(in dir: URL) -> [StoredRiskReport] {
@@ -107,23 +156,25 @@ public enum RiskReportStorage {
   }
 
   public static func listSummaries() -> [(report: StoredRiskReport, summary: RiskReportSummary?)] {
-    guard let dir = try? reportsDirectoryURL() else { return [] }
-    return listSummaries(in: dir)
+    list().map { summary(for: $0) }
   }
 
   public static func listSummaries(in dir: URL) -> [(
     report: StoredRiskReport, summary: RiskReportSummary?
   )] {
-    let reports = list(in: dir)
-    return reports.map { r in
-      if let meta = RiskReportSummaryIO.readMeta(reportPath: r.path) {
-        return (r, meta)
-      }
-      guard let dto = loadDTO(atPath: r.path) else { return (r, nil) }
-      RiskReportSummaryIO.writeMeta(for: dto, reportPath: r.path)
-      let summary = RiskReportSummaryIO.readMeta(reportPath: r.path)
-      return (r, summary)
+    list(in: dir).map { summary(for: $0) }
+  }
+
+  /// 读取单份报告的摘要：优先用 `meta.json`，缺失时解密报告并补写缓存。
+  private static func summary(for report: StoredRiskReport) -> (
+    report: StoredRiskReport, summary: RiskReportSummary?
+  ) {
+    if let meta = RiskReportSummaryIO.readMeta(reportPath: report.path) {
+      return (report, meta)
     }
+    guard let dto = loadDTO(atPath: report.path) else { return (report, nil) }
+    RiskReportSummaryIO.writeMeta(for: dto, reportPath: report.path)
+    return (report, RiskReportSummaryIO.readMeta(reportPath: report.path))
   }
 
   public static func delete(atPath path: String) -> Bool {
