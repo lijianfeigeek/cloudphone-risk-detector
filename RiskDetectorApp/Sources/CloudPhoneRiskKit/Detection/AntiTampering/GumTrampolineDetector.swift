@@ -1,3 +1,7 @@
+// GumTrampolineDetector：识别 ARM64 上 Frida Gum Interceptor 的 inline hook 跳板。
+// 通过 dlsym 解析高价值系统函数，读取入口前 4 条指令，匹配 LDR+BR、ADRP+ADD+BR、
+// 长距离 B 等跳板模式，并跟踪跳转目标是否落在匿名可执行内存。
+// 与 FunctionIntegrityHashDetector 互补：后者看字节是否变化，本检测器看变化成了什么。
 import CRiskCore
 import Darwin
 import Foundation
@@ -13,23 +17,30 @@ import Foundation
 // anonymous memory (a strong indicator of Frida's trampoline pages).
 
 // ARM64 instruction encodings for known hook patterns
+// 常见 ARM64 hook 跳板指令编码（32 位小端机器码）。
 private enum HookPattern {
     // LDR X16, #8  (literal load of 8 bytes forward into X16)
+    // LDR X16, #8：把紧跟在 BR 之后的 8 字节地址字面量装入 X16。
     static let ldrX16: UInt32 = 0x58000050
 
     // BR X16  (branch to register X16)
+    // BR X16：跳转到 X16，Frida 短跳板的标准结尾。
     static let brX16: UInt32 = 0xD61F0200
 
     // BR X17
+    // BR X17：ADRP+ADD 风格跳板的结尾。
     static let brX17: UInt32 = 0xD61F0220
 
     // RET
+    // RET：正常函数返回指令。
     static let ret: UInt32 = 0xD65F03C0
 
     // NOP
+    // NOP：部分变体在跳板前后填充 NOP。
     static let nop: UInt32 = 0xD503201F
 
     // STP X29, X30, [SP, #-16]!  (typical frame setup — Frida trampoline prologue)
+    // STP X29, X30, [SP, #-16]!：典型函数序言。
     static let stpX29X30Neg16: UInt32 = 0xA9BF7BFD
 
     // STP X29, X30, [SP, #-32]!
@@ -52,6 +63,7 @@ private enum HookPattern {
 }
 
 /// Result of checking a single symbol's prologue for trampoline hooks.
+/// 单个符号的跳板检查结果。
 private struct TrampolineCheckResult {
     let symbolName: String
     let isHooked: Bool
@@ -70,9 +82,13 @@ private struct TrampolineCheckResult {
 /// 3. Checks for known inline hook patterns (LDR X16, BR X16, etc.)
 /// 4. Follows branch targets and checks if they land in anonymous memory
 /// 5. Detects hook chains (multiple functions hooked to the same region)
+/// Frida Gum 跳板检测器。
+/// - 线程模型：同步读取目标函数前 16 字节并解析跳转目标。
+/// - 失败语义：符号无法解析/读取失败/归属校验失败均按未命中处理。
 struct GumTrampolineDetector: Detector {
 
     /// System critical functions frequently targeted by Frida Interceptor.
+    // 高危符号及其所属库；这些函数常被 hook 以监控/篡改 SDK 行为。
     private static let criticalSymbols: [(name: String, library: String)] = [
         // Process/thread
         ("pthread_create", "/usr/lib/system/libsystem_pthread.dylib"),
@@ -115,8 +131,10 @@ struct GumTrampolineDetector: Detector {
     ]
 
     /// Number of 32-bit instructions to read from each function prologue.
+    // 读取 4 条指令（16 字节），足以覆盖常见跳板序列。
     private static let instructionCount = 4
 
+    /// 入口：模拟器直接返回 0，真机进入 `detectKernel()`。
     @inline(never)
     func detect() throws -> DetectorResult {
 #if targetEnvironment(simulator)
@@ -127,11 +145,13 @@ struct GumTrampolineDetector: Detector {
     }
 
     /// Keep the VMP-targeted `detect()` entry narrow and stable in optimized builds.
+    /// 逐个检查关键符号，累计跳板分数并识别 hook 链。
     @inline(never)
     private func detectKernel() -> DetectorResult {
         var totalScore: Double = 0
         var methods: [String] = []
         var hookedSymbols: [TrampolineCheckResult] = []
+        // 记录跳转目标及出现次数，用于识别多个函数指向同一匿名区域。
         var branchTargets: [UnsafeRawPointer: Int] = [:]  // target -> count for chain detection
 
         for symbol in Self.criticalSymbols {
@@ -147,6 +167,7 @@ struct GumTrampolineDetector: Detector {
             }
         }
 
+        // hook 链：同一目标被 >=2 个函数跳转，通常是 Frida 的 trampoline 页。
         // Bonus: hook chain detection — multiple functions pointing to same anonymous region
         let chainCount = branchTargets.values.filter { $0 >= 2 }.count
         if chainCount > 0 {
@@ -155,13 +176,16 @@ struct GumTrampolineDetector: Detector {
         }
 
         // Cap the total score
+        // 总分封顶 90。
         return DetectorResult(score: min(totalScore, 90), methods: methods)
     }
 
     // MARK: - Per-Symbol Trampoline Check
 
+    /// 检查单个符号的 prologue 是否为已知跳板。
     private func checkSymbolTrampoline(_ name: String, library: String) -> TrampolineCheckResult {
         // Resolve symbol address via dlsym
+        // RTLD_NOLOAD：只查已加载库，不触发额外加载。
         guard let handle = dlopen(library, RTLD_LAZY | RTLD_NOLOAD),
               let symPtr = dlsym(handle, name) else {
             return TrampolineCheckResult(
@@ -175,6 +199,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         // Verify the address actually belongs to the expected library via dladdr
+        // dladdr 校验符号地址确实属于预期库，降低符号被替换的误判。
         var info = Dl_info()
         guard dladdr(symPtr, &info) != 0 else {
             return TrampolineCheckResult(
@@ -188,6 +213,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         // Read first N instructions
+        // 读取函数入口的前 N 条指令。
         let instructions = readInstructions(at: symPtr, count: Self.instructionCount)
         guard !instructions.isEmpty else {
             return TrampolineCheckResult(
@@ -209,6 +235,7 @@ struct GumTrampolineDetector: Detector {
             var targetIsAnon = false
 
             if let target = target {
+                // 目标位于已知镜像内且非匿名 -> 可能是正常长跳转，降低置信。
                 targetIsAnon = isAddressInAnonymousMemory(target)
 
                 // Extra: verify the target is not in a known system image
@@ -227,6 +254,7 @@ struct GumTrampolineDetector: Detector {
             }
 
             // Score: base + anonymous memory bonus
+            // 基础 8 分；跳转目标在匿名内存时提升到 12 分。
             var score = 8.0
             if targetIsAnon {
                 score = 12.0
@@ -256,15 +284,18 @@ struct GumTrampolineDetector: Detector {
 
     /// Checks if the instruction sequence matches a known Frida hook trampoline pattern.
     /// Returns (isHooked, patternName).
+    /// 匹配已知跳板指令序列，返回 (是否命中, 模式名)。
     private func isKnownHookPattern(_ instructions: [UInt32]) -> (Bool, String) {
         guard instructions.count >= 2 else { return (false, "too_short") }
 
         // Pattern 1: LDR X16, #8; BR X16  (standard Frida Gum short trampoline)
+        // 模式 1：LDR X16, #8; BR X16，Frida 标准短跳板。
         if instructions[0] == HookPattern.ldrX16 && instructions[1] == HookPattern.brX16 {
             return (true, "ldr_x16_br_x16")
         }
 
         // Pattern 2: ADRP X17, ...; ADD X17, X17, ...; BR X17  (Dobby/Substrate style)
+        // 模式 2：ADRP X17; ADD X17, X17; BR X17，Dobby/Substrate 风格。
         if instructions.count >= 3 {
             let isAdrpAddBr =
                 (instructions[0] & HookPattern.adrpMask) == HookPattern.adrpValue &&
@@ -276,6 +307,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         // Pattern 3: B <offset> (unconditional relative branch to trampoline)
+        // 模式 3：B <offset> 无条件相对跳转。
         if (instructions[0] & HookPattern.bMask) == HookPattern.bValue {
             // Verify it is not a branch to a nearby location within the function
             // (which could be a normal function prologue). Frida's trampoline
@@ -283,6 +315,7 @@ struct GumTrampolineDetector: Detector {
             let imm26 = instructions[0] & 0x03FFFFFF
             let signExtended = signExtend(imm26, bits: 26)
             // If the branch offset is > 1MB, it's very likely a hook trampoline
+            // 跳转距离超过 1MB 才视为 hook；近距离分支可能是正常函数序言。
             if abs(signExtended) > 0x100000 {
                 return (true, "b_long_range")
             }
@@ -291,6 +324,7 @@ struct GumTrampolineDetector: Detector {
         // Pattern 4: LDR X16, #8; BR X16 with NOP padding
         // Some Frida variants insert NOPs before or after
         if instructions.count >= 3 {
+            // 模式 4：NOP 填充后的 LDR+BR。
             if instructions[0] == HookPattern.nop && instructions[1] == HookPattern.ldrX16 && instructions[2] == HookPattern.brX16 {
                 return (true, "nop_ldr_x16_br_x16")
             }
@@ -312,10 +346,12 @@ struct GumTrampolineDetector: Detector {
     // MARK: - Branch Target Resolution
 
     /// Resolves the target address of a branch trampoline from the instruction sequence.
+    /// 从跳板指令序列解析出跳转目标地址。
     private func resolveBranchTarget(_ instructions: [UInt32], base: UnsafeRawPointer) -> UnsafeRawPointer? {
         guard instructions.count >= 2 else { return nil }
 
         // LDR X16, #8; BR X16 pattern — target is embedded as a literal after the BR
+        // LDR X16, #8; BR X16：地址字面量位于 BR 之后偏移 8 处。
         if instructions[0] == HookPattern.ldrX16 && instructions[1] == HookPattern.brX16 {
             // The 8-byte address literal starts at offset 8 (after LDR + BR)
             let addrPtr = base.advanced(by: 8).assumingMemoryBound(to: UInt64.self)
@@ -324,6 +360,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         // ADRP+ADD+BR X17 pattern
+        // ADRP+ADD+BR X17：解码 ADRP 页偏移与 ADD 立即数。
         if instructions.count >= 3 &&
            (instructions[0] & HookPattern.adrpMask) == HookPattern.adrpValue &&
            (instructions[1] & HookPattern.addMask) == HookPattern.addX17Value &&
@@ -347,6 +384,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         // B (unconditional branch) — PC-relative
+        // B：PC 相对偏移，左移 2 位得到字节偏移。
         if (instructions[0] & HookPattern.bMask) == HookPattern.bValue {
             let imm26 = instructions[0] & 0x03FFFFFF
             let offset = signExtend(imm26, bits: 26) << 2
@@ -361,20 +399,24 @@ struct GumTrampolineDetector: Detector {
     // MARK: - Memory Checks
 
     /// Checks whether the given address resides in anonymous memory (not backed by any image).
+    /// 判断地址是否位于匿名内存（不属于任何镜像）。
     private func isAddressInAnonymousMemory(_ addr: UnsafeRawPointer) -> Bool {
         // First check: cprisk_addr_in_any_image covers dyld_all_image_infos
+        // 第一层：cprisk_addr_in_any_image，抗 dladdr hook。
         let inImage = cprisk_addr_in_any_image(addr) != 0
         if inImage {
             return false
         }
 
         // Second check: dladdr as additional verification
+        // 第二层：dladdr 可解析出镜像名则不是匿名内存。
         var info = Dl_info()
         if dladdr(addr, &info) != 0 && info.dli_fname != nil {
             // Address resolves to a known image — not anonymous
             return false
         }
 
+        // 第三层：vm_region 查看共享模式。
         // Third check: vm_region to see if the region is truly anonymous
         var targetAddr = vm_address_t(UInt(bitPattern: addr))
         var size: vm_size_t = 0
@@ -423,6 +465,7 @@ struct GumTrampolineDetector: Detector {
         }
 
         if extResult == KERN_SUCCESS {
+            // share mode 0/1/3（COW/PRIVATE 等）且无文件映射，视为匿名。
             // Share mode 0 (SM_COW) or 1 (SM_PRIVATE) with no mapped file = anonymous
             let shareMode = UInt32(extInfo.share_mode)
             if shareMode == 0 || shareMode == 1 || shareMode == 3 {
@@ -430,6 +473,7 @@ struct GumTrampolineDetector: Detector {
             }
         }
 
+        // 回退：既不在镜像内也无法被 dladdr 解析，按匿名处理。
         // Fallback: not in any image + not resolved by dladdr = likely anonymous
         return true
     }
@@ -437,6 +481,7 @@ struct GumTrampolineDetector: Detector {
     // MARK: - Helpers
 
     /// Reads `count` 32-bit ARM64 instructions from the given address.
+    /// 从目标地址读取指定数量的 32 位指令。
     private func readInstructions(at ptr: UnsafeRawPointer, count: Int) -> [UInt32] {
         var instructions: [UInt32] = []
         instructions.reserveCapacity(count)
@@ -444,6 +489,7 @@ struct GumTrampolineDetector: Detector {
         let wordPtr = ptr.assumingMemoryBound(to: UInt32.self)
         for i in 0..<count {
             let addr = UnsafeRawPointer(wordPtr + i)
+            // 优先 vm_read_overwrite，比直接解引用更难被 hook。
             // Use vm_read_overwrite for a safer read that is harder to hook
             var bytesRead: vm_size_t = 0
             var value: UInt32 = 0
@@ -460,6 +506,7 @@ struct GumTrampolineDetector: Detector {
             if readResult == KERN_SUCCESS && bytesRead == vm_size_t(MemoryLayout<UInt32>.size) {
                 instructions.append(value)
             } else {
+                // 读取失败时回退直接读取，保证检测器仍能工作。
                 // Fallback to direct read if vm_read_overwrite fails
                 instructions.append(wordPtr[i])
             }
@@ -469,6 +516,7 @@ struct GumTrampolineDetector: Detector {
     }
 
     /// Sign-extends a value from `bits` width to Int64.
+    /// 把指定宽度的值符号扩展到 Int64。
     private func signExtend(_ value: UInt32, bits: Int) -> Int64 {
         let signBit = UInt32(1) << (bits - 1)
         if value & signBit != 0 {
@@ -483,16 +531,20 @@ struct GumTrampolineDetector: Detector {
 
 // MARK: - Signal Conversion
 
+/// 信号转换：跳板命中与 hook 链分别成信号。
 extension GumTrampolineDetector {
+    /// 跳板信号置信度 = 命中符号数 / 受检符号数。
     func asSignals() throws -> [RiskSignal] {
         let result = try detect()
         guard result.score > 0 else { return [] }
 
         var signals: [RiskSignal] = []
 
+        // 排除 hook_chain 方法，单独统计普通跳板命中。
         let hookedMethods = result.methods.filter { $0.hasPrefix("gum_trampoline:") && !$0.contains("hook_chain") }
         if !hookedMethods.isEmpty {
             let hookCount = hookedMethods.count
+            // 置信度按命中比例计算，命中越多越可信。
             let confidence = min(Double(hookCount) / Double(Self.criticalSymbols.count), 1.0)
 
             signals.append(RiskSignal(
@@ -510,6 +562,7 @@ extension GumTrampolineDetector {
             ))
         }
 
+        // hook 链信号固定 25 分，state=tampered。
         let chainMethods = result.methods.filter { $0.contains("hook_chain") }
         if !chainMethods.isEmpty {
             signals.append(RiskSignal(

@@ -2,30 +2,22 @@ import CRiskCore
 import Darwin
 import Foundation
 
-// MARK: - Direct Syscall Cross-Validator
+// MARK: - 直接系统调用交叉校验
 //
-// KernelHookSideChannel / FridaSocketDetector 的时序侧信道属于概率型检测，
-// 依赖 Frida Stalker 的 DBT 开销。不使用 Stalker 的 hook 工具时序异常不明显。
-//
-// 本检测器采用"结果一致性"验证——确定性检测，非概率型：
-// - 通过 libc 包装器调用系统调用（可能被 hook 篡改返回值）
-// - 通过 CRiskCore 直接 SVC #0x80 调用同一系统调用（绕过 libc hook）
-// - 比较两条路径的返回值：不一致 = libc 层存在活跃 hook 且正在篡改结果
-//
-// 探针维度：
-// 1. getpid()  vs  cprisk_getpid_direct()   — 最小化测试，不可能自然不一致
-// 2. stat()    vs  cprisk_stat_direct()      — 文件存在性交叉验证
-// 3. access()  vs  cprisk_access_direct()    — 文件权限交叉验证
-//
-// 覆盖场景：Substrate/Dobby/Ellekit/fishhook 对 libc 函数的 hook；
-//           越狱隐藏工具（如 Shadow、A-Bypass）篡改文件检测结果
+// 本检测器做"结果一致性"验证，属于确定性检测，而非 KernelHookSideChannel /
+// FridaSocketDetector 依赖 Stalker DBT 开销的时序概率检测：
+// 经 libc 包装器调用 getpid/stat/access，同时经 CRiskCore 直接执行 SVC 调用同一系统调用，
+// 比较两条路径的返回值；不一致即说明 libc 层存在活跃 hook 正在篡改结果。
+// 覆盖 Substrate/Dobby/Ellekit/fishhook 及 Shadow、A-Bypass 等越狱隐藏工具。
 
+/// 直接系统调用交叉校验检测器。
+/// - 线程模型：无共享可变状态，可在任意线程调用。
+/// - 安全不变量：模拟器或探针异常时降级为 0 分，不产生误杀。
 struct DirectSyscallCrossValidator: Detector {
 
-    // MARK: - Test Probes
+    // MARK: - 测试探针
 
-    /// File paths that must exist on any stock iOS device.
-    /// We probe these to check if libc returns the same result as a direct SVC.
+    /// 任何原厂 iOS 设备都必须存在的路径；用于对比 libc 与直接 SVC 的探测结果。
     private static let probePaths: [String] = [
         "/usr/lib/dyld",
         "/bin/sh",
@@ -33,21 +25,24 @@ struct DirectSyscallCrossValidator: Detector {
         "/usr/lib/system/libsystem_pthread.dylib",
     ]
 
-    /// A path that should NOT exist — used to verify consistent "not found" responses.
+    /// 必然不存在的随机路径；用于验证两条路径对"文件不存在"给出同样结论，
+    /// 防止 hook 伪造任意文件存在性而绕过检测。
     private static let nonExistentPath = "/var/tmp/cprisk_probe_nonexistent_\(arc4random())"
 
-    // MARK: - Scoring
-    private static let scoreGetpidMismatch: Double   = 40  // Almost impossible without hook
-    private static let scoreStatMismatch: Double     = 30  // Strong indicator
+    // MARK: - 计分
+    // 单次 getpid 不一致几乎没有自然成因，故权重最高；stat/access 次之。
+    private static let scoreGetpidMismatch: Double   = 40  // 无 hook 时几乎不可能出现
+    private static let scoreStatMismatch: Double     = 30  // 强指示
     private static let scoreAccessMismatch: Double   = 25
-    private static let scoreMultiMismatch: Double    = 20  // Bonus for ≥2 mismatches
+    private static let scoreMultiMismatch: Double    = 20  // ≥2 类不一致时的叠加奖励
     private static let maxScore: Double              = 80
 
-    // MARK: - Detector Protocol
+    // MARK: - Detector 协议
 
     @inline(never)
     func detect() throws -> DetectorResult {
 #if targetEnvironment(simulator)
+        // 模拟器的 libc 与 CRiskCore 行为不可比，直接降级，避免宿主环境误报。
         return DetectorResult(score: 0, methods: ["dscv:unavailable_simulator"])
 #else
         return detectKernel()
@@ -60,7 +55,8 @@ struct DirectSyscallCrossValidator: Detector {
         var methods: [String] = []
         var mismatchCount = 0
 
-        // --- Probe 1: getpid consistency ---
+        // --- 探针 1：getpid 一致性 ---
+        // 同一进程内两条路径必须返回同一 PID，任何差异都只能来自 libc 拦截。
         let libcPid = getpid()
         let directPid = cprisk_getpid_direct()
         if libcPid != directPid {
@@ -69,7 +65,7 @@ struct DirectSyscallCrossValidator: Detector {
             mismatchCount += 1
         }
 
-        // --- Probe 2: stat() consistency ---
+        // --- 探针 2：stat() 一致性 ---
         let statMismatches = checkStatConsistency()
         if statMismatches > 0 {
             score += Self.scoreStatMismatch
@@ -77,7 +73,7 @@ struct DirectSyscallCrossValidator: Detector {
             mismatchCount += 1
         }
 
-        // --- Probe 3: access() consistency ---
+        // --- 探针 3：access() 一致性 ---
         let accessMismatches = checkAccessConsistency()
         if accessMismatches > 0 {
             score += Self.scoreAccessMismatch
@@ -85,7 +81,7 @@ struct DirectSyscallCrossValidator: Detector {
             mismatchCount += 1
         }
 
-        // Multi-mismatch bonus: multiple hooked syscalls = active instrumentation
+        // 多类系统调用同时不一致，说明存在活跃的插桩框架，追加组合分。
         if mismatchCount >= 2 {
             score += Self.scoreMultiMismatch
             methods.append("dscv:multi_mismatch:\(mismatchCount)")
@@ -98,9 +94,10 @@ struct DirectSyscallCrossValidator: Detector {
         return DetectorResult(score: min(score, Self.maxScore), methods: methods)
     }
 
-    // MARK: - stat() Cross-Check
+    // MARK: - stat() 交叉校验
 
-    /// Returns the number of probe paths where libc `stat` and CRiskCore `stat_direct` disagree.
+    /// 统计 libc `stat` 与 CRiskCore `stat_direct` 结论不一致的探针路径数量。
+    /// - 返回：不一致路径数（含随机不存在路径），0 表示一致。
     private func checkStatConsistency() -> Int {
         var mismatches = 0
 
@@ -111,7 +108,7 @@ struct DirectSyscallCrossValidator: Detector {
             }
         }
 
-        // Also check non-existent path — hook may fabricate existence
+        // 再探测随机不存在路径：hook 可能为了隐藏文件而伪造"存在"。
         let (libcNonExist, directNonExist) = statBothPaths(Self.nonExistentPath)
         if libcNonExist != directNonExist {
             mismatches += 1
@@ -120,7 +117,7 @@ struct DirectSyscallCrossValidator: Detector {
         return mismatches
     }
 
-    /// Returns (libcSuccess, directSuccess) for stat() on a given path.
+    /// 返回指定路径经 libc 与直接系统调用执行 stat 的成功标志 `(libcSuccess, directSuccess)`。
     private func statBothPaths(_ path: String) -> (Bool, Bool) {
         var libcSb = stat()
         let libcRc = path.withCString { cPath in
@@ -135,9 +132,9 @@ struct DirectSyscallCrossValidator: Detector {
         return (libcRc == 0, directRc == 0)
     }
 
-    // MARK: - access() Cross-Check
+    // MARK: - access() 交叉校验
 
-    /// Returns the number of probe paths where libc `access` and CRiskCore `access_direct` disagree.
+    /// 统计 libc `access` 与 CRiskCore `access_direct` 结论不一致的探针路径数量。
     private func checkAccessConsistency() -> Int {
         var mismatches = 0
 
@@ -148,7 +145,7 @@ struct DirectSyscallCrossValidator: Detector {
             }
         }
 
-        // Non-existent path: both should return error (-1)
+        // 不存在路径：两条路径都应返回错误（-1），不一致说明返回值被篡改。
         let (libcNonExist, directNonExist) = accessBothPaths(Self.nonExistentPath, mode: F_OK)
         if libcNonExist != directNonExist {
             mismatches += 1
@@ -157,7 +154,7 @@ struct DirectSyscallCrossValidator: Detector {
         return mismatches
     }
 
-    /// Returns (libcSuccess, directSuccess) for access() on a given path.
+    /// 返回指定路径经 libc 与直接系统调用执行 access 的成功标志 `(libcSuccess, directSuccess)`。
     private func accessBothPaths(_ path: String, mode: Int32) -> (Bool, Bool) {
         let libcRc = path.withCString { cPath in
             Darwin.access(cPath, mode)
@@ -171,9 +168,12 @@ struct DirectSyscallCrossValidator: Detector {
     }
 }
 
-// MARK: - Signal Bridge
+// MARK: - 信号桥接
 
 extension DirectSyscallCrossValidator {
+    /// 将检测结果转换为 `syscall_result_mismatch` 信号。
+    /// - getpid 不一致视为硬命中（真实设备不可能出现），其余情形给 0.85 软置信；
+    /// - layer 2、weightHint 85：属于反篡改强证据，但仍是多信号中的一环。
     func asSignals() throws -> [RiskSignal] {
         let result = try detect()
         guard result.score > 0 else { return [] }

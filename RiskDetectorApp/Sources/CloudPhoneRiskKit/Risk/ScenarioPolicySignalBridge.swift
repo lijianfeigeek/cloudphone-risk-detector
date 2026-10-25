@@ -1,16 +1,32 @@
+// 场景策略信号桥：把分散的底层信号聚合成服务端策略可直接消费的“场景信号”
+// （设备篡改、调试器、Frida 端口、DNS 隧道、IDFV 重装、MCC 归属不一致）。
+// 输入是本次已收集的信号与风险快照，输出为新增 `RiskSignal`，不修改原始信号。
+// 注意：IDFV 历史只存哈希值并加密落盘，30 天窗口外的变化不参与重装判定。
 import Foundation
 
+/// 场景策略派生器：无状态（IDFV 历史文件锁除外）地把驱动信号聚合为高层结论。
 enum ScenarioPolicySignalBridge {
+    // 串行化 IDFV 历史文件的读改写，避免并发 evaluate 丢失变化记录。
     private static let idfvHistoryLock = NSLock()
+    // 加密存储 key；数据本身仍经 SecureFileStore/PayloadCrypto 加密。
     private static let idfvHistoryKey = "cprk_scenario_policy.idfv_history"
+    // 30 天滑动窗口，窗口外的重装记录不再计入。
     private static let idfvWindow: TimeInterval = 30 * 24 * 3600
+    // 窗口内至少 2 次 IDFV 变化才产出重装信号，单次变化可能只是正常重装。
     private static let idfvTriggerCount = 2
 
+    /// 持久化的 IDFV 变化历史：lastValue 是 SHA-256 哈希，timestamps 为变化时刻（秒）。
     private struct IDFVHistory: Codable {
         var lastValue: String
         var changeTimestamps: [TimeInterval]
     }
 
+    /// 派生全部场景信号；任一驱动器缺失时静默跳过。
+    /// - Parameters:
+    ///   - snapshot: 本次评估快照（设备/网络）。
+    ///   - existingSignals: 已收集信号，用于识别篡改/调试/Frida 驱动。
+    ///   - now: 注入当前时间（便于测试）；IDFV 窗口按此计算。
+    /// - Returns: 新增的高层信号列表，可能为空。
     static func deriveSignals(
         snapshot: RiskSnapshot,
         existingSignals: [RiskSignal],
@@ -18,6 +34,7 @@ enum ScenarioPolicySignalBridge {
     ) -> [RiskSignal] {
         var out: [RiskSignal] = []
 
+        // 逐类聚合：每类仅在存在驱动信号时才产出，避免空信号污染评分。
         if let deviceTamper = deviceTamperSignal(from: existingSignals) {
             out.append(deviceTamper)
         }
@@ -40,8 +57,13 @@ enum ScenarioPolicySignalBridge {
         return out
     }
 
+    /// 聚合设备篡改驱动信号。
+    /// 触发条件：存在 `.tampered` 驱动、最强分 ≥25、或驱动数 ≥4。
+    /// 输出分数 = 最强驱动分×0.7 + 篡改驱动数×10 + 硬命中数×5（封顶 100）；
+    /// 有篡改态时保持 `.tampered`，否则按驱动数量给出 soft 置信度。
     static func deviceTamperSignal(from existingSignals: [RiskSignal]) -> RiskSignal? {
         let drivers = existingSignals.filter {
+            // 排除自身，防止重复聚合导致分数自增。
             guard $0.id != SignalID.deviceTamperScore else { return false }
             return isDeviceTamperDriver($0)
         }
@@ -57,9 +79,11 @@ enum ScenarioPolicySignalBridge {
             return false
         }
         let strongestScore = drivers.map(\.score).max() ?? 0
+        // 触发门槛：任意篡改态、单条强证据，或多条弱证据形成共识。
         let shouldEmit = tamperedDrivers.isEmpty == false || strongestScore >= 25 || drivers.count >= 4
         guard shouldEmit else { return nil }
 
+        // 分数封顶 100：强证据占主导，篡改/硬命中计数只作加成。
         let derivedScore = min(
             100,
             strongestScore * 0.7
@@ -72,7 +96,9 @@ enum ScenarioPolicySignalBridge {
                 + Double(min(tamperedDrivers.count, 4)) * 0.08
                 + Double(min(drivers.count, 6)) * 0.03
         )
+        // 有篡改态直接沿用 tampered；否则按驱动数量给出 soft 置信度。
         let state: RiskSignalState = tamperedDrivers.isEmpty ? .soft(confidence: confidence) : .tampered
+        // 证据只保留前 8 个驱动 id，控制上报体积。
         let driverIDs = Array(drivers.map(\.id).sorted().prefix(8))
 
         return RiskSignal(
@@ -93,6 +119,8 @@ enum ScenarioPolicySignalBridge {
         )
     }
 
+    /// 聚合调试器/anti-debug 驱动信号，输出 `is_debugged`。
+    /// 分数 = 20 + 最强分×0.4 + 驱动数×3（封顶 48）；硬命中或最强分 ≥18 判 hard。
     static func debuggedSignal(from existingSignals: [RiskSignal]) -> RiskSignal? {
         let drivers = existingSignals.filter {
             guard $0.id != SignalID.isDebugged else { return false }
@@ -120,12 +148,15 @@ enum ScenarioPolicySignalBridge {
                 "driver_count": "\(drivers.count)",
                 "drivers": driverIDs.joined(separator: ","),
             ],
+            // tampered 优先于 hard：检测链路被篡改比“检测到调试器”更严重。
             state: tampered ? .tampered : .hard(detected: hardDetected || strongestScore >= 18),
             layer: 3,
             weightHint: 72
         )
     }
 
+    /// 聚合 `frida_port_*` 监听端口信号，输出 `frida_port_open`（默认按 hard 处理）。
+    /// 端口优先从 evidence.listening_port 读取，缺失时回退到 id 末段。
     static func fridaPortSignal(from existingSignals: [RiskSignal]) -> RiskSignal? {
         let drivers = existingSignals.filter {
             guard $0.id != SignalID.fridaPortOpen else { return false }
@@ -155,6 +186,8 @@ enum ScenarioPolicySignalBridge {
         )
     }
 
+    /// 聚合 Frida 异常协议/可疑本地监听信号为 DNS 隧道信号。
+    /// 无篡改证据时按驱动数量给出 soft 置信度。
     static func dnsTunnelSignal(from existingSignals: [RiskSignal]) -> RiskSignal? {
         let drivers = existingSignals.filter {
             guard $0.id != SignalID.dnsTunnelDetected else { return false }
@@ -189,6 +222,9 @@ enum ScenarioPolicySignalBridge {
         )
     }
 
+    /// 根据 30 天内 IDFV（已哈希）变化次数判断重装/设备农场。
+    /// 第 2 次变化起产出 soft 信号；分数随次数递增，封顶 45。
+    /// - 副作用：读取并写回加密历史文件（加锁，失败不阻断评估）。
     static func idfvReinstallSignal(
         snapshot: RiskSnapshot,
         now: Date = Date()
@@ -206,8 +242,10 @@ enum ScenarioPolicySignalBridge {
         let nowTs = now.timeIntervalSince1970
         var history = loadIDFVHistory()
             ?? IDFVHistory(lastValue: idfv, changeTimestamps: [])
+        // 滑动窗口裁剪：过期变化不再计入。
         history.changeTimestamps.removeAll { nowTs - $0 > idfvWindow }
 
+        // 值变化才记一次；相同值重复评估不会累加。
         if history.lastValue != idfv {
             history.changeTimestamps.append(nowTs)
             history.lastValue = idfv
@@ -215,6 +253,7 @@ enum ScenarioPolicySignalBridge {
 
         saveIDFVHistory(history)
 
+        // 低于触发次数返回 nil，避免正常换机/单次重装误伤。
         guard history.changeTimestamps.count >= idfvTriggerCount else { return nil }
 
         let confidence = min(0.92, 0.68 + Double(history.changeTimestamps.count - idfvTriggerCount) * 0.05)
@@ -233,6 +272,8 @@ enum ScenarioPolicySignalBridge {
         )
     }
 
+    /// 比较 SIM MCC 与设备 locale 推断的归属地；不一致时产出 soft 信号。
+    /// 缺少 MCC 或 locale 无法映射国家时返回 nil（数据不足不误判）。
     static func mccMismatchSignal(snapshot: RiskSnapshot) -> RiskSignal? {
         guard let mcc = snapshot.network.mcc?.trimmingCharacters(in: .whitespacesAndNewlines),
               !mcc.isEmpty else {
@@ -244,6 +285,7 @@ enum ScenarioPolicySignalBridge {
             return nil
         }
 
+        // 只比较“国家/地区 → MCC 集合”，不推断运营商；在集合内即视为正常，降低漫游误伤。
         guard expectedMCCs.contains(mcc) == false else { return nil }
 
         return RiskSignal(
@@ -264,11 +306,13 @@ enum ScenarioPolicySignalBridge {
     /// IDFV 历史不再明文存 UserDefaults：AES-GCM 加密文件（SecureFileStore）。
     /// 遗留明文记录仅做一次性迁移读取，迁移后删除。
     private static func loadIDFVHistory() -> IDFVHistory? {
+        // 优先读取 AES-GCM 加密文件；解密/解码失败视为无历史。
         if let encrypted = SecureFileStore.shared.read(key: idfvHistoryKey),
            let decrypted = try? PayloadCrypto.decrypt(encrypted),
            let history = try? JSONDecoder().decode(IDFVHistory.self, from: decrypted) {
             return history
         }
+        // 兼容旧版明文 UserDefaults：成功迁移到加密存储后删除明文。
         let defaults = UserDefaults.standard
         guard let data = defaults.data(forKey: idfvHistoryKey),
               let history = try? JSONDecoder().decode(IDFVHistory.self, from: data) else {
@@ -280,6 +324,7 @@ enum ScenarioPolicySignalBridge {
         return history
     }
 
+    /// 加密后写入安全文件；失败返回 false，调用方不因此中断评估。
     @discardableResult
     private static func saveIDFVHistory(_ history: IDFVHistory) -> Bool {
         guard let data = try? JSONEncoder().encode(history),
@@ -287,6 +332,7 @@ enum ScenarioPolicySignalBridge {
         return SecureFileStore.shared.write(key: idfvHistoryKey, data: encrypted)
     }
 
+    /// 判定设备篡改驱动：anti-tamper/integrity 分类，或跨通道共识信号。
     private static func isDeviceTamperDriver(_ signal: RiskSignal) -> Bool {
         if signal.category == ObfuscatedConstants.categoryAntiTamper || signal.category == "integrity" {
             return true
@@ -302,6 +348,7 @@ enum ScenarioPolicySignalBridge {
         }
     }
 
+    /// 判定调试器驱动：显式 id、`debugger_port_*`、`anti_debug_watchdog_*` 前缀。
     private static func isDebugDriver(_ signal: RiskSignal) -> Bool {
         if signal.id == SignalID.debuggerDetected
             || signal.id == SignalID.antiDebugRuntimeConsensus
@@ -320,8 +367,11 @@ enum ScenarioPolicySignalBridge {
         return false
     }
 
+    /// 从 locale 提取两位国家/地区码并大写；无法识别时返回 nil。
+    /// iOS 16+ 使用 `Locale.Region`，旧系统按分隔符取末段（如 "zh_CN"/"en-US"）。
     private static func normalizedRegionCode(from localeIdentifier: String) -> String? {
         let locale = Locale(identifier: localeIdentifier)
+        // 新 API 更可靠；旧系统回退到字符串末段解析。
         if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
             if let region = locale.region?.identifier, region.isEmpty == false {
                 return region.uppercased()
@@ -334,6 +384,8 @@ enum ScenarioPolicySignalBridge {
         return last.uppercased()
     }
 
+    /// 国家/地区码 → 可能的 MCC 集合（部分国家有多个 MCC）。
+    /// 表只覆盖常见地区，用于一致性校验而非完整 MCC 数据库。
     private static let regionToMCCs: [String: Set<String>] = [
         "AR": ["722"],
         "AT": ["232"],

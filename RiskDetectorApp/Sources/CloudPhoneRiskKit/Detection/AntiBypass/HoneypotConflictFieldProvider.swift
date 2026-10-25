@@ -1,44 +1,48 @@
+// 蜜罐矛盾字段提供者：故意输出一对互相矛盾的 vendor 字段（真实平台值 vs 编译期硬编码错值），
+// 正常 SDK 永远不会“自我修正”该矛盾；若上报里矛盾消失，说明攻击者在客户端做了字段标准化。
+// 同时用运行时 XOR 重组的期望值检测硬编码串是否被 patch，用双边坍缩检测识别同步 hook。
+// 三条信号覆盖不同攻击路径，采用加性计分叠加，不参与 overlapGroup 去重。
+
 import Darwin
 import Foundation
 #if canImport(UIKit)
 import UIKit
 #endif
 
-/*
- * HoneypotConflictFieldProvider
- *
- * 借鉴自小红书 libtiny.so 的 x5="Vivo" 蜜罐设计：
- *   libtiny 在尝试连接小米/酷派 OAID 服务失败后硬编码 vendor 为 "Vivo"，但同一个指纹
- *   里 x23=Google、x24=Pixel 6、x7=gs101 — 三个字段公然矛盾。这个矛盾**是预期的**。
- *   后端知道矛盾应该存在；如果某个上传里 x5 被"修正"成 "Google"（与 x23 一致），
- *   反而暴露了攻击者在客户端做了字段标准化 — 因为正常 SDK 永远不会自我修正。
- *
- * 客户端单端的价值：
- *   1. **误导成本**：分析者在 IDA 里看到我们故意输出 vendor_a/vendor_b 矛盾对，
- *      自然会去研究"这是不是个 bug、要不要 patch 掉"，浪费时间。
- *   2. **常量篡改检测**：vendor_b 是编译期常量。每次 emit 与编译期 expected 比对；
- *      若不一致说明某个 hook 或 .data 篡改了字符串。
- *   3. **印章绑定**：vendor_a/vendor_b 由 GF(2) 仿射 seal 绑定。
- *   4. **未来服务器扩展锚点**：服务器只要看 vendor_b == expected 就能识别"被清洗
- *      过的载荷"。
- *
- * 注意（攻击者已在 launch 时 hook 的场景）：
- *   如果 hook 在 SDK 加载前就已经在了，攻击者可以同时改 vendor_b 字符串和我们读取它的
- *   逻辑。常量比对仅能检测 hook 不到位的攻击者。这是已知的限制；与服务器端验证组合
- *   使用时威力最大。
- *
- * 加性打分（by design / v7.7 audit-fix N4）:
- *   单次 evaluate 中本 Provider 可能同时 emit 三个信号:
- *     - honeypot_vendor_conflict (matrix 篡改时 score 35)
- *     - honeypot_constant_drift  (vendor_b 被 hook 修正时 score 75)
- *     - honeypot_vendor_collapsed (vendor_a == vendor_b 时 score 80)
- *   再叠加 IntegrityChainSealProvider 的 integrity_chain_seal (matrix 篡改时 score 40)，
- *   单次 evaluate 总分可达 ~155+。这是有意的 defense-in-depth：每条信号反映一种独立的
- *   攻击模式，攻击者必须同时绕过全部 3-4 条才能压低分数。
- *   不走 RiskSignal.overlapGroup 去重 — 这些 signal 的 evidence 字段不同，下游审计应
- *   分别看到"哪些攻击维度被命中"。
- */
+// 借鉴自小红书 libtiny.so 的 x5="Vivo" 蜜罐设计：
+//   libtiny 在尝试连接小米/酷派 OAID 服务失败后硬编码 vendor 为 "Vivo"，但同一个指纹
+//   里 x23=Google、x24=Pixel 6、x7=gs101 — 三个字段公然矛盾。这个矛盾**是预期的**。
+//   后端知道矛盾应该存在；如果某个上传里 x5 被"修正"成 "Google"（与 x23 一致），
+//   反而暴露了攻击者在客户端做了字段标准化 — 因为正常 SDK 永远不会自我修正。
+//
+// 客户端单端的价值：
+//   1. **误导成本**：分析者在 IDA 里看到我们故意输出 vendor_a/vendor_b 矛盾对，
+//      自然会去研究"这是不是个 bug、要不要 patch 掉"，浪费时间。
+//   2. **常量篡改检测**：vendor_b 是编译期常量。每次 emit 与编译期 expected 比对；
+//      若不一致说明某个 hook 或 .data 篡改了字符串。
+//   3. **印章绑定**：vendor_a/vendor_b 由 GF(2) 仿射 seal 绑定。
+//   4. **未来服务器扩展锚点**：服务器只要看 vendor_b == expected 就能识别"被清洗
+//      过的载荷"。
+//
+// 注意（攻击者已在 launch 时 hook 的场景）：
+//   如果 hook 在 SDK 加载前就已经在了，攻击者可以同时改 vendor_b 字符串和我们读取它的
+//   逻辑。常量比对仅能检测 hook 不到位的攻击者。这是已知的限制；与服务器端验证组合
+//   使用时威力最大。
+//
+// 加性打分（by design / v7.7 audit-fix N4）:
+//   单次 evaluate 中本 Provider 可能同时 emit 三个信号:
+//     - honeypot_vendor_conflict (matrix 篡改时 score 35)
+//     - honeypot_constant_drift  (vendor_b 被 hook 修正时 score 75)
+//     - honeypot_vendor_collapsed (vendor_a == vendor_b 时 score 80)
+//   再叠加 IntegrityChainSealProvider 的 integrity_chain_seal (matrix 篡改时 score 40)，
+//   单次 evaluate 总分可达 ~155+。这是有意的 defense-in-depth：每条信号反映一种独立的
+//   攻击模式，攻击者必须同时绕过全部 3-4 条才能压低分数。
+//   不走 RiskSignal.overlapGroup 去重 — 这些 signal 的 evidence 字段不同，下游审计应
+//   分别看到"哪些攻击维度被命中"。
 
+/// 蜜罐提供者：用“预期存在且不可自洽”的字段对，检测字段标准化与字符串 patch。
+///
+/// 线程模型：无可变共享状态，`signals(snapshot:)` 可多线程并发调用。
 final class HoneypotConflictFieldProvider: RiskSignalProvider {
 
     static let shared = HoneypotConflictFieldProvider()
@@ -63,6 +67,8 @@ final class HoneypotConflictFieldProvider: RiskSignalProvider {
 
     private init() {}
 
+    /// 生成蜜罐信号集合：主矛盾信号始终输出（干净时 score 为 0），
+    /// 常量漂移与双边坍缩只在命中时追加，避免良性设备产生噪声。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         let observed = currentObservation()
         let canonical = "\(observed.vendorA)|\(observed.vendorB)"
@@ -141,6 +147,7 @@ final class HoneypotConflictFieldProvider: RiskSignalProvider {
 
     // MARK: - Observation
 
+    /// 一次观测得到的 vendor 字段对；两者本应永远不同。
     private struct Observation {
         let vendorA: String
         let vendorB: String
@@ -162,6 +169,7 @@ final class HoneypotConflictFieldProvider: RiskSignalProvider {
         return "\(machine):\(osrel)"
     }
 
+    /// 先探测长度再读取，两次调用之间长度可能变化；第二次失败时返回空串而不是截断值。
     private func sysctlString(_ name: String) -> String {
         var size: size_t = 0
         guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "" }

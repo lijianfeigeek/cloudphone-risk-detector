@@ -1,7 +1,11 @@
+// 越狱检测结果的数据模型：定义引擎对外输出的最终判决与单个检测器的中间结果。
+// 位于越狱检测管道末端：各 Detector 先产出 DetectorResult，再由 JailbreakEngine 聚合为 DetectionResult。
+// 关键安全不变量：`unavailable` 与“未命中”必须可区分，调用方不得把不可用状态当作设备干净。
 import Foundation
 
 // MARK: - 最终检测结果
 /// 整个检测流程完成后返回的结果
+/// 线程模型：不可变值类型（`Sendable`），可安全跨并发域传递。
 public struct DetectionResult: Sendable {
 
     /// 是否判定为越狱设备
@@ -15,9 +19,11 @@ public struct DetectionResult: Sendable {
 
     /// 命中的检测方法列表
     /// 例如: ["file:/Applications/Cydia.app", "dylib:FridaGadget"]
+    /// 由各检测器的原始标记去重并排序后得到，可用于服务端归因分析。
     public let detectedMethods: [String]
 
     /// 详细信息（可用于日志/调试）
+    /// 采用 `key=value` 多行文本，便于人工排查，不参与服务端判决。
     public let details: String
 
     /// 检测是否实际不可用（例如模拟器上检测器无法运行）。
@@ -27,6 +33,13 @@ public struct DetectionResult: Sendable {
     /// 默认 `false`，保持现有四参构造可编译。
     public let unavailable: Bool
 
+    /// 创建最终检测结果。
+    /// - Parameters:
+    ///   - isJailbroken: 是否达到判定阈值。
+    ///   - confidence: 置信度分数，调用方不应假定其一定被裁剪到 100。
+    ///   - detectedMethods: 命中的检测方法标记。
+    ///   - details: 调试用的明细文本。
+    ///   - unavailable: 本次检测是否实际未执行；默认 `false`。
     public init(isJailbroken: Bool, confidence: Double, detectedMethods: [String], details: String, unavailable: Bool = false) {
         self.isJailbroken = isJailbroken
         self.confidence = confidence
@@ -38,16 +51,20 @@ public struct DetectionResult: Sendable {
 
 // MARK: - 单个检测器的结果
 /// 每个检测模块（如 FileDetector）返回的结果
+/// 检测器只负责给出证据与分值，是否越过阈值由 JailbreakEngine 统一决定。
 public struct DetectorResult: Sendable {
 
     /// 该检测模块的得分
     /// 不同检测项有不同权重，命中后累加
+    /// 负分表示检测器自身故障（而非“检测到越狱”），由引擎特殊处理。
     public let score: Double
 
     /// 该模块命中的检测方法
+    /// 命名格式由各检测器约定（如 `file:`、`dylib:`、`hook:` 前缀）。
     public let methods: [String]
 
     /// 创建一个空结果（未检测到任何异常）
+    /// 用于平台不支持或检测被跳过等场景，语义等同于“已执行且无命中”。
     public static var empty: DetectorResult {
         return DetectorResult(score: 0, methods: [])
     }

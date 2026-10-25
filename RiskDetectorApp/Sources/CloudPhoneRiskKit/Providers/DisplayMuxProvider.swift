@@ -22,6 +22,7 @@ final class DisplayMuxProvider: RiskSignalProvider {
 
     let id = "display_mux"
 
+    /// 仅在 iOS 真机执行；模拟器与无 UIKit 平台返回空。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []
@@ -35,6 +36,7 @@ final class DisplayMuxProvider: RiskSignalProvider {
     }
 
     #if !targetEnvironment(simulator) && canImport(UIKit)
+    /// 读取 `UIScreen.isCaptured` 与 `UIScreen.screens`，输出录屏/外接显示器信号。
     private func collectSignals() -> [RiskSignal] {
         var out: [RiskSignal] = []
 
@@ -70,6 +72,7 @@ final class DisplayMuxProvider: RiskSignalProvider {
         return out
     }
 
+    /// 若当前非主线程则同步派发到主线程执行（UIScreen 需主线程访问）。
     private func runOnMainIfNeeded<T>(_ block: () -> T) -> T {
         if Thread.isMainThread {
             return block()

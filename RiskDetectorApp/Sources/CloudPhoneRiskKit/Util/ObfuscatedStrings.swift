@@ -1,14 +1,26 @@
+// 混淆字符串表：集中存放越狱 / Frida / 注入 / 反调试相关的敏感字面量。
+// 明文特征会留在 Mach-O 的 __TEXT/__cstring 中，攻击者用 strings 即可定位检测逻辑，
+// 因此条目在源码中以 XOR / ROT13 / 逆序 / Caesar / Base64 形式保存，运行时惰性解码；
+// 属性名保持可读，仅隐藏真正敏感的取值。
 import Foundation
 
+/// 轻量字符串解码器集合。
+/// - 全部为纯函数、无共享状态，可在任意线程调用。
+/// - 仅在访问 `ObfuscatedConstants` 的计算属性时执行，结果不缓存，减少明文驻留时间。
 enum StringDeobfuscator {
+    /// 单字节 XOR 解码：逐字节与 `key` 异或后按 UTF-8 还原。
+    /// 每个条目使用不同 key，阻止对整个表做一次异或批量还原。
     static func xorDecode(_ bytes: [UInt8], key: UInt8) -> String {
         let decoded = bytes.map { $0 ^ key }
+        // 解码失败时退化为空串，调用方按“无特征”处理，避免解码错误导致崩溃。
         return String(bytes: decoded, encoding: .utf8) ?? ""
     }
 
+    /// 字母 ROT13：仅旋转 ASCII 字母，数字、标点保持不变。
     static func rot13(_ input: String) -> String {
         return String(input.unicodeScalars.map { scalar in
             let v = scalar.value
+            // 分大小写区间旋转，非字母标量原样透传。
             switch v {
             case 65...90: return Character(Unicode.Scalar((v - 65 + 13) % 26 + 65)!)
             case 97...122: return Character(Unicode.Scalar((v - 97 + 13) % 26 + 97)!)
@@ -17,11 +29,14 @@ enum StringDeobfuscator {
         })
     }
 
+    /// 字节逆序解码：反向书写使 `strings` 无法直接命中敏感词。
     static func reverseBytes(_ bytes: [UInt8]) -> String {
         return String(bytes: bytes.reversed(), encoding: .utf8) ?? ""
     }
 
+    /// Caesar 位移解码：`shift` 为编码时的位移量，这里反向还原字母区间。
     static func caesarShift(_ bytes: [UInt8], shift: Int) -> String {
+        // 归一化到 0...25，保证负数或超过 26 的位移量也能正确还原。
         let s = (shift % 26 + 26) % 26
         let decoded = bytes.map { b -> UInt8 in
             switch b {
@@ -33,18 +48,29 @@ enum StringDeobfuscator {
         return String(bytes: decoded, encoding: .utf8) ?? ""
     }
 
+    /// 标准 Base64 解码；非法输入返回空串（fail-safe，不抛错）。
     static func base64Decode(_ base64: String) -> String {
         guard let data = Data(base64Encoded: base64),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
     }
 
+    /// 多阶段拼接：把拆散的片段按顺序还原成一个敏感词。
+    /// - 单个片段不足以被静态扫描识别，`separator` 用于需要中间分隔符的场景。
     static func multiStage(_ stages: [() -> String], separator: String = "") -> String {
         return stages.map { $0() }.joined(separator: separator)
     }
 }
 
+/// 运行时解码后的敏感常量集合。
+/// - 表结构：每个计算属性对应一条（或一组）检测特征，属性名是调用方使用的稳定语义键。
+/// - 编码方式按条目选择：XOR、字母 ROT13、字节逆序、Caesar，路径类多用 Base64。
+/// - 每次访问都会重新解码（无缓存），需要时再读即可，避免明文长期驻留。
+/// - signal id / method prefix 参与协议或与服务端约定，改名须同步 C 层与后端。
 enum ObfuscatedConstants {
+    // MARK: - 设备 / 模拟器特征
+
+    /// Apple 半虚拟化设备标识（云手机、模拟器常见），多段拼接拆散特征词。
     static var appleParavirtualDevice: String {
         StringDeobfuscator.multiStage([
             { StringDeobfuscator.xorDecode([0x03, 0x32, 0x32, 0x2e, 0x27, 0x62, 0x12, 0x23, 0x30, 0x23], key: 0x42) },
@@ -53,22 +79,30 @@ enum ObfuscatedConstants {
         ])
     }
 
+    /// 软件渲染器名（模拟器/云手机常见的 llvmpipe），Caesar 编码。
     static var llvmpipe: String {
         StringDeobfuscator.caesarShift([0x73, 0x73, 0x63, 0x74, 0x77, 0x70, 0x77, 0x6c], shift: 7)
     }
 
+    /// 设备名伪装特征 "iphone99"，ROT13 编码。
     static var iphone99Pattern: String {
         StringDeobfuscator.rot13("vcubar99")
     }
 
+    /// 云手机厂商的虚拟化主机/域名特征（"vresearch"），XOR 编码。
     static var vresearchPattern: String {
         StringDeobfuscator.xorDecode([0x41, 0x55, 0x52, 0x44, 0x52, 0x56, 0x55, 0x42, 0x5f], key: 0x37)
     }
 
+    /// 半虚拟化标识（"paravirtual"），字节逆序存储。
     static var paravirtualPattern: String {
         StringDeobfuscator.reverseBytes([0x6c, 0x61, 0x75, 0x74, 0x69, 0x72, 0x76, 0x61, 0x72, 0x61, 0x70])
     }
 
+    // MARK: - Frida / 注入相关路径与标记
+
+    /// Frida server 常见安装路径表。
+    /// 整表以 Base64 / XOR 存储，避免 `strings` 一次扫出全部注入工具路径。
     static var fridaServerPaths: [String] {
         [
             StringDeobfuscator.base64Decode("L3Vzci9zYmluL2ZyaWRhLXNlcnZlcg=="),
@@ -79,26 +113,33 @@ enum ObfuscatedConstants {
         ]
     }
 
+    /// Cydia 安装目录路径。
     static var cydiaPath: String {
         StringDeobfuscator.base64Decode("L0FwcGxpY2F0aW9ucy9DeWRpYS5hcHA=")
     }
 
+    /// MobileSubstrate 库目录路径。
     static var substratePath: String {
         StringDeobfuscator.base64Decode("L0xpYnJhcnkvTW9iaWxlU3Vic3RyYXRl")
     }
 
+    /// 敏感 libc 符号名（Caesar 编码），供 dlsym / 栈完整性检查使用。
     static var sysctlbyname: String {
         StringDeobfuscator.caesarShift([0x78, 0x64, 0x79, 0x68, 0x79, 0x71, 0x67, 0x64, 0x66, 0x73, 0x72, 0x6a], shift: 21)
     }
 
+    /// 动态加载入口符号名，避免字符串扫描直接定位注入点。
     static var dlopen: String {
         StringDeobfuscator.caesarShift([0x67, 0x6f, 0x72, 0x73, 0x68, 0x71], shift: 23)
     }
 
+    /// 反调试 / deny-attach 相关令牌（Caesar 编码），用于调试器与父进程相关性检查。
     static var denyAttachToken: String {
         StringDeobfuscator.caesarShift([0x61, 0x65, 0x63, 0x6c, 0x6e, 0x70], shift: 15)
     }
 
+    /// Frida 运行期标记（线程名、模块名、gadget 名等）。
+    /// 扫描内存/镜像时与这些子串匹配；表内混合使用多种编码，增加静态提取成本。
     static var fridaMarkers: [String] {
         [
             StringDeobfuscator.xorDecode([0x43, 0x57, 0x6c, 0x61, 0x44], key: 0x25),
@@ -113,6 +154,7 @@ enum ObfuscatedConstants {
         ]
     }
 
+    /// 常见 hook 框架名（substrate / substitute / libhooker 等），混合编码存储。
     static var hookFrameworkPatterns: [String] {
         [
             StringDeobfuscator.reverseBytes([0x65, 0x74, 0x61, 0x72, 0x74, 0x73, 0x62, 0x75, 0x73]),
@@ -122,6 +164,9 @@ enum ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 关键词与端口
+
+    /// 基础关键词 "frida"；同名变体（hook/jailbreak/tamper 等）结构相同，均用 Base64 隐藏。
     static var keywordFrida: String {
         StringDeobfuscator.base64Decode("ZnJpZGE=")
     }
@@ -152,6 +197,7 @@ enum ObfuscatedConstants {
     }
 
     /// Debugger / Frida-adjacent ports checked by `DebuggerDetector`.
+    /// 表中存的是 `端口 ^ 0x5A5A`；TCP 端口是 16 位，所以用 UInt16 掩码即可。
     static var debuggerPorts: [Int] {
         let key: UInt16 = 0x5A5A
         let encoded: [UInt16] = [0x6A63, 0x5373, 0x33F8, 0x33F9, 0x07D0]
@@ -160,7 +206,7 @@ enum ObfuscatedConstants {
 
     /// Suspicious TCP ports reserved for Frida/socket-based detectors.
     static var suspiciousRuntimePorts: [Int] {
-        let key: UInt16 = 0x5A5A
+        let key: UInt16 = 0x5A5A  // 与 debuggerPorts 共用同一掩码键
         let encoded: [UInt16] = [0x33F8, 0x33F9, 0x4B06]
         return encoded.map { Int($0 ^ key) }
     }
@@ -168,6 +214,7 @@ enum ObfuscatedConstants {
     /// Offline fallback: commonly seen non-default Frida / gadget listen ports (merged + deduped in `DynamicFeatureList`).
     static var suspiciousPortsBuiltinFallback: [Int] {
         let key: UInt16 = 0x5A5A
+        // 每个元素都是“端口 ^ 0x5A5A”，防止端口号以明文常量出现在二进制中。
         let encoded: [UInt16] = [
             0x33FB, 0x33FE, 0x78E2, 0x79D8, 0x5F63, 0x2033, 0xFB9C, 0x4B06,
             0xE834, 0x990A, 0x8E6B, 0x8359, 0xA7B2, 0x9A5A, 0x7AA1, 0x20ED,
@@ -194,6 +241,8 @@ enum ObfuscatedConstants {
         }
     }
 
+    // MARK: - 多路径共识与调用栈特征
+
     /// Critical jailbreak paths used by multi-path consensus detectors.
     static var jailbreakConsensusCriticalPaths: [String] {
         [
@@ -205,6 +254,7 @@ enum ObfuscatedConstants {
     }
 
     /// Call-stack substring needles for `RuntimeIntegrityValidator` (stack frame scan).
+    /// 调用栈里出现这些框架名，说明注入代码正在执行，比“文件存在”证据更强。
     static var runtimeIntegrityStackSuspiciousNeedles: [String] {
         [
             StringDeobfuscator.base64Decode("TW9iaWxlU3Vic3RyYXRl"),
@@ -232,6 +282,10 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("dGFza19mb3JfcGlk")
     }
 
+    // MARK: - Signal / Detector ID（协议稳定值）
+
+    /// Signal/Detector ID 全表：这些字符串会进入上报 JSON 与本地策略。
+    /// 必须与服务端约定保持一致；此处在源码中以 Base64 保存，避免明文 ID 被直接检索。
     static var signalJailbreak: String {
         StringDeobfuscator.base64Decode("amFpbGJyZWFr")
     }
@@ -478,6 +532,9 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("amFpbGJyZWFrX2ZpbGU=")
     }
 
+    // MARK: - Method 前缀（证据归类）
+
+    /// method 前缀用于把同类证据聚合到同一个 signal；冒号是前缀与具体位置的天然分隔符。
     static var methodPrefixMultipartHook: String {
         StringDeobfuscator.base64Decode("bXVsdGlwYXJ0X2hvb2s6")
     }
@@ -762,6 +819,7 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("c3VzcGljaW91c19xdWV1ZTo=")
     }
 
+    /// Frida 通过环境变量注入时常见的键名。
     static var fridaEnvKeys: [String] {
         [
             StringDeobfuscator.base64Decode("RlJJREE="),
@@ -775,7 +833,7 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("RlJJREE=")
     }
 
-    // MARK: - Frida detector tuning (process env keys; values must match launchd/shell at runtime)
+    // MARK: - Frida 检测器调优（进程环境键；取值需与运行环境的 launchd/shell 一致）
 
     static var envKeyCpriskFridaPortSweep: String {
         StringDeobfuscator.base64Decode("Q1BSSVNLX0ZSSURBX1BPUlRfU1dFRVA=")
@@ -817,7 +875,10 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("Q1BSSVNLX0ZSSURBX01FTVNJR19NQVhfUkVHSU9OX0lURVI=")
     }
 
+    // MARK: - 协议令牌标签
+
     /// XOR+SHA256(label) seeds for `FridaDetector.protoToken` (must stay stable vs on-disk enc blobs).
+    /// 标签值一旦变化，已落盘的加密探针 blob 将无法解出，发布后不可随意调整。
     static var fridaProtoLabelFnFrida: String {
         StringDeobfuscator.base64Decode("Q1BSSVNLX0ZOX0ZSSURB")
     }
@@ -858,6 +919,8 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("Q1BSSVNLX1BST1RPX0RCVVNfV0lSRQ==")
     }
 
+    // MARK: - 主动探针载荷
+
     /// Main-binary `dlsym` probe for honeypot (Mach-O C symbol; not exported by the app when clean).
     static var honeypotFridaAgentMainSymbol: String {
         StringDeobfuscator.base64Decode("X2ZyaWRhX2FnZW50X21haW4=")
@@ -882,6 +945,8 @@ enum ObfuscatedConstants {
             StringDeobfuscator.base64Decode("AA=="),
         ]
     }
+
+    // MARK: - dyld / libc 符号名
 
     /// dyld / libc symbol names resolved via `dlsym` for PLT integrity baselines.
     static var symbolSysctl: String {
@@ -915,6 +980,8 @@ enum ObfuscatedConstants {
     static var symbolDyldGetImageHeader: String {
         StringDeobfuscator.base64Decode("X2R5bGRfZ2V0X2ltYWdlX2hlYWRlcg==")
     }
+
+    // MARK: - 父进程 / 环境特征
 
     /// Parent process / path needles (anti-debug / anti-tamper heuristics).
     static var antiTamperSuspiciousParentNeedles: [String] {
@@ -953,6 +1020,9 @@ enum ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 镜像 / section / 字符串扫描标记
+
+    /// dyld 镜像名中出现的 Frida / Gum 特征。
     static var fridaModuleMarkers: [String] {
         [
             keywordFrida,
@@ -1041,6 +1111,9 @@ enum ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 注入库 / ObjC 扫描特征
+
+    /// 镜像路径扫描用的注入库 token；比 `suspiciousLibraryTokensForDyld` 更精简。
     static var hookSuspiciousImageTokens: [String] {
         [
             keywordFrida,
@@ -1151,10 +1224,14 @@ enum ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 分类、别名与组合特征
+
+    /// 证据分类值 "anti_tamper"。
     static var categoryAntiTamper: String {
         StringDeobfuscator.base64Decode("YW50aV90YW1wZXI=")
     }
 
+    /// 证据键 "hooked"：用已解码的 hook 关键词拼接后缀，避免完整单词出现在字符串表中。
     static var evidenceKeyHooked: String {
         "\(keywordHook)ed"
     }
@@ -1269,16 +1346,21 @@ enum ObfuscatedConstants {
 }
 
 extension ObfuscatedConstants {
+    /// 在受限作用域内使用解密后的字符串，退出时尽力清空引用。
+    /// 注意：Swift String 内部可能复制，这里只能缩短本变量的生命周期，不等于立即擦除内存。
     static func withDeobfuscated<T>(_ getter: () -> String, _ body: (String) -> T) -> T {
         var str = getter()
         defer {
+            // 尽早释放明文引用（best-effort）。
             str = ""
         }
         return body(str)
     }
 }
 
+/// 构建期配置：区分 DEBUG/Release，并在 Release 下关闭日志输出。
 enum BuildConfig {
+    /// 编译期判定的 Release 标志，避免运行期被动态改写。
     static let isRelease: Bool = {
         #if DEBUG
         return false
@@ -1287,8 +1369,11 @@ enum BuildConfig {
         #endif
     }()
 
+    /// 是否已完成 Release 配置，保证配置逻辑幂等。
     private(set) static var isConfigured = false
 
+    /// Release 下关闭 Logger，避免检测细节与敏感路径进入系统日志。
+    /// 幂等：重复调用不会重复执行配置。
     static func configureForRelease() {
         guard !isConfigured else { return }
         isConfigured = true

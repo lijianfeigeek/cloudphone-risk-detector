@@ -1,3 +1,7 @@
+// 检测器注册中心（DetectorRegistry）
+// 职责：维护“检测器类型 -> 工厂”的注册表、分组顺序与元数据清单，统一执行单个/分组/全量检测。
+// 管道位置：Detection/Adapter 层，JailbreakEngine.detectV2 通过它调度所有检测器。
+// 安全要点：注册表加锁，seal 后拒绝一切注册/注销，防止运行期被替换或摘除检测器。
 import Foundation
 
 /// 检测器注册中心
@@ -8,12 +12,18 @@ import Foundation
 /// - 使用注册模式，支持动态添加/移除检测器
 /// - 与现有 JailbreakEngine 兼容，可以通过配置启用新检测器
 /// - 支持检测器分组管理（越狱检测、反篡改检测、行为检测等）
+///
+/// ## 线程模型与安全不变量
+/// - 注册表的读写都由 `UnfairLock` 保护，可被多个评估任务并发调用。
+/// - `seal()` 之后注册表冻结：任何注册/注销请求只记录日志并返回，保证检测能力不被运行期篡改。
 public final class DetectorRegistry {
     
     // MARK: - Singleton
     
+    /// 进程级单例；检测器工厂在初始化时由运行时 plan 构建一次。
     public static let shared = DetectorRegistry()
-    
+
+    /// 私有初始化：注册表与分组顺序一次性构建，避免外部创建出不一致的实例。
     private init() {
         self.registry = DetectorRegistryBootstrap.makeDefaultRegistry()
         self.groupTypeOrder = DetectorRegistryBootstrap.makeOrderedGroups()
@@ -46,6 +56,7 @@ public final class DetectorRegistry {
         case moduleWhitelist         // 模块白名单（对抗 IPA 重签注入/越狱 tweak 注入）
         case syscallCrossValidator   // libc 与直接 SVC 结果一致性（对抗越狱隐藏工具）
 
+        /// 稳定字符串标识；部分常量来自混淆表，避免在 `__cstring` 中暴露检测语义。
         public var rawValue: String {
             switch self {
             case .file: return "file"
@@ -68,6 +79,7 @@ public final class DetectorRegistry {
             }
         }
 
+        /// 由字符串反查类型；未知值返回 nil，供配置解析时安全降级。
         public init?(rawValue: String) {
             guard let match = Self.allCases.first(where: { $0.rawValue == rawValue }) else {
                 return nil
@@ -76,7 +88,8 @@ public final class DetectorRegistry {
         }
     }
 
-    /// 检测器分组
+    /// 检测器分组：越狱、反篡改、完整性。
+    /// 分组决定执行顺序与汇总口径，同一分组内按 `groupTypeOrder` 稳定串行执行。
     public enum DetectorGroup: CaseIterable, Sendable {
         case jailbreak
         case antiTamper
@@ -98,7 +111,10 @@ public final class DetectorRegistry {
         }
     }
 
+    /// 控制流平坦化（CFF）参数：把 `detect(type:)` / `detect(group:)` 的状态机编译成
+    /// 不透明的编码状态跳转，降低静态阅读与定向 Hook 的成功率。
     private enum CFF {
+        /// 非语义域标签，仅参与种子派生，不暴露具体检测器名。
         static let detectTypeLabel = "dr_dt_v1"
         static let detectGroupLabel = "dr_dg_v1"
 
@@ -116,6 +132,7 @@ public final class DetectorRegistry {
             codecStyle: .feistelSpn
         )
 
+        /// 按检测器类型派生运行时盐值，使不同检测路径的状态编码互不相同。
         static func salt(for type: DetectorType) -> UInt32 {
             CFFRuntimeSalt.derive(
                 functionSeed: detectTypeConfig.functionSeed,
@@ -127,6 +144,7 @@ public final class DetectorRegistry {
             )
         }
 
+        /// 按分组与成员数量派生盐值；成员数变化会让旧状态的解码自然失效。
         static func salt(for group: DetectorGroup, detectorCount: Int) -> UInt32 {
             CFFRuntimeSalt.derive(
                 functionSeed: detectGroupConfig.functionSeed,
@@ -138,6 +156,7 @@ public final class DetectorRegistry {
             )
         }
 
+        /// FNV-1a 64 位哈希：跨进程稳定，用于把类型/分组字符串混入盐值。
         private static func stableHash64(_ value: String) -> UInt64 {
             var hash: UInt64 = 0xCBF29CE484222325
             for byte in value.utf8 {
@@ -165,6 +184,13 @@ public final class DetectorRegistry {
         /// 检测器优先级（同组冲突时保留优先级最高者，默认 100）
         public let priority: Int
 
+        /// - Parameters:
+        ///   - minOS: 最低支持的 iOS 版本，低于该版本不调度。
+        ///   - maxOS: 最高支持版本；nil 表示无上限。
+        ///   - dependsOn: 必须先启用的检测器集合（仅声明，调度方按需校验）。
+        ///   - conflictsWith: 互斥检测器；同时启用时保留 `priority` 更高者。
+        ///   - signalOverlapGroup: 重叠组标识；同组评分取 max，避免同源重复计分。
+        ///   - priority: 冲突/同分时的优先级，默认 100，数值越大越优先。
         public init(
             minOS: Double = 14.0,
             maxOS: Double? = nil,
@@ -182,7 +208,9 @@ public final class DetectorRegistry {
         }
     }
 
-    /// 内置检测器元数据注册表
+    /// 内置检测器元数据注册表。
+    /// 重叠组把“同源检测”折叠为一个计分来源；例如 `frida` 与 `fridaModule` 同组，
+    /// `functionIntegrityHash` 也与 Frida 族同组，避免多处命中被重复累加。
     private static let manifests: [DetectorType: DetectorManifest] = [
         .file: DetectorManifest(signalOverlapGroup: ObfuscatedConstants.overlapGroupJailbreakFile),
         .dyld: DetectorManifest(signalOverlapGroup: "dyld"),
@@ -235,10 +263,12 @@ public final class DetectorRegistry {
     
     // MARK: - 线程安全与封印
 
+    /// 保护注册表与封印标记的自旋锁；所有读写路径都必须经过它。
     private let lock = UnfairLock()
 
     /// 封印后拒绝一切 register/unregister 操作
     private var _isSealed = false
+    /// 只读查询封印状态；读取也加锁，避免与 `seal()` 竞争时看到撕裂状态。
     public var isSealed: Bool {
         lock.withLock { _isSealed }
     }
@@ -260,8 +290,10 @@ public final class DetectorRegistry {
     /// - Parameters:
     ///   - type: 检测器类型
     ///   - factory: 检测器工厂闭包
+    /// - Note: 已封印时静默拒绝（只记日志），不抛错以免调用方误判注册成功。
     public func register(type: DetectorType, factory: @escaping DetectorFactory) {
         lock.withLock {
+            // 封印是最后一道防线：运行期任何替换检测器的尝试都不得生效。
             guard !_isSealed else {
                 Logger.log("DetectorRegistry.register rejected (sealed): \(type.rawValue)")
                 return
@@ -273,6 +305,7 @@ public final class DetectorRegistry {
     
     /// 注销检测器
     /// - Parameter type: 检测器类型
+    /// - Note: 封印后拒绝注销，防止攻击者通过摘除检测器让风险分数归零。
     public func unregister(type: DetectorType) {
         lock.withLock {
             guard !_isSealed else {
@@ -284,7 +317,8 @@ public final class DetectorRegistry {
         }
     }
 
-    /// 封印注册表，调用后拒绝一切 register/unregister 操作
+    /// 封印注册表，调用后拒绝一切 register/unregister 操作。
+    /// 典型调用时机：默认检测器已注册且完整性校验通过之后。
     public func seal() {
         lock.withLock {
             _isSealed = true
@@ -295,6 +329,7 @@ public final class DetectorRegistry {
     /// 创建检测器实例
     /// - Parameter type: 检测器类型
     /// - Returns: 检测器实例，如果类型未注册则返回 nil
+    /// - Note: 工厂在锁内执行，避免注册表被并发修改；工厂本身应保持轻量。
     public func createDetector(type: DetectorType) -> Detector? {
         lock.withLock {
             guard let factory = registry[type] else {
@@ -305,9 +340,12 @@ public final class DetectorRegistry {
         }
     }
     
-    /// 执行指定类型的检测
+    /// 执行指定类型的检测。
+    ///
+    /// 状态机顺序：entry -> create -> (connector/settle) -> execute -> finish。
+    /// 状态值经过 CFF 编码，并带 `loopBudget` 上限；预算耗尽时返回已完成的部分结果。
     /// - Parameter type: 检测器类型
-    /// - Returns: 检测结果
+    /// - Returns: 检测结果；未注册返回 `.empty`，检测器抛错返回异常分（score 80）。
     public func detect(type: DetectorType) -> DetectorResult {
         let cffConfig = CFF.detectTypeConfig
         let salt = CFF.salt(for: type)
@@ -318,10 +356,13 @@ public final class DetectorRegistry {
         let settleState: UInt32 = 0x35
         let finishState: UInt32 = 0x36
 
+        // 检测器崩溃/抛错不能当作“干净”：统一折算为高分异常信号，交由上层判决。
         let anomalyResult = DetectorResult(score: 80, methods: ["detector_anomaly_\(type.rawValue)"])
         let cffKey = CFFStateCodec.deriveSeed(function: CFF.detectTypeLabel, config: cffConfig)
+        // 关闭运行时盐时用固定掩码派生，保证行为可复现（主要供调试/测试）。
         let effectiveSalt = cffConfig.enableRuntimeSalt ? salt : salt ^ 0x13579BDF
 
+        // 单个检测状态机的编解码快捷函数：统一使用本次类型派生的 key/salt。
         func encodeState(_ rawState: UInt32) -> UInt32 {
             CFFStateCodec.encode(state: rawState, key: cffKey, salt: effectiveSalt, style: cffConfig.codecStyle)
         }
@@ -333,6 +374,7 @@ public final class DetectorRegistry {
         var sink = CFFReturnSink<DetectorResult>()
         var detector: Detector?
         var result: DetectorResult = .empty
+        // 硬上限防止状态机因编码/派发异常而活锁；正常路径最多消耗 6 步。
         var loopBudget = 20
         var encodedState = encodeState(entryState)
 
@@ -411,10 +453,11 @@ public final class DetectorRegistry {
         return sink.resolve(or: result)
     }
     
-    /// 执行指定分组的所有检测
+    /// 执行指定分组的所有检测（组内按稳定顺序串行）。
     /// - Parameter group: 检测器分组
-    /// - Returns: 分组检测结果
+    /// - Returns: 分组检测结果；分组不存在时返回 `details == "group_not_found"`。
     public func detect(group: DetectorGroup) -> GroupDetectionResult {
+        // 分组缺失时返回空结果而非崩溃，保持调用链 fail-open 到上层统一判决。
         guard let orderedTypes = groupTypeOrder[group], !orderedTypes.isEmpty else {
             return GroupDetectionResult(score: 0, methods: [], details: "group_not_found")
         }
@@ -431,10 +474,12 @@ public final class DetectorRegistry {
         var allMethods: [String] = []
         var typeIndex = 0
         var currentType: DetectorType?
+        // 每个检测器最多 5 个状态步，另加固定余量；防止状态机异常时无限循环。
         var loopBudget = max(24, orderedTypes.count * 5 + 10)
         let cffKey = CFFStateCodec.deriveSeed(function: CFF.detectGroupLabel, config: cffConfig)
         let effectiveSalt = cffConfig.enableRuntimeSalt ? salt : salt ^ 0x13579BDF
 
+        // 分组状态机的编解码快捷函数。
         func encodeState(_ rawState: UInt32) -> UInt32 {
             CFFStateCodec.encode(state: rawState, key: cffKey, salt: effectiveSalt, style: cffConfig.codecStyle)
         }
@@ -446,6 +491,7 @@ public final class DetectorRegistry {
         var sink = CFFReturnSink<GroupDetectionResult>()
         var encodedState = encodeState(entryState)
 
+        // 分组收尾：方法名去重排序，并附带分组标识供上层解释。
         func finalizeResult() -> GroupDetectionResult {
             GroupDetectionResult(
                 score: totalScore,
@@ -535,6 +581,8 @@ public final class DetectorRegistry {
     /// - Returns: 综合检测结果
     ///
     /// 同一 `signalOverlapGroup` 内的检测器评分取最高值（而非累加），防止重复计分。
+    /// - Parameter enabledTypes: 本次启用的检测器集合，默认全部。
+    /// - Returns: 各分组结果、去重后的方法列表、总分与可上报的摘要。
     public func detectAll(enabledTypes: Set<DetectorType> = Set(DetectorType.allCases)) -> ComprehensiveDetectionResult {
         var groupResults: [DetectorGroup: GroupDetectionResult] = [:]
         var totalScore: Double = 0
@@ -550,7 +598,8 @@ public final class DetectorRegistry {
                 rawResults.append((detectorType, result))
             }
 
-            // 信号重叠去重：同组取 max score
+            // 信号重叠去重：同一 signalOverlapGroup 只保留分数最高（同分取高 priority）的一条，
+            // 避免 Frida/模块注入等同一根因被多个检测器重复计分。
             let deduped = deduplicateByOverlapGroup(rawResults)
 
             var groupScore: Double = 0
@@ -580,7 +629,7 @@ public final class DetectorRegistry {
     
     /// 获取检测器类型所属分组
     /// - Parameter type: 检测器类型
-    /// - Returns: 检测器分组
+    /// - Returns: 检测器分组；未编入任何分组时返回 nil
     public func group(for type: DetectorType) -> DetectorGroup? {
         for (group, types) in groupTypeOrder {
             if types.contains(type) {
@@ -599,12 +648,16 @@ public final class DetectorRegistry {
     
     // MARK: - Manifest 查询
 
-    /// 获取检测器的元数据清单
+    /// 获取检测器的元数据清单；未登记的类型返回默认 manifest（minOS 14.0、无依赖）。
     public func manifest(for type: DetectorType) -> DetectorManifest {
         Self.manifests[type] ?? DetectorManifest()
     }
 
-    /// 判断检测器在当前 iOS 版本上是否可用
+    /// 判断检测器在当前 iOS 版本上是否可用。
+    /// - Parameters:
+    ///   - type: 检测器类型
+    ///   - osVersion: 当前系统版本（如 17.4）
+    /// - Returns: 是否落在 `minOS...maxOS` 闭区间内。
     public func isAvailable(_ type: DetectorType, osVersion: Double) -> Bool {
         let m = manifest(for: type)
         if osVersion < m.minOS { return false }
@@ -612,13 +665,15 @@ public final class DetectorRegistry {
         return true
     }
 
-    /// 获取指定检测器的未满足依赖
+    /// 获取指定检测器尚未满足的依赖（`dependsOn` 减去已启用集合）。
+    /// 调用方可用它决定跳过该检测器或补充启用依赖项。
     public func unsatisfiedDependencies(for type: DetectorType, enabledTypes: Set<DetectorType>) -> Set<DetectorType> {
         let m = manifest(for: type)
         return m.dependsOn.subtracting(enabledTypes)
     }
 
-    /// 对分组检测结果进行信号重叠去重（同 signalOverlapGroup 内取 max score）
+    /// 对分组检测结果进行信号重叠去重（同 signalOverlapGroup 内取 max score）。
+    /// 同分时比较 manifest 的 `priority`，优先级高者胜出；无重叠组的结果原样保留。
     public func deduplicateByOverlapGroup(_ results: [(DetectorType, DetectorResult)]) -> [(DetectorType, DetectorResult)] {
         var groupBest: [String: (DetectorType, DetectorResult)] = [:]
         var ungrouped: [(DetectorType, DetectorResult)] = []
@@ -643,6 +698,7 @@ public final class DetectorRegistry {
 
     // MARK: - 辅助方法
 
+    /// 生成上报摘要：只保留前 10 个方法名，避免详情字符串无限膨胀。
     private func generateSummary(totalScore: Double, methods: [String]) -> String {
         let methodCount = methods.count
         return """
@@ -655,16 +711,21 @@ public final class DetectorRegistry {
 
 // MARK: - 运行时工厂 Plan（降低静态字面量可扫性）
 
+/// 默认检测器工厂的引导构建器。
+/// 工厂清单与分组成员以 token/哈希排序后才注册，使源码书写顺序不等于运行时执行顺序，
+/// 增加静态扫描者预测检测顺序的难度。
 private enum DetectorRegistryBootstrap {
     /// 与 token 混合后再排序，使源码中的行序与运行时注册序解耦
     static let planMix: UInt64 = 0xD37E_C70E_9E41_D6C1
 
+    /// 一条工厂记录：`token` 仅参与排序，`type`/`factory` 才是实际注册内容。
     private struct FactoryToken {
         let token: UInt64
         let type: DetectorRegistry.DetectorType
         let factory: DetectorRegistry.DetectorFactory
     }
 
+    /// 内置工厂清单；新增检测器时必须同步加入 `groupMembership`，否则不会被分组执行。
     private static let factoryPlan: [FactoryToken] = [
         FactoryToken(token: 0x4B21F9A2C0D18E71, type: .file, factory: { FileDetector() }),
         FactoryToken(token: 0x2E88D403F19A56B4, type: .dyld, factory: { DyldDetector() }),
@@ -686,6 +747,7 @@ private enum DetectorRegistryBootstrap {
         FactoryToken(token: 0x089C6E7B4D1270AC, type: .syscallCrossValidator, factory: { DirectSyscallCrossValidator() }),
     ]
 
+    /// 分组静态成员表；`Set` 只表达归属，实际执行顺序由 `makeOrderedGroups` 的哈希排序决定。
     private static let groupMembership: [DetectorRegistry.DetectorGroup: Set<DetectorRegistry.DetectorType>] = [
         .jailbreak: [.file, .dyld, .env, .sysctl, .scheme, .hook],
         .antiTamper: [
@@ -696,6 +758,7 @@ private enum DetectorRegistryBootstrap {
         .integrity: [.codeSignature, .memoryIntegrity, .runtimeIntegrity],
     ]
 
+    /// 每个分组使用固定盐值，使同一类型在不同分组中的排序键不同。
     private static func groupSalt(_ group: DetectorRegistry.DetectorGroup) -> UInt64 {
         switch group {
         case .jailbreak: return 0x1110_AAAA_BBBB_CCC1
@@ -704,6 +767,7 @@ private enum DetectorRegistryBootstrap {
         }
     }
 
+    /// FNV-1a 64：为分组排序提供跨进程稳定的哈希键。
     private static func fnv1a64(_ text: String) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
         for b in text.utf8 {
@@ -713,6 +777,8 @@ private enum DetectorRegistryBootstrap {
         return hash
     }
 
+    /// 按 `token ^ planMix` 排序后构建默认注册表。
+    /// - Returns: 类型到工厂的字典；排序只影响构建顺序，不影响字典查找语义。
     static func makeDefaultRegistry() -> [DetectorRegistry.DetectorType: DetectorRegistry.DetectorFactory] {
         let ordered = factoryPlan.sorted {
             ($0.token ^ planMix) < ($1.token ^ planMix)
@@ -725,6 +791,7 @@ private enum DetectorRegistryBootstrap {
         return reg
     }
 
+    /// 为每个分组生成稳定、可复现的执行顺序（不依赖 `Set` 的迭代顺序）。
     static func makeOrderedGroups() -> [DetectorRegistry.DetectorGroup: [DetectorRegistry.DetectorType]] {
         var out: [DetectorRegistry.DetectorGroup: [DetectorRegistry.DetectorType]] = [:]
         for (group, members) in groupMembership {
@@ -744,13 +811,14 @@ private enum DetectorRegistryBootstrap {
 // MARK: - 检测结果类型
 
 /// 分组检测结果
+/// - `score`: 组内去重后的分数总和；`methods`: 命中的方法标识；`details`: 分组标识。
 public struct GroupDetectionResult {
     public let score: Double
     public let methods: [String]
     public let details: String
 }
 
-/// 综合检测结果
+/// 综合检测结果：跨分组汇总后的总分、各组明细与去重方法列表。
 public struct ComprehensiveDetectionResult {
     public let totalScore: Double
     public let groupResults: [DetectorRegistry.DetectorGroup: GroupDetectionResult]
@@ -772,10 +840,11 @@ public struct ComprehensiveDetectionResult {
 
 extension JailbreakConfig {
     
-    /// 从配置创建启用的检测器类型集合
+    /// 从配置创建启用的检测器类型集合。
+    /// 旧字段只控制越狱类检测器；反篡改/完整性类默认全部启用，由 `V2Config` 另行裁剪。
     var enabledDetectorTypes: Set<DetectorRegistry.DetectorType> {
         var types: Set<DetectorRegistry.DetectorType> = []
-        
+
         if enableFileDetect { types.insert(.file) }
         if enableDyldDetect { types.insert(.dyld) }
         if enableEnvDetect { types.insert(.env) }
@@ -801,7 +870,7 @@ extension JailbreakConfig {
         return types
     }
     
-    /// 创建包含新检测器的配置
+    /// 创建包含新检测器的配置入口（当前仅设置旧检测开关，新检测器由默认集合补齐）。
     public static func v2(
         threshold: Double = 30,
         enableJailbreak: Bool = true,
@@ -831,11 +900,12 @@ extension JailbreakEngine {
     
     /// 使用新检测器架构进行检测
     /// - Parameter config: 检测配置
-    /// - Returns: 检测结果
+    /// - Returns: 检测结果；`confidence` 取总分并截断到 100。
     func detectV2(config: JailbreakConfig) -> DetectionResult {
         let enabledTypes = config.enabledDetectorTypes
         let result = DetectorRegistry.shared.detectAll(enabledTypes: enabledTypes)
-        
+
+        // 判决阈值来自配置；达到阈值即判越狱，分数同时作为置信度上报。
         let isJailbroken = result.totalScore >= config.threshold
         
         return DetectionResult(

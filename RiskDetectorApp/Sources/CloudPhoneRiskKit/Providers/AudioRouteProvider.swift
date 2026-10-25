@@ -18,6 +18,8 @@ final class AudioRouteProvider: RiskSignalProvider {
 
     let id = "audio_route"
 
+    /// 仅在 iOS 真机执行：模拟器没有真实音频路由，其他平台无 AVAudioSession。
+    /// 音频会话 API 要求主线程访问，故统一派发到主线程。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []
@@ -31,6 +33,8 @@ final class AudioRouteProvider: RiskSignalProvider {
     }
 
     #if !targetEnvironment(simulator) && os(iOS)
+    /// 读取 `currentRoute.outputs` 并输出 USB/LineOut、虚拟音频两类信号。
+    /// 两类信号均为 soft，需结合其他设备信号判断，避免正常外接声卡误杀。
     private func collectSignals() -> [RiskSignal] {
         var out: [RiskSignal] = []
         let session = AVAudioSession.sharedInstance()
@@ -88,6 +92,7 @@ final class AudioRouteProvider: RiskSignalProvider {
         return out
     }
 
+    /// 若当前非主线程则同步派发到主线程执行；AVAudioSession 在主线程访问更安全。
     private func runOnMainIfNeeded<T>(_ block: () -> T) -> T {
         if Thread.isMainThread {
             return block()

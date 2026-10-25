@@ -1,13 +1,19 @@
+// 信号词汇表与线上编码：集中定义 `SignalID`/`SignalCategory` 常量、`RiskSignalState` 枚举，
+// 以及上报用的短键 `RiskSignal` wire 结构（i/ca/s/ev/st/l/wh）。
+// 这些 id、category 与字段名属于跨端协议，改动会破坏服务端解析；新增信号只追加、不复用旧 id。
+// 状态编码只写必要字段，解码端对 confidence 做防御性归一化。
 import Foundation
 
 // MARK: - Signal Identifiers
 
-/// 统一管理所有 RiskSignal 的 ID，避免字符串散落各处导致拼写错误和维护困难
+/// 统一管理所有 RiskSignal 的 ID，避免字符串散落各处导致拼写错误和维护困难。
+/// 约定：id 为小写下划线 ASCII，跨端稳定；同一 id 应始终对应同一种检测语义。
 public enum SignalID {
     // Jailbreak
     static let jailbreak = ObfuscatedConstants.signalJailbreak
 
     // Network
+    // 网络类信号：可能由真实网络环境变化触发，评分时需结合服务端聚合判断。
     static let vpnActive = ObfuscatedConstants.requiredSignalVpnActive
     static let proxyEnabled = "proxy_enabled"
     static let networkInterfaceAnomaly = "network_interface_anomaly"
@@ -44,6 +50,7 @@ public enum SignalID {
     static let ipAccountAgg = "ip_account_agg"
 
     // Cloud Phone / Hardware
+    // 云手机/硬件类信号：单项通常不足以下结论，强调多信号一致性。
     static let gpuVirtual = "gpu_virtual"
     static let vphoneHardware = "vphone_hardware"
     static let hardwareInconsistency = "hardware_inconsistency"
@@ -199,7 +206,8 @@ public enum SignalID {
 
 // MARK: - Signal Categories
 
-/// 统一管理所有 RiskSignal 的 category
+/// 统一管理所有 RiskSignal 的 category。
+/// category 是粗粒度归类（越狱/网络/行为/时序/服务端/云手机），用于聚合与默认权重。
 public enum SignalCategory {
     static let jailbreak = ObfuscatedConstants.signalJailbreak
     static let network = "network"
@@ -209,6 +217,13 @@ public enum SignalCategory {
     static let cloudphone = "cloudphone"
 }
 
+/// 信号状态，决定服务端如何解读该信号：
+/// - `.hard(detected:)`：确定性检测，detected 为最终布尔结论；
+/// - `.soft(confidence:)`：启发式证据，confidence 归一化到 0–1；
+/// - `.serverRequired`：本地无法定论，需服务端聚合/二次判定；
+/// - `.unavailable`：该检测面在当前环境不可用（不算命中，也不等于清白）；
+/// - `.tampered`：证据表明检测链路被篡改，优先级最高。
+/// wire 编码见 `CodingKeys`：只写类型 t 与对应载荷 d/c；未知类型会导致解码失败。
 public enum RiskSignalState: Sendable, Codable, Equatable {
     case hard(detected: Bool)
     case soft(confidence: Double)
@@ -216,12 +231,14 @@ public enum RiskSignalState: Sendable, Codable, Equatable {
     case unavailable
     case tampered
 
+    // 短键压缩上报体积：type→t、detected→d、confidence→c。
     private enum CodingKeys: String, CodingKey {
         case type = "t"
         case detected = "d"
         case confidence = "c"
     }
 
+    /// 线上状态类型字符串；rawValue 即 wire 值，不可随意改名。
     private enum StateType: String, Codable {
         case hard
         case soft
@@ -230,6 +247,7 @@ public enum RiskSignalState: Sendable, Codable, Equatable {
         case tampered
     }
 
+    /// 解码状态；对 confidence 做防御性归一化（非有限值按 0，越界裁剪到 0–1）。
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(StateType.self, forKey: .type)
@@ -238,6 +256,7 @@ public enum RiskSignalState: Sendable, Codable, Equatable {
             self = .hard(detected: try container.decode(Bool.self, forKey: .detected))
         case .soft:
             let raw = try container.decode(Double.self, forKey: .confidence)
+            // 服务端/中间人可能给出 NaN/Inf 或越界值，不能让坏值进入评分。
             self = .soft(confidence: raw.isFinite ? min(max(raw, 0), 1) : 0)
         case .serverRequired:
             self = .serverRequired
@@ -248,6 +267,7 @@ public enum RiskSignalState: Sendable, Codable, Equatable {
         }
     }
 
+    /// 按状态类型只编码必要字段，保持与解码端对称。
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
@@ -267,15 +287,26 @@ public enum RiskSignalState: Sendable, Codable, Equatable {
     }
 }
 
+/// 单条风险信号：id/category 定位检测面，score 表示本地强度，
+/// evidence 提供可解释证据，state/layer/weightHint 供融合引擎判断置信度与权重。
+/// wire 编码使用短键，见 `CodingKeys`。
 public struct RiskSignal: Sendable, Codable {
+    /// 信号类型 id（见 `SignalID`），跨端稳定
     public var id: String
+    /// 信号分类（见 `SignalCategory`），用于聚合与权重归类
     public var category: String
+    /// 本地原始分（0–100 语义），不代表最终判决
     public var score: Double
+    /// 键值证据；只放可上报的短字符串，不得包含原始 IDFV/坐标等隐私数据
     public var evidence: [String: String]
+    /// 信号状态；nil 表示旧版/无状态信号，由引擎按 category 权重处理
     public var state: RiskSignalState?
+    /// 检测层级：1 基础、2 聚合/设备、3 篡改/一致性等，用于跨层共识
     public var layer: Int?
+    /// 提供者建议权重（0 表示未提供）；融合引擎会与最低权重取 max，防止被伪造压低
     public var weightHint: Double
 
+    // 短键：i/ca/s/ev/st/l/wh，与服务端解析约定一致。
     private enum CodingKeys: String, CodingKey {
         case id = "i"
         case category = "ca"
@@ -286,6 +317,7 @@ public struct RiskSignal: Sendable, Codable {
         case weightHint = "wh"
     }
 
+    /// 创建信号；state/layer/weightHint 可选，weightHint 默认 0 表示由引擎决定权重。
     public init(
         id: String,
         category: String,

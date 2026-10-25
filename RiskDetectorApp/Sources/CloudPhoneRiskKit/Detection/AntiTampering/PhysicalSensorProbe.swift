@@ -4,6 +4,12 @@ import Foundation
 import CoreMotion
 #endif
 
+// MARK: - 物理传感器探测
+//
+// 云手机/模拟器无法提供真实物理传感器数据，或数据呈现恒定重力、零噪声、零漂移、
+// 磁场异常、气压恒定等特征。本检测器采集 CoreMotion 的 15 帧（约 0.5 秒）样本并分析，
+// 结果按 TTL 缓存并支持启动预热，避免支付等主路径被同步采样阻塞。
+
 /// 物理传感器异常探测
 ///
 /// 云手机/模拟器通常无法提供真实的物理传感器数据，或数据呈现明显异常特征：
@@ -21,10 +27,13 @@ import CoreMotion
 /// - 未预热兜底：主线程冷启动直接返回 pending 并继续后台预热；后台线程仍可同步采集
 struct PhysicalSensorProbe: Detector {
 
+    // 15 帧 @30 Hz ≈ 0.5 秒：足够计算方差，又能控制支付场景的等待时间。
     private static let deviceMotionSampleCount = 15
     /// 30 Hz 采样率，15 帧约 0.5 秒（支付场景 UX 友好）
     private static let deviceMotionInterval: TimeInterval = 1.0 / 30.0
+    // 2 秒总超时：覆盖传感器启动延迟，同时保证检测链路不会被无限拖住。
     private static let totalTimeoutSeconds: TimeInterval = 2.0
+    // 气压计采样 1 秒：相对海拔变化缓慢，短窗口只用于判断读数是否恒定。
     private static let barometerSampleSeconds: TimeInterval = 1.0
 
     /// 缓存 TTL（秒），超时后评估时需同步采集兜底
@@ -39,7 +48,8 @@ struct PhysicalSensorProbe: Detector {
     private static let cacheStateLock = UnfairLock()
     private static var cacheState = CacheState()
 
-    /// 后台异步预热，在 CPRiskKit.start() 时调用，不阻塞主流程
+    /// 后台异步预热，在 CPRiskKit.start() 时调用，不阻塞主流程。
+    /// - Parameter forceRefresh: 为 true 时忽略缓存直接重采（用于过期缓存的后台刷新）。
     static func prewarm(forceRefresh: Bool = false) {
         #if targetEnvironment(simulator) || !os(iOS)
         return
@@ -64,6 +74,7 @@ struct PhysicalSensorProbe: Detector {
         #endif
     }
 
+    /// 在锁内判断是否需要启动预热；正在预热或缓存仍新鲜时返回 false。
     private static func beginPrewarmIfNeeded(now: TimeInterval, forceRefresh: Bool) -> Bool {
         cacheStateLock.withLock {
             if cacheState.isPrewarming { return false }
@@ -78,10 +89,12 @@ struct PhysicalSensorProbe: Detector {
         }
     }
 
+    /// 清除预热进行中标记；由 `defer` 保证异常路径也会调用。
     private static func finishPrewarm() {
         cacheStateLock.withLock { cacheState.isPrewarming = false }
     }
 
+    /// 存储检测结果与时间戳，供后续评估零阻塞读取。
     private static func storeCache(_ result: DetectorResult, at timestamp: TimeInterval) {
         cacheStateLock.withLock {
             cacheState.cachedResult = result
@@ -89,6 +102,7 @@ struct PhysicalSensorProbe: Detector {
         }
     }
 
+    /// 读取缓存快照与年龄；无缓存时返回 nil。
     private static func cachedSnapshot(now: TimeInterval) -> (result: DetectorResult, age: TimeInterval)? {
         cacheStateLock.withLock {
             guard let result = cacheState.cachedResult, cacheState.cachedTimestamp > 0 else { return nil }
@@ -96,10 +110,14 @@ struct PhysicalSensorProbe: Detector {
         }
     }
 
+    /// 评估入口：优先返回新鲜缓存，其次返回过期缓存并异步刷新；
+    /// 冷启动且在主线线程时返回 pending，避免阻塞 UI；后台线程可同步采集兜底。
     func detect() throws -> DetectorResult {
         #if targetEnvironment(simulator)
+        // 模拟器无真实传感器，直接降级。
         return DetectorResult(score: 0, methods: ["unavailable_simulator"])
         #elseif !os(iOS)
+        // 非 iOS 平台无 CoreMotion 语义，返回 0 分不参与判定。
         return DetectorResult(score: 0, methods: ["unavailable_macos"])
         #else
         let now = Date().timeIntervalSince1970
@@ -138,7 +156,8 @@ struct PhysicalSensorProbe: Detector {
         #endif
     }
 
-    /// 实际执行检测（供预热与 detect 兜底共用）
+    /// 实际执行检测（供预热与 detect 兜底共用）。
+    /// - 返回：各分项累加分数与明细；传感器不可用时提前返回 +20。
     private func performDetection() throws -> DetectorResult {
         #if targetEnvironment(simulator)
         return DetectorResult(score: 0, methods: ["unavailable_simulator"])
@@ -177,6 +196,9 @@ struct PhysicalSensorProbe: Detector {
     }
 
     #if canImport(CoreMotion) && !targetEnvironment(simulator) && os(iOS)
+    /// 采集并分析 deviceMotion：重力/加速度/陀螺仪/磁力计四类特征。
+    /// - 采样窗口：15 帧 @30 Hz，总超时 2 秒；
+    /// - 失败语义：超时 +15、采集错误 +12、样本不足 +10，均提前返回。
     private func collectAndAnalyzeDeviceMotion(motionManager: CMMotionManager) -> (score: Double, methods: [String]) {
         var score: Double = 0
         var methods: [String] = []
@@ -283,6 +305,9 @@ struct PhysicalSensorProbe: Detector {
     }
 
     #if os(iOS)
+    /// 采集气压计相对海拔读数，判断硬件是否存在及读数是否恒定。
+    /// - 采样窗口：1 秒，额外 0.5 秒等待余量；
+    /// - 授权不足/硬件不可用时给 10 分并提前返回。
     private func checkBarometer() -> (score: Double, methods: [String]) {
         var score: Double = 0
         var methods: [String] = []
@@ -355,6 +380,7 @@ struct PhysicalSensorProbe: Detector {
     }
     #endif
 
+    /// 计算三轴加速度样本各分量去均值后的总体标准差。
     private func stddevOfAccelerations(_ samples: [CMAcceleration]) -> Double {
         guard samples.count >= 2 else { return 0 }
         let n = Double(samples.count)
@@ -371,6 +397,7 @@ struct PhysicalSensorProbe: Detector {
         return sqrt(varSum / (n * 3.0))
     }
 
+    /// 计算三轴加速度的均方根（RMS），用于衡量本底噪声强度。
     private func rmsOfAccelerations(_ samples: [CMAcceleration]) -> Double {
         guard !samples.isEmpty else { return 0 }
         var sum = 0.0
@@ -380,6 +407,7 @@ struct PhysicalSensorProbe: Detector {
         return sqrt(sum / Double(samples.count * 3))
     }
 
+    /// 计算三轴角速度的均值向量与总体方差。
     private func meanAndVarianceOfRotationRates(_ samples: [CMRotationRate]) -> (mean: CMRotationRate, variance: Double) {
         guard samples.count >= 2 else { return (CMRotationRate(x: 0, y: 0, z: 0), 0) }
         let n = Double(samples.count)
@@ -396,6 +424,7 @@ struct PhysicalSensorProbe: Detector {
         return (mean, varSum / (n * 3.0))
     }
 
+    /// 计算一维样本的总体标准差。
     private func stddev(_ values: [Double]) -> Double {
         guard values.count >= 2 else { return 0 }
         let n = Double(values.count)
@@ -407,6 +436,9 @@ struct PhysicalSensorProbe: Detector {
 }
 
 extension PhysicalSensorProbe {
+    /// 将检测结果转换为 `physical_sensor_anomaly` 软信号。
+    /// - 置信度按 score/70 线性折算并封顶 1.0；
+    /// - layer 3、weightHint 70：物理传感器异常受设备姿态影响，需与其他证据联合判断。
     func asSignals() throws -> [RiskSignal] {
         let result = try detect()
         guard result.score > 0 else { return [] }

@@ -1,7 +1,16 @@
+// 越狱相关字符串表：路径、进程名、应用名、环境变量与系统配置特征。
+// 与 ObfuscatedStrings.swift 同属混淆常量，全部以 Base64 存储，运行时经 b64() 解码。
+// 单独拆文件只为按检测场景组织条目；score 是该证据的启发式计分权重。
 import Foundation
 
+/// 越狱检测特征集合的扩充。
+/// - 二元组 `(path/env, score)` 中的 score 由检测器汇总后与阈值比较，调权会直接影响判决。
+/// - 所有条目都惰性解码，源码与二进制中不出现明文路径或变量名。
 extension ObfuscatedConstants {
 
+    // MARK: - 可疑文件路径（含权重）
+
+    /// 常见越狱应用 / 工具路径及权重：越专用的工具给分越高（10–30）。
     static var jailbreakSuspiciousPaths: [(path: String, score: Double)] {
         [
             (b64("L0FwcGxpY2F0aW9ucy9DeWRpYS5hcHA="), 30),
@@ -41,6 +50,9 @@ extension ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 关键路径与噪声路径
+
+    /// 强证据路径：任一路径可访问即基本可判定越狱。
     static var jailbreakCriticalPaths: [String] {
         [
             b64("L2V0Yy9hcHQ="),
@@ -63,6 +75,9 @@ extension ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 进程名 / 应用名特征
+
+    /// 进程列表中出现的越狱工具、调试器与注入器进程名。
     static var sysctlSuspiciousProcessNeedles: [String] {
         [
             b64("Y3lkaWE="),
@@ -83,6 +98,7 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// 父进程名特征：正常 App 的父进程通常是 launchd，出现这些名字说明被调试/注入拉起。
     static var sysctlSuspiciousParentNeedles: [String] {
         [
             b64("Y3lkaWE="),
@@ -95,6 +111,7 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// 已安装应用列表中的越狱工具名。
     static var listApplicationsNeedles: [String] {
         [
             b64("c2lsZW8="),
@@ -108,6 +125,9 @@ extension ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 环境变量
+
+    /// roothide 越狱注入的环境变量；命中权重最高（35–40），因为正常进程不会设置这些值。
     static var roothideEnvVars: [(name: String, score: Double)] {
         [
             (b64("SkJST09U"), 40),
@@ -116,6 +136,7 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// dyld 注入相关环境变量及权重；`DYLD_INSERT_LIBRARIES` 直接加载外部库，权重 50。
     static var envSuspiciousVars: [(name: String, score: Double)] {
         [
             (b64("RFlMRF9JTlNFUlRfTElCUkFSSUVT"), 50),
@@ -137,6 +158,9 @@ extension ObfuscatedConstants {
         ]
     }
 
+    // MARK: - 系统配置文件
+
+    /// 越狱环境常见的系统配置文件路径（部分在未越狱设备上也存在，仅作弱证据）。
     static var systemConfigPaths: [String] {
         [
             b64("L2V0Yy9mc3RhYg=="),
@@ -147,8 +171,10 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// `/etc/hosts` 路径。
     static var hostsPath: String { b64("L2V0Yy9ob3N0cw==") }
 
+    /// apt 包管理器的配置 / 缓存路径（越狱后常见）。
     static var aptPaths: [String] {
         [
             b64("L2V0Yy9hcHQ="),
@@ -160,14 +186,20 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// apt 软件源列表路径。
     static var aptSourcesListPath: String { b64("L2V0Yy9hcHQvc291cmNlcy5saXN0") }
 
+    /// 软件源中的越狱社区仓库名。
     static var aptRepoNeedles: [String] {
         [b64("Y3lkaWE="), b64("YmlnYm9zcw=="), b64("bW9kbXlp")]
     }
 
+    /// `/etc/fstab` 路径；越狱工具常用它让根分区可写。
     static var fstabPath: String { b64("L2V0Yy9mc3RhYg==") }
 
+    // MARK: - hosts / fstab 篡改特征
+
+    /// hosts 中的可疑条目：屏蔽 OTA 更新或指向越狱源。
     static var suspiciousHostsEntries: [String] {
         [
             b64("MTI3LjAuMC4xIG9jc3A="),
@@ -179,6 +211,7 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// fstab 中的异常挂载项（如根分区 rw 或注入框架目录）。
     static var suspiciousFstabMounts: [String] {
         [
             b64("L3Zhcg=="),
@@ -189,6 +222,7 @@ extension ObfuscatedConstants {
         ]
     }
 
+    /// 统一的 Base64 查表入口；解码失败时 `base64Decode` 返回空串，调用方按“未命中”处理。
     private static func b64(_ s: String) -> String {
         StringDeobfuscator.base64Decode(s)
     }

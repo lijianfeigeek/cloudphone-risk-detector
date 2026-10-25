@@ -1,6 +1,13 @@
+// MARK: - 设备历史模型
+//
+// 职责：追踪设备在时间维度上的风险快照，计算时序统计特征、风险趋势、
+// 异常事件与设备稳定性指标，用于增量决策与风险溯源。
+// 位于评估管线的历史分析层：输入来自历次评估快照，输出趋势与稳定性信号。
+// 安全不变量：所有序列按时间戳排序并去重，避免乱序/重复快照污染趋势判断。
+// 注意：本结构已废弃，主实现为 `Analysis/DeviceHistory.DeviceHistory`。
+
 import Foundation
 
-// MARK: - 设备历史模型
 ///
 /// ## 设计理念
 ///
@@ -35,16 +42,25 @@ import Foundation
 @available(*, deprecated, message: "平行遗留实现；主实现为 Analysis/DeviceHistory.DeviceHistory")
 public struct RiskDeviceHistory: Codable, Sendable {
 
+    /// 历史快照列表（按时间戳升序）
     public let snapshots: [RiskDeviceSnapshot]
+    /// 最多保留的快照数量
     public let maxSnapshots: Int
+    /// 快照保留时长（秒）
     public let retentionPeriod: TimeInterval
 
+    /// JSON 编码键：使用短键名压缩体积。
     private enum CodingKeys: String, CodingKey {
         case snapshots = "sn"
         case maxSnapshots = "ms"
         case retentionPeriod = "rp"
     }
 
+    /// 创建设备历史。
+    /// - Parameters:
+    ///   - snapshots: 初始快照列表，会被排序。
+    ///   - maxSnapshots: 最多保留数量，默认 100。
+    ///   - retentionPeriod: 保留时长（秒），默认 30 天。
     public init(
         snapshots: [RiskDeviceSnapshot] = [],
         maxSnapshots: Int = 100,
@@ -52,6 +68,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
     ) {
         // 按时间戳排序并去重
         let sorted = snapshots.sorted { $0.timestamp < $1.timestamp }
+        // 注意：此处变量名为 unique，但初始化阶段并未调用去重；保持与既有实现一致
         let unique = sorted
 
         self.snapshots = unique
@@ -81,7 +98,9 @@ public struct RiskDeviceHistory: Codable, Sendable {
         )
     }
 
-    /// 批量添加快照
+    /// 批量添加快照。
+    /// - Parameter newSnapshots: 待追加的快照列表。
+    /// - Returns: 排序、去重并裁剪后的新历史实例。
     public func addingSnapshots(_ newSnapshots: [RiskDeviceSnapshot]) -> RiskDeviceHistory {
         var combined = snapshots + newSnapshots
         combined = combined.sorted { $0.timestamp < $1.timestamp }
@@ -114,6 +133,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
     public func temporalFeatures(window: TimeInterval? = nil) -> HistoryTemporalFeatures {
         let windowedSnapshots = snapshots(inWindow: window)
 
+        // 少于 2 个快照无法计算方差/趋势，返回退化结果（标准差与斜率记 0）
         guard windowedSnapshots.count >= 2 else {
             return HistoryTemporalFeatures(
                 count: windowedSnapshots.count,
@@ -137,12 +157,13 @@ public struct RiskDeviceHistory: Codable, Sendable {
         let maxScore = scores.max() ?? 0
         let minScore = scores.min() ?? 0
 
-        // 标准差
+        // 标准差（样本标准差，分母为 n-1；n=1 时退化为 1 避免除零）
         let variance = scores.map { pow($0 - meanScore, 2) }.reduce(0, +) / Double(max(scores.count - 1, 1))
         let stdScore = sqrt(variance)
 
         // 时间跨度
         guard let first = timestamps.first, let last = timestamps.last else {
+            // 理论上不可达（上面已保证 >= 2 条），保留防御性分支
             let highRiskThreshold: Double = 60
             let earlyHighRiskCount = scores.filter { $0 >= highRiskThreshold }.count
             return HistoryTemporalFeatures(
@@ -167,7 +188,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
             meanY: meanScore
         )
 
-        // 高风险统计
+        // 高风险统计：分数达到 60 即计入高风险事件
         let highRiskThreshold: Double = 60
         let highRiskCount = scores.filter { $0 >= highRiskThreshold }.count
         let highRiskRatio = Double(highRiskCount) / count
@@ -206,19 +227,22 @@ public struct RiskDeviceHistory: Codable, Sendable {
     public func riskTrend(window: TimeInterval? = nil) -> HistoryRiskTrend {
         let features = temporalFeatures(window: window)
 
+        // 至少 3 个样本才足以判断趋势，否则数据不足
         guard features.count >= 3 else {
             return .unknown
         }
 
-        // 趋势斜率判断（单位：分数/小时）
+        // 趋势斜率判断（单位：分数/小时）：原始斜率单位为“分数/秒”，乘 3600 转小时
         let slopePerHour = features.trendSlope * 3600
 
         // 先识别明确的单向趋势，再把无明显方向但方差过大的序列归类为 volatile。
+        // 阈值 0.5 分/小时：低于该变化视为噪声，避免把轻微波动误判为趋势。
         if slopePerHour > 0.5 {
             return .escalating
         } else if slopePerHour < -0.5 {
             return .deescalating
         } else if features.stdScore > 20 {
+            // 标准差 > 20 表示分数剧烈波动，虽无单向趋势但可疑
             return .volatile
         } else {
             return .stable
@@ -234,12 +258,13 @@ public struct RiskDeviceHistory: Codable, Sendable {
     /// 3. **首次越狱**：从正常状态变为越狱状态
     ///
     public func detectAnomalies(threshold: Double = 60) -> [HistoryAnomalyEvent] {
+        // 少于 2 条无法做相邻比较
         guard snapshots.count >= 2 else { return [] }
 
         var anomalies: [HistoryAnomalyEvent] = []
 
         for (prev, curr) in zip(snapshots, snapshots.dropFirst()) {
-            // 突变检测
+            // 突变检测：相邻快照分数跳升 30 分以上
             let scoreDelta = curr.riskScore - prev.riskScore
             if scoreDelta >= 30 {
                 anomalies.append(HistoryAnomalyEvent(
@@ -251,7 +276,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
                 ))
             }
 
-            // 越狱状态变化
+            // 越狱状态变化：仅记录“从未越狱变为越狱”的首次跃迁
             if !prev.wasJailbroken && curr.wasJailbroken {
                 anomalies.append(HistoryAnomalyEvent(
                     type: .jailbreakDetected,
@@ -276,6 +301,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
     /// 4. **位置稳定性**：时区/地区是否频繁变化
     ///
     public func stabilityMetrics() -> StabilityMetrics {
+        // 单条快照没有变化可比，视为完全稳定
         guard snapshots.count >= 2 else {
             return StabilityMetrics(
                 fingerprintStability: 1.0,
@@ -286,7 +312,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
             )
         }
 
-        // 指纹稳定性
+        // 指纹稳定性：不同指纹数量越少越稳定
         let uniqueFingerprints = Set(snapshots.map { $0.fingerprintHash }).count
         let fingerprintStability = 1.0 - (Double(uniqueFingerprints - 1) / Double(max(snapshots.count - 1, 1)))
 
@@ -319,7 +345,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
         }
         let locationStability = 1.0 - (Double(locationChanges) / Double(max(snapshots.count - 1, 1)))
 
-        // 综合稳定性
+        // 综合稳定性：四维等权平均
         let overallStability = (
             fingerprintStability +
             configurationStability +
@@ -327,6 +353,7 @@ public struct RiskDeviceHistory: Codable, Sendable {
             locationStability
         ) / 4.0
 
+        // 钳制到 [0,1]，防止异常输入导致越界
         return StabilityMetrics(
             fingerprintStability: max(0, min(1, fingerprintStability)),
             configurationStability: max(0, min(1, configurationStability)),
@@ -338,7 +365,9 @@ public struct RiskDeviceHistory: Codable, Sendable {
 
     // MARK: - 查询方法
 
-    /// 获取指定时间窗口内的快照
+    /// 获取指定时间窗口内的快照。
+    /// - Parameter window: 回溯时长（秒）；传 `nil` 返回全部快照。
+    /// - Returns: 时间戳落在窗口内的快照（相对当前时间）。
     public func snapshots(inWindow window: TimeInterval?) -> [RiskDeviceSnapshot] {
         guard let window = window else { return snapshots }
 
@@ -348,30 +377,34 @@ public struct RiskDeviceHistory: Codable, Sendable {
         return snapshots.filter { $0.timestamp >= windowStart }
     }
 
-    /// 获取最新的 N 个快照
+    /// 获取最新的 N 个快照。
+    /// - Parameter count: 数量。
+    /// - Returns: 末尾（最新）的至多 count 条快照。
     public func latestSnapshots(count: Int) -> [RiskDeviceSnapshot] {
         return Array(snapshots.suffix(count))
     }
 
-    /// 获取最新的快照
+    /// 获取最新的快照。
     public var latestSnapshot: RiskDeviceSnapshot? {
         return snapshots.last
     }
 
-    /// 获取最早的快照
+    /// 获取最早的快照。
     public var earliestSnapshot: RiskDeviceSnapshot? {
         return snapshots.first
     }
 
     // MARK: - 私有辅助方法
 
-    /// 去除时间戳相近的重复快照（1分钟内只保留一个）
+    /// 去除时间戳相近的重复快照（1分钟内只保留一个）。
+    /// 输入必须已按时间升序排列。
     private func reduceDuplicates(_ snapshots: [RiskDeviceSnapshot]) -> [RiskDeviceSnapshot] {
         var result: [RiskDeviceSnapshot] = []
         var lastTimestamp: TimeInterval?
 
         for snapshot in snapshots {
             if let last = lastTimestamp {
+                // 与上一条保留记录间隔超过 60 秒才保留，抑制短时间重复快照
                 if snapshot.timestamp - last > 60 { // 1分钟间隔
                     result.append(snapshot)
                     lastTimestamp = snapshot.timestamp
@@ -385,7 +418,8 @@ public struct RiskDeviceHistory: Codable, Sendable {
         return result
     }
 
-    /// 清理超出数量限制的快照
+    /// 清理超出数量限制的快照。
+    /// 先按保留期过滤过期数据，再截断到 `maxSnapshots` 条（保留最新）。
     private func pruneSnapshots(_ snapshots: [RiskDeviceSnapshot]) -> [RiskDeviceSnapshot] {
         let now = Date().timeIntervalSince1970
         let minTimestamp = now - retentionPeriod
@@ -401,7 +435,13 @@ public struct RiskDeviceHistory: Codable, Sendable {
         return valid
     }
 
-    /// 计算线性回归斜率
+    /// 计算线性回归斜率。
+    /// - Parameters:
+    ///   - x: 时间戳序列。
+    ///   - y: 分数序列。
+    ///   - meanX: x 的均值。
+    ///   - meanY: y 的均值。
+    /// - Returns: 斜率；分母为 0（所有时间戳相同）时返回 0。
     private func calculateLinearRegression(x: [TimeInterval], y: [Double], meanX: Double, meanY: Double) -> Double {
         var numerator: Double = 0
         var denominator: Double = 0
@@ -420,21 +460,36 @@ public struct RiskDeviceHistory: Codable, Sendable {
 /// 单个时间点的设备状态快照
 public struct RiskDeviceSnapshot: Codable, Sendable {
 
+    /// 快照时间（Unix 秒）
     public let timestamp: TimeInterval
+    /// 风险分数
     public let riskScore: Double
+    /// 是否判定为高风险
     public let isHighRisk: Bool
+    /// 当时是否越狱
     public let wasJailbroken: Bool
+    /// 越狱判定置信度（0–100）
     public let jailbreakConfidence: Double
+    /// 设备指纹哈希
     public let fingerprintHash: String
+    /// 系统版本
     public let systemVersion: String
+    /// 语言代码
     public let languageCode: String
+    /// 地区代码
     public let regionCode: String
+    /// 时区标识符
     public let timeZoneIdentifier: String
+    /// 主网络接口类型
     public let primaryInterfaceType: String
+    /// 是否检测到 VPN
     public let hasVPN: Bool
+    /// 是否检测到代理
     public let hasProxy: Bool
+    /// 附加元数据
     public let metadata: [String: String]?
 
+    /// JSON 编码键：使用短键名压缩体积。
     private enum CodingKeys: String, CodingKey {
         case timestamp = "ts"
         case riskScore = "rs"
@@ -452,6 +507,7 @@ public struct RiskDeviceSnapshot: Codable, Sendable {
         case metadata = "md"
     }
 
+    /// 创建快照。
     public init(
         timestamp: TimeInterval,
         riskScore: Double,
@@ -485,6 +541,11 @@ public struct RiskDeviceSnapshot: Codable, Sendable {
     }
 
     /// 从 `RiskContext` 和 `RiskScoreReport` 创建快照
+    /// - Parameters:
+    ///   - context: 本次评估的上下文。
+    ///   - report: 评分报告。
+    ///   - fingerprintHash: 设备指纹哈希。
+    /// - Returns: 包含设备、网络、越狱与评分信息的快照。
     public static func from(
         context: RiskContext,
         report: RiskScoreReport,
@@ -511,6 +572,7 @@ public struct RiskDeviceSnapshot: Codable, Sendable {
         )
     }
 
+    /// 读取当前地区代码（兼容新旧 Locale API）。
     private static func currentRegionCode() -> String {
         let locale = Locale.current
         if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
@@ -522,17 +584,28 @@ public struct RiskDeviceSnapshot: Codable, Sendable {
 
 // MARK: - 时序特征
 
+/// 历史风险的时序统计特征。
 public struct HistoryTemporalFeatures: Codable, Sendable {
+    /// 有效快照数量
     public let count: Int
+    /// 时间跨度（秒）
     public let timeSpan: TimeInterval
+    /// 平均风险分数
     public let meanScore: Double
+    /// 风险分数标准差
     public let stdScore: Double
+    /// 趋势斜率（分数/秒）
     public let trendSlope: Double
+    /// 最高风险分数
     public let maxScore: Double
+    /// 最低风险分数
     public let minScore: Double
+    /// 高风险事件次数
     public let highRiskCount: Int
+    /// 高风险事件比例（0–1）
     public let highRiskRatio: Double
 
+    /// JSON 编码键：使用短键名压缩体积。
     private enum CodingKeys: String, CodingKey {
         case count = "c"
         case timeSpan = "ts"
@@ -545,6 +618,7 @@ public struct HistoryTemporalFeatures: Codable, Sendable {
         case highRiskRatio = "hr"
     }
 
+    /// 创建时序特征。
     public init(
         count: Int,
         timeSpan: TimeInterval,
@@ -567,12 +641,16 @@ public struct HistoryTemporalFeatures: Codable, Sendable {
         self.highRiskRatio = highRiskRatio
     }
 
-    /// 判断是否为高风险历史
+    /// 判断是否为高风险历史。
+    /// - Parameter threshold: 平均分阈值，默认 60。
+    /// - Returns: 平均分达标或高风险占比 ≥ 50% 时返回 `true`。
     public func isHighRiskHistory(threshold: Double = 60) -> Bool {
         return meanScore >= threshold || highRiskRatio >= 0.5
     }
 
-    /// 判断是否为上升趋势
+    /// 判断是否为上升趋势。
+    /// - Parameter threshold: 每小时斜率阈值，默认 0.1。
+    /// - Returns: 折合每小时的斜率超过阈值返回 `true`。
     public func isEscalating(threshold: Double = 0.1) -> Bool {
         // 转换为每小时的斜率
         return trendSlope * 3600 > threshold
@@ -581,6 +659,7 @@ public struct HistoryTemporalFeatures: Codable, Sendable {
 
 // MARK: - 风险趋势
 
+/// 风险趋势枚举。
 public enum HistoryRiskTrend: String, Codable, Sendable {
     /// 风险上升（需要关注）
     case escalating
@@ -622,13 +701,20 @@ public enum HistoryRiskTrend: String, Codable, Sendable {
 
 // MARK: - 稳定性指标
 
+/// 设备稳定性指标（各维度 0–1，越大越稳定）。
 public struct StabilityMetrics: Codable, Sendable {
+    /// 指纹稳定性
     public let fingerprintStability: Double
+    /// 配置稳定性
     public let configurationStability: Double
+    /// 网络稳定性
     public let networkStability: Double
+    /// 位置稳定性
     public let locationStability: Double
+    /// 综合稳定性
     public let overallStability: Double
 
+    /// JSON 编码键：使用短键名压缩体积。
     private enum CodingKeys: String, CodingKey {
         case fingerprintStability = "fs"
         case configurationStability = "cs"
@@ -637,6 +723,7 @@ public struct StabilityMetrics: Codable, Sendable {
         case overallStability = "os"
     }
 
+    /// 创建稳定性指标。
     public init(
         fingerprintStability: Double,
         configurationStability: Double,
@@ -651,12 +738,16 @@ public struct StabilityMetrics: Codable, Sendable {
         self.overallStability = overallStability
     }
 
-    /// 判断是否为稳定设备
+    /// 判断是否为稳定设备。
+    /// - Parameter threshold: 综合稳定性阈值，默认 0.8。
+    /// - Returns: 综合稳定性达到阈值返回 `true`。
     public func isStable(threshold: Double = 0.8) -> Bool {
         return overallStability >= threshold
     }
 
-    /// 获取不稳定的维度列表
+    /// 获取不稳定的维度列表。
+    /// - Parameter threshold: 单维阈值，默认 0.7。
+    /// - Returns: 低于阈值的维度名称（中文）。
     public func unstableDimensions(threshold: Double = 0.7) -> [String] {
         var dimensions: [String] = []
 
@@ -679,13 +770,20 @@ public struct StabilityMetrics: Codable, Sendable {
 
 // MARK: - 异常事件
 
+/// 历史异常事件。
 public struct HistoryAnomalyEvent: Codable, Sendable {
+    /// 异常类型
     public let type: HistoryAnomalyType
+    /// 事件时间（Unix 秒）
     public let timestamp: TimeInterval
+    /// 事件前分数
     public let previousScore: Double
+    /// 事件时分数
     public let currentScore: Double
+    /// 异常描述
     public let description: String
 
+    /// JSON 编码键：使用短键名压缩体积。
     private enum CodingKeys: String, CodingKey {
         case type = "t"
         case timestamp = "ts"
@@ -694,6 +792,7 @@ public struct HistoryAnomalyEvent: Codable, Sendable {
         case description = "ds"
     }
 
+    /// 创建异常事件。
     public init(
         type: HistoryAnomalyType,
         timestamp: TimeInterval,
@@ -729,9 +828,13 @@ public enum HistoryAnomalyType: String, Codable, Sendable {
 
 // MARK: - 风险上下文扩展（内部使用）
 
-/// 隐式的 RiskContext 结构，用于编译
+/// 隐式的 RiskContext 结构，用于编译。
+/// 注意：该类型未被实际引用，仅为保持工程索引/编译完整性而保留。
 private struct HistoryRiskContext {
+    /// 设备指纹
     var device: DeviceFingerprint
+    /// 网络信号
     var network: NetworkSignals
+    /// 越狱检测结果
     var jailbreak: DetectionResult
 }

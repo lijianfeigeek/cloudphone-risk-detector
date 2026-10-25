@@ -1,17 +1,24 @@
+// GPU 渲染指纹 Provider。
+// 用 Metal 计算着色器渲染固定 8×8 图案，对像素做 SHA-256 得到渲染指纹。
+// 不同 GPU/驱动会产生细微渲染差异，可用于识别云手机虚拟 GPU 与设备聚类；
+// 指纹本身不计分，仅上报；Metal 不可用时输出 `gpu_render_unavailable` 弱信号。
 #if canImport(Metal) && canImport(UIKit)
 import CryptoKit
 import Foundation
 import Metal
 
+/// 渲染指纹采集器：缓存 5 分钟，避免每次评估都触发 GPU 计算。
 final class GPURenderFingerprintProvider: RiskSignalProvider {
     static let shared = GPURenderFingerprintProvider()
     let id = "gpu_render_fingerprint"
 
+    // 缓存访问用自旋锁保护；systemUptime 单调递增，不受用户改系统时间影响。
     private let lock = UnfairLock()
     private var cachedFingerprint: String?
     private var cacheTime: TimeInterval = 0
     private let cacheTTL: TimeInterval = 300
 
+    /// 生成信号：成功时上报指纹（hard detected:false），失败时上报不可用。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         guard let fp = fingerprint() else {
             return [RiskSignal(
@@ -36,6 +43,8 @@ final class GPURenderFingerprintProvider: RiskSignalProvider {
         )]
     }
 
+    /// 读取缓存指纹；过期或不存在时重新渲染。
+    /// - 缓存命中直接在锁内返回，避免重复占用 GPU。
     private func fingerprint() -> String? {
         let now = ProcessInfo.processInfo.systemUptime
         let cached: String? = lock.withLock {
@@ -53,6 +62,9 @@ final class GPURenderFingerprintProvider: RiskSignalProvider {
         return result
     }
 
+    /// 执行一次 Metal 计算并返回像素哈希。
+    /// - 任一步骤（设备、队列、纹理、库、管线）失败都返回 nil，由上层降级。
+    /// - 同步等待 GPU 完成，最多 2s，低于 ProviderRegistry 的 3s 预算。
     private func renderFingerprint() -> String? {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
@@ -69,6 +81,7 @@ final class GPURenderFingerprintProvider: RiskSignalProvider {
         desc.usage = [.shaderRead, .shaderWrite]
         guard let texture = device.makeTexture(descriptor: desc) else { return nil }
 
+        // 使用固定 8×8 RGBA8 纹理，小尺寸可保证低端 GPU 也能快速完成。
         let source = """
         #include <metal_stdlib>
         using namespace metal;
@@ -101,7 +114,8 @@ final class GPURenderFingerprintProvider: RiskSignalProvider {
         let semaphore = DispatchSemaphore(value: 0)
         buffer.addCompletedHandler { _ in semaphore.signal() }
         buffer.commit()
-        // Use 2s timeout (< ProviderRegistry's 3s) to avoid racing the registry deadline
+        // 超时 2s（< ProviderRegistry 的 3s），确保不会与注册表的整体截止时间赛跑；
+        // 超时即放弃本次指纹，避免阻塞后续 Provider。
         if semaphore.wait(timeout: .now() + 2.0) == .timedOut {
             return nil
         }
@@ -126,9 +140,11 @@ final class GPURenderFingerprintProvider: RiskSignalProvider {
 #else
 import Foundation
 
+/// Metal/UIKit 不可用平台（如部分测试目标）的空实现，不产生任何信号。
 final class GPURenderFingerprintProvider: RiskSignalProvider {
     static let shared = GPURenderFingerprintProvider()
     let id = "gpu_render_fingerprint"
+    /// Metal/UIKit 不可用时不做任何检测。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] { [] }
 }
 #endif

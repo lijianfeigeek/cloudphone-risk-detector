@@ -1,18 +1,33 @@
+// 场景策略：为每个业务场景配置分数阈值、内部等级→动作映射、类别权重与组合规则。
+// 本地判决主干是 score 与三个阈值比较：< medium 为 low，[medium, high) 为 medium，
+// [high, critical) 为 high，>= critical 为 critical；动作再经 actionMapping 映射。
+// 预设策略通过 Codable 单字母键下发，服务端可整包覆盖。
+
 import Foundation
 
 // MARK: - 场景策略配置
-/// 定义特定场景下的风控策略：阈值、动作、权重等
+/// 定义特定场景下的风控策略：阈值、动作映射、类别权重和组合规则。
+/// 线程安全：纯值类型，构造后不可变。
 public struct ScenarioPolicy: Codable, Sendable {
 
+    /// 中风险起始分；score 低于此值为 low。
     public let mediumThreshold: Double
+    /// 高风险起始分；score 达到此值进入 high。
     public let highThreshold: Double
+    /// 严重风险起始分；score 达到此值进入 critical。
     public let criticalThreshold: Double
+    /// 内部 4 级等级到处置动作的显式映射，缺项时用内置默认映射兜底。
     public let actionMapping: [InternalRiskLevel: RiskAction]
+    /// 按信号类别（jailbreak/network/behavior/device/time）加权的系数。
     public let signalWeights: SignalWeights
+    /// 多信号同时命中时触发加分或强制动作的组合规则。
     public let comboRules: [ComboRule]
+    /// 是否允许组合规则的 `forceAction` 覆盖按分数算出的动作。
     public let enableForceRules: Bool
+    /// 基于压缩摘要的快速判决规则，可在评分链路前直接命中。
     public let compressedVerdictRules: [CompressedVerdictRule]
 
+    // 单字母键压缩传输体积，键名属于协议的一部分。
     private enum CodingKeys: String, CodingKey {
         case mediumThreshold = "mt"
         case highThreshold = "ht"
@@ -26,6 +41,7 @@ public struct ScenarioPolicy: Codable, Sendable {
 
     // MARK: - 初始化
 
+    /// 创建场景策略。阈值默认 30/55/80；actionMapping 为 nil 时使用默认映射。
     public init(
         mediumThreshold: Double = 30,
         highThreshold: Double = 55,
@@ -46,11 +62,13 @@ public struct ScenarioPolicy: Codable, Sendable {
         self.compressedVerdictRules = compressedVerdictRules
     }
 
+    /// 从下发 JSON 解码；任一层数据缺失或阈值不合法时回退默认值，保证策略始终可用。
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         var m = try container.decodeIfPresent(Double.self, forKey: .mediumThreshold) ?? 30
         var h = try container.decodeIfPresent(Double.self, forKey: .highThreshold) ?? 55
         var c = try container.decodeIfPresent(Double.self, forKey: .criticalThreshold) ?? 80
+        // 必须有限、非负、严格递增且不超过 100；否则整组回退，防止阈值倒挂导致分级失效。
         if !m.isFinite || !h.isFinite || !c.isFinite || !(0 <= m && m < h && h < c && c <= 100) {
             m = 30; h = 55; c = 80
         }
@@ -66,7 +84,8 @@ public struct ScenarioPolicy: Codable, Sendable {
 
     // MARK: - 便捷方法
 
-    /// 根据分数和策略阈值计算风险等级
+    /// 根据分数和策略阈值计算风险等级。
+    /// 阈值区间左闭右开；非有限值或负分按 low 处理，避免脏数据放大风险。
     public func level(for score: Double) -> InternalRiskLevel {
         guard score.isFinite, score >= 0 else { return .low }
         switch score {
@@ -77,12 +96,12 @@ public struct ScenarioPolicy: Codable, Sendable {
         }
     }
 
-    /// 根据风险等级获取建议动作
+    /// 根据风险等级获取建议动作；映射缺项时用内置默认动作兜底。
     public func action(for level: InternalRiskLevel) -> RiskAction {
         actionMapping[level] ?? Self.defaultAction(for: level)
     }
 
-    /// 默认动作映射
+    /// 默认动作映射：低/中风险放行，高风险挑战，严重风险拒绝。
     private static func defaultActionMapping() -> [InternalRiskLevel: RiskAction] {
         [
             .low: .allow,
@@ -92,7 +111,7 @@ public struct ScenarioPolicy: Codable, Sendable {
         ]
     }
 
-    /// 默认动作逻辑（备用）
+    /// 默认动作逻辑（备用），仅在 actionMapping 缺项时调用。
     private static func defaultAction(for level: InternalRiskLevel) -> RiskAction {
         switch level {
         case .low, .medium:
@@ -272,7 +291,7 @@ public struct ScenarioPolicy: Codable, Sendable {
         cr007bCVDLightCombo,
     ]
 
-    /// 通用策略（默认）
+    /// 通用策略（默认）：30/55/80，对应“监控/挑战/拒绝”三档。
     public static let general = ScenarioPolicy(
         mediumThreshold: 30,
         highThreshold: 55,
@@ -280,7 +299,8 @@ public struct ScenarioPolicy: Codable, Sendable {
         comboRules: coreComboRules + [cr004ImpossibleNoCellularPower, cr003SimulatorCloudHostname, cr006TimeAnomalyCombo]
     )
 
-    /// 登录策略：相对宽松，允许一定风险但需要监控
+    /// 登录策略：相对宽松（35/60/85），允许一定风险但需要监控。
+    /// 提高行为权重、降低越狱权重，因为登录阶段行为样本少且越狱本身不代表盗号。
     public static let login = ScenarioPolicy(
         mediumThreshold: 35,
         highThreshold: 60,
@@ -295,7 +315,8 @@ public struct ScenarioPolicy: Codable, Sendable {
         comboRules: coreComboRules + [cr004ImpossibleNoCellularPower, cr003SimulatorCloudHostname, cr006TimeAnomalyCombo]
     )
 
-    /// 注册策略：严格，防止批量注册
+    /// 注册策略：严格（25/50/75），防止批量注册。
+    /// 中风险即挑战、高风险升级认证，并提高设备指纹与网络权重。
     public static let register = ScenarioPolicy(
         mediumThreshold: 25,
         highThreshold: 50,
@@ -325,7 +346,8 @@ public struct ScenarioPolicy: Codable, Sendable {
         ]
     )
 
-    /// 支付策略：最严格，任何高风险都应拦截
+    /// 支付策略：最严格（20/45/70），任何高风险都应拦截。
+    /// 中风险即升级认证、高风险直接拒绝，并额外叠加越狱+VPN 等支付专用组合规则。
     public static let payment = ScenarioPolicy(
         mediumThreshold: 20,
         highThreshold: 45,
@@ -363,7 +385,7 @@ public struct ScenarioPolicy: Codable, Sendable {
         ]
     )
 
-    /// 账户变更策略：严格
+    /// 账户变更策略：严格（25/50/75），中风险挑战、高风险升级认证。
     public static let accountChange = ScenarioPolicy(
         mediumThreshold: 25,
         highThreshold: 50,
@@ -377,7 +399,8 @@ public struct ScenarioPolicy: Codable, Sendable {
         comboRules: coreComboRules + [cr004ImpossibleNoCellularPower, cr003SimulatorCloudHostname, cr006TimeAnomalyCombo]
     )
 
-    /// 敏感操作策略：最严格
+    /// 敏感操作策略：最严格（15/40/65）。
+    /// 低风险也要求挑战，高风险直接拒绝，并使用全量组合规则。
     public static let sensitiveAction = ScenarioPolicy(
         mediumThreshold: 15,
         highThreshold: 40,
@@ -398,7 +421,7 @@ public struct ScenarioPolicy: Codable, Sendable {
         comboRules: allComboRules
     )
 
-    /// API访问策略：适中
+    /// API 访问策略：适中（30/55/80），降低行为与越狱权重，提高设备指纹权重。
     public static let apiAccess = ScenarioPolicy(
         mediumThreshold: 30,
         highThreshold: 55,
@@ -413,7 +436,7 @@ public struct ScenarioPolicy: Codable, Sendable {
         comboRules: coreComboRules + [cr004ImpossibleNoCellularPower, cr003SimulatorCloudHostname, cr006TimeAnomalyCombo]
     )
 
-    /// 根据场景获取预设策略
+    /// 根据场景获取预设策略；query 与未单独配置的场景复用 general。
     public static func policy(for scenario: RiskScenario) -> ScenarioPolicy {
         switch scenario {
         case .default: return .general
@@ -429,14 +452,21 @@ public struct ScenarioPolicy: Codable, Sendable {
 }
 
 // MARK: - 信号权重配置
-/// 不同类别信号在特定场景下的权重系数
+/// 不同类别信号在特定场景下的权重系数。
+/// 取值 0–10，默认 1.0；解码时会拒绝 NaN/无穷/越界值。
 public struct SignalWeights: Codable, Sendable {
+    /// 越狱类信号权重。
     public let jailbreak: Double
+    /// 网络环境类信号权重。
     public let network: Double
+    /// 行为类信号权重。
     public let behavior: Double
+    /// 设备指纹类信号权重。
     public let device: Double
+    /// 时间异常类信号权重。
     public let time: Double
 
+    // 单字母键压缩传输体积。
     private enum CodingKeys: String, CodingKey {
         case jailbreak = "j"
         case network = "n"
@@ -462,6 +492,7 @@ public struct SignalWeights: Codable, Sendable {
     /// 默认权重（全部为1.0）
     public static let `default` = SignalWeights()
 
+    /// 解码并逐项校验权重；非法值回退 1.0，防止权重被放大到失控。
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         func valid(_ v: Double) -> Double {
@@ -474,7 +505,7 @@ public struct SignalWeights: Codable, Sendable {
         time = valid(try container.decodeIfPresent(Double.self, forKey: .time) ?? 1.0)
     }
 
-    /// 获取指定类别的权重
+    /// 获取指定类别的权重；未知类别按中性权重 1.0 处理。
     public func weight(for category: String) -> Double {
         switch category.lowercased() {
         case ObfuscatedConstants.signalJailbreak: return jailbreak
@@ -490,10 +521,15 @@ public struct SignalWeights: Codable, Sendable {
 // MARK: - 组合规则
 /// 当多个特定信号同时出现时，触发额外的风险加分或强制动作
 public struct ComboRule: Codable, Sendable {
+    /// 规则名称（同时用于服务端回溯）。
     public let name: String
+    /// 规则要求的信号 ID 列表；硬 AND 模式下必须全部在场。
     public let requiredSignals: [String]
+    /// 命中后追加的分数。
     public let bonusScore: Double
+    /// 命中后的强制动作；nil 表示只加分、不覆盖动作。
     public let forceAction: RiskAction?
+    /// 人类可读说明，仅用于日志与审计。
     public let description: String?
     /// N-of-M 带权阈值（可选）。与 `signalWeights` 同时提供时，`matches` 改用带权
     /// 求和判定：累加“在场的 required 信号”的权重，达到阈值即命中。缺省（nil）时
@@ -510,6 +546,7 @@ public struct ComboRule: Codable, Sendable {
     /// 加权模式下必须在场的信号。用于表达“杀手锏”信号必须存在，否则不应触发。
     public let mandatorySignals: [String]?
 
+    // 单字母键压缩传输体积；`ds` 等键已进入下发协议。
     private enum CodingKeys: String, CodingKey {
         case name = "n"
         case requiredSignals = "rs"
@@ -544,14 +581,17 @@ public struct ComboRule: Codable, Sendable {
         self.mandatorySignals = mandatorySignals
     }
 
-    /// 检查信号是否匹配此规则
+    /// 检查信号是否匹配此规则。
+    /// 配置了 `weightThreshold` + `signalWeights` 时使用 N-of-M 带权判定，否则为硬 AND。
     public func matches(signals: [RiskSignal]) -> Bool {
+        // 空规则永远不命中，避免配置错误放大风险。
         guard !requiredSignals.isEmpty else { return false }
         let signalIds = Set(signals.map { $0.id })
         let required = Set(requiredSignals)
 
         // N-of-M 带权模式：累加在场 required 信号的权重，达阈值即命中。
         if let threshold = weightThreshold, let weights = signalWeights {
+            // 阈值或权重配置不完整时退回硬 AND，保持旧行为而不是静默放宽。
             guard threshold.isFinite, threshold > 0 else {
                 return required.isSubset(of: signalIds)
             }
@@ -561,16 +601,19 @@ public struct ComboRule: Codable, Sendable {
             }) else {
                 return required.isSubset(of: signalIds)
             }
+            // mandatorySignals 是“杀手锏”前置条件：缺失则权重再高也不触发。
             if let mandatorySignals, !Set(mandatorySignals).isSubset(of: signalIds) {
                 return false
             }
 
+            // 只累加实际在场的 required 信号权重，缺席信号贡献 0。
             var matchedCount = 0
             let score = requiredSignals.reduce(0.0) { partial, sid in
                 guard signalIds.contains(sid) else { return partial }
                 matchedCount += 1
                 return partial + (weights[sid] ?? 0)
             }
+            // 命中数量下限用于阻止少数高权重信号单独触发强制动作。
             if let minimumMatchedCount, minimumMatchedCount > 0, matchedCount < minimumMatchedCount {
                 return false
             }
@@ -583,7 +626,7 @@ public struct ComboRule: Codable, Sendable {
 }
 
 // MARK: - 策略构建器
-/// 流式接口用于构建自定义策略
+/// 流式接口用于构建自定义策略；每个 setter 返回新副本，便于链式调用。
 public struct ScenarioPolicyBuilder {
     private var mediumThreshold: Double = 30
     private var highThreshold: Double = 55
@@ -596,6 +639,7 @@ public struct ScenarioPolicyBuilder {
 
     public init() {}
 
+    /// 设置三个分数阈值（构建时不校验递增关系，调用方需保证 medium < high < critical）。
     public func setThresholds(medium: Double, high: Double, critical: Double) -> ScenarioPolicyBuilder {
         var builder = self
         builder.mediumThreshold = medium
@@ -604,36 +648,42 @@ public struct ScenarioPolicyBuilder {
         return builder
     }
 
+    /// 为指定内部等级设置动作；未设置的等级在 build 时使用默认映射。
     public func setAction(_ action: RiskAction, for level: InternalRiskLevel) -> ScenarioPolicyBuilder {
         var builder = self
         builder.actionMapping[level] = action
         return builder
     }
 
+    /// 设置各类别信号的权重系数。
     public func setSignalWeights(_ weights: SignalWeights) -> ScenarioPolicyBuilder {
         var builder = self
         builder.signalWeights = weights
         return builder
     }
 
+    /// 追加一条组合规则（保持追加顺序）。
     public func addComboRule(_ rule: ComboRule) -> ScenarioPolicyBuilder {
         var builder = self
         builder.comboRules.append(rule)
         return builder
     }
 
+    /// 控制组合规则的 forceAction 是否允许覆盖分数动作。
     public func setEnableForceRules(_ enable: Bool) -> ScenarioPolicyBuilder {
         var builder = self
         builder.enableForceRules = enable
         return builder
     }
 
+    /// 设置压缩摘要快速判决规则。
     public func setCompressedVerdictRules(_ rules: [CompressedVerdictRule]) -> ScenarioPolicyBuilder {
         var builder = self
         builder.compressedVerdictRules = rules
         return builder
     }
 
+    /// 生成不可变策略；空动作映射会回落到默认映射。
     public func build() -> ScenarioPolicy {
         ScenarioPolicy(
             mediumThreshold: mediumThreshold,

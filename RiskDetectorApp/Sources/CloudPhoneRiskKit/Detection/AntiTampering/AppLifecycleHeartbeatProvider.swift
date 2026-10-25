@@ -1,39 +1,31 @@
+// App 生命周期心跳提供者：注册 UIApplication 生命周期通知并计数，用于识别没有 UI 驱动的
+// headless 进程（协议回放 / unidbg / 注入式拉起）。思路启发自小红书 x208 心跳字段。
+// 启动后 5 秒为静默期；之后 active 状态却 0 个生命周期事件 → headless_no_lifecycle_events(60, hard)；
+// 状态探测超时 + 0 事件 → lifecycle_state_unknown_during_check(15, soft)；
+// 只有 resign/background 而无 becomeActive → lifecycle_partial_no_become_active(25, soft)。
+
 import Foundation
 #if canImport(UIKit)
 import UIKit
 #endif
 
-/*
- * AppLifecycleHeartbeatProvider
- *
- * 借鉴自小红书 x208 字段的心跳 t 结构：
- *   小红书在指纹里上报一个心跳计数器结构。如果一个"设备"从来没有心跳数据
- *   （tt 始终为空），说明它不是通过正常 App 启动的，而是通过协议直接请求 API
- *   的（headless protocol replay）。
- *
- * iOS 等价实现：
- *   注册 UIApplication 的生命周期通知。正常用户启动 App 在 ~1s 内一定会触发
- *   didBecomeActiveNotification。如果 SDK 启动后 5 秒内一次 lifecycle 事件都没
- *   触发，且当前 applicationState 又声称是 .active，强烈指示这个进程不是被 UI
- *   驱动的 — 典型场景：headless 反编译注入、unidbg/Frida 直接拉起 SDK 模拟
- *   接口调用。
- *
- * 关键决策：
- *   - **observer 在 init() 立即注册**（singleton init 仅执行一次，无 race），
- *     避免"注册前的 didBecomeActive 漏掉"的 FP。
- *   - applicationState 主线程探测 250ms 超时；超时返回 "unknown"，与 "active"
- *     一并触发头条信号（轻分），避免 main 拥塞时误判为合法。
- */
-
+/// 应用生命周期心跳提供者（单例）。
+///
+/// 线程模型：观察者回调统一派发到主队列，计数字段由 `UnfairLock` 保护；
+/// 非主线程读取 applicationState 时通过信号量等待主线程，最多 250ms。
 final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
 
     static let shared = AppLifecycleHeartbeatProvider()
     let id = "app_lifecycle_heartbeat"
 
+    /// 启动静默期：给系统留出投递首个 didBecomeActive 的时间，避免冷启动误报。
     private static let warmupSeconds: TimeInterval = 5.0
+    /// 主线程状态探测超时；超时返回 "unknown"，不会阻塞评估链路超过该时长。
     private static let appStateProbeTimeoutMs: Int = 250
 
+    /// 保护四个计数与 observer 数组；观察者回调可能来自任意线程。
     private let lock = UnfairLock()
+    /// 提供者创建时刻，用于计算静默期是否结束。
     private let providerStartTime: Date
     private var didBecomeActiveCount: Int = 0
     private var willResignActiveCount: Int = 0
@@ -41,6 +33,7 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
     private var willEnterForegroundCount: Int = 0
     private var observers: [NSObjectProtocol] = []
 
+    /// 单例初始化时立即注册观察者：避免“注册前已经发生过 didBecomeActive”导致漏计。
     private init() {
         self.providerStartTime = Date()
         registerObservers()
@@ -50,6 +43,11 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         unregisterObservers()
     }
 
+    /// 根据生命周期事件计数与当前 App 状态生成信号。
+    ///
+    /// - 静默期内始终返回空数组。
+    /// - 0 事件时区分 active（强信号）、unknown（探测超时，轻信号）与 background（合理静默）。
+    /// - 只有退出事件、从未进入 active 时给中等强度的部分信号。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         let elapsed = Date().timeIntervalSince(providerStartTime)
         let counts = countsSnapshot()
@@ -132,8 +130,9 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         return []
     }
 
-    // MARK: - State
+    // MARK: - 状态读取
 
+    /// 四个生命周期事件的累计计数快照。
     private struct Counts {
         let didBecomeActiveCount: Int
         let willResignActiveCount: Int
@@ -141,6 +140,7 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         let willEnterForegroundCount: Int
     }
 
+    /// 加锁复制计数，保证读到的是同一时刻的一致快照。
     private func countsSnapshot() -> Counts {
         lock.withLock {
             Counts(
@@ -152,8 +152,10 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         }
     }
 
-    // MARK: - Observers
+    // MARK: - 观察者注册
 
+    /// 注册四个 UIApplication 生命周期通知；仅在可导入 UIKit 的平台生效。
+    /// - 回调使用 `[weak self]`，避免 NotificationCenter 强引用导致单例无法释放。
     private func registerObservers() {
         #if canImport(UIKit)
         let center = NotificationCenter.default
@@ -194,6 +196,7 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         #endif
     }
 
+    /// 反注册所有通知观察者；先原子取走数组，避免与注册/析构并发重复移除。
     private func unregisterObservers() {
         let toRemove = lock.withLock { () -> [NSObjectProtocol] in
             let copy = observers
@@ -206,6 +209,11 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
         }
     }
 
+    /// 读取当前 applicationState 的字符串表示。
+    ///
+    /// - 已处于主线程时直接读取，避免无谓等待。
+    /// - 否则异步派发到主线程并最多等待 250ms；超时返回 "unknown"（可能是 main 被恶意占满）。
+    /// - 非 UIKit 平台返回 "unsupported"，调用方按静默处理。
     private func currentApplicationStateString() -> String {
         #if canImport(UIKit)
         if Thread.isMainThread {
@@ -225,6 +233,7 @@ final class AppLifecycleHeartbeatProvider: RiskSignalProvider {
     }
 
     #if canImport(UIKit)
+    /// 将 UIKit 枚举映射为稳定的字符串，便于作为 evidence 上报与跨版本对比。
     private static func applicationStateString(_ state: UIApplication.State) -> String {
         switch state {
         case .active: return "active"

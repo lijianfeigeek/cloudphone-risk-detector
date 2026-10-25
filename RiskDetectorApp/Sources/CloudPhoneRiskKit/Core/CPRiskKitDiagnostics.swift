@@ -1,15 +1,22 @@
-// MARK: - CPRiskKit+Diagnostics
+// MARK: - CPRiskKit+Diagnostics（诊断快照）
 //
-// 从 CloudPhoneRiskKit.swift 拆分：Debug snapshots、watchdog snapshot、
-// anti-debug plan snapshot、diagnostics 及 async/await APIs。
+// 职责：暴露 Armor 运行时、Anti-Debug 看门狗与 anti-debug 计划节的只读快照，
+// 并提供基于 async/await 的评估与远程配置更新封装。
+// 位于评估管线的诊断/对外 API 层：诊断只读、不改变保护状态；异步封装不改变同步语义。
+// 安全不变量：所有快照通过 `stateLock` 读取一致状态；continuation 必须且只能恢复一次。
 
 import CRiskCore
 import Foundation
 
+/// 为 CPRiskKit 提供保护运行时诊断快照能力。
 extension CPRiskKit {
 
-    // MARK: - Debug Armor Snapshot
+    // MARK: - Armor 调试快照
 
+    /// 读取 Armor 运行时调试快照。
+    ///
+    /// 在锁内复制快照后再转换，避免调用方持有锁期间做字符串转换。
+    /// - Returns: 当前 Armor 运行时状态的只读描述。
     internal func debugArmorRuntimeSnapshotImpl() -> ArmorRuntimeDebugSnapshot {
         let snapshot = stateLock.withLock { armorRuntimeSnapshot }
         return ArmorRuntimeDebugSnapshot(
@@ -24,8 +31,13 @@ extension CPRiskKit {
         )
     }
 
-    // MARK: - Watchdog Snapshot
+    // MARK: - 看门狗快照
 
+    /// 读取 Anti-Debug 看门狗快照。
+    ///
+    /// 直接读取 C 层结构体并逐字段映射为 Swift 值类型；C 层返回码被忽略，
+    /// 未初始化时字段为零值，快照仍然可用（看门狗不阻塞评估）。
+    /// - Returns: 看门狗运行指标快照。
     internal func antiDebugWatchdogSnapshotImpl() -> AntiDebugWatchdogSnapshot {
         var raw = cprisk_anti_debug_watchdog_snapshot_t()
         _ = cprisk_get_anti_debug_watchdog_snapshot(&raw)
@@ -109,8 +121,13 @@ extension CPRiskKit {
         )
     }
 
-    // MARK: - Anti-Debug Plan Snapshot
+    // MARK: - Anti-Debug 计划快照
 
+    /// 读取 anti-debug 计划节快照。
+    ///
+    /// 计划节由打包期工具注入；缺失或解析失败时对应字段为 false/0，
+    /// 调用方应据此决定是否降级为运行期检测。
+    /// - Returns: 计划节解析与应用状态快照。
     internal func antiDebugPlanSnapshotImpl() -> AntiDebugPlanSnapshot {
         var raw = cprisk_antidebug_plan_snapshot_t()
         _ = cprisk_get_antidebug_plan_snapshot(&raw)
@@ -136,9 +153,14 @@ extension CPRiskKit {
     }
 }
 
-// MARK: - async/await APIs (2.0)
+// MARK: - async/await API（2.0）
 
 extension CPRiskKit {
+    /// 异步执行评估（默认配置）。
+    ///
+    /// 通过 `withCheckedContinuation` 把回调式 API 桥接为 async；回调只会被调用一次，
+    /// 因此 continuation 恰好恢复一次。
+    /// - Returns: 评估报告。
     @available(iOS 13.0, macOS 10.15, *)
     public func evaluateAsync() async -> CPRiskReport {
         await withCheckedContinuation { continuation in
@@ -148,6 +170,9 @@ extension CPRiskKit {
         }
     }
 
+    /// 异步执行评估（指定配置）。
+    /// - Parameter config: 风险评估配置。
+    /// - Returns: 评估报告。
     @available(iOS 13.0, macOS 10.15, *)
     public func evaluateAsync(config: CPRiskConfig) async -> CPRiskReport {
         await withCheckedContinuation { continuation in
@@ -157,6 +182,11 @@ extension CPRiskKit {
         }
     }
 
+    /// 异步执行评估（指定配置与场景）。
+    /// - Parameters:
+    ///   - config: 风险评估配置，默认 `.default`。
+    ///   - scenario: 业务场景，默认 `.default`。
+    /// - Returns: 评估报告。
     @available(iOS 13.0, macOS 10.15, *)
     public func evaluateAsync(
         config: CPRiskConfig = .default,
@@ -169,6 +199,11 @@ extension CPRiskKit {
         }
     }
 
+    /// 异步更新远程配置。
+    ///
+    /// 回调仅以 Bool 表示成功/失败；失败时转换为 `ConfigError.networkError` 抛出，
+    /// 由调用方决定是否重试。成功时 continuation 恢复且不返回值。
+    /// - Throws: `ConfigError.networkError` 表示更新失败。
     @available(iOS 13.0, macOS 10.15, *)
     public func updateRemoteConfigAsync() async throws {
         try await withCheckedThrowingContinuation { continuation in

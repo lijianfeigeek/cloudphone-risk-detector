@@ -1,49 +1,47 @@
+// 上报链路·客户端 nonce 防重放窗口：记录本进程最近签发的 nonce，拦截重复使用。
+// 窗口只在本地内存中使用，不随 payload 上报；服务端侧另有 `NonceReplayProtecting` 消费表。
+
 import Foundation
 
-// MARK: - Client-Side Nonce Deduplication Window
+// MARK: - 客户端 nonce 去重窗口
 
-/// Thread-safe rolling window of recently-emitted client-side nonces.
+/// 线程安全的本地上报 nonce 滚动窗口。
 ///
-/// Since nonces are UUID v4 (122 bits of entropy) collision probability is
-/// astronomically small; however this window provides a defence-in-depth layer
-/// against two practical threats:
+/// nonce 使用 UUID v4（122 位熵），碰撞概率可忽略；该窗口提供纵深防御，
+/// 主要覆盖两类现实威胁：
 ///
-/// - **Logic bugs in calling code** – e.g. an accidental loop that serialises
-///   the same envelope object twice without calling `create()` again.
-/// - **UUID-generator tampering** – a rooted device or emulator that patches
-///   `UUID()` to return a deterministic value; the window catches the repeat on
-///   the second attempt within the expiry interval.
+/// - **调用方逻辑缺陷**：例如循环中重复序列化同一个信封对象而未重新调用 `create()`。
+/// - **UUID 生成器被篡改**：越狱设备/模拟器把 `UUID()` 补丁成确定性值，窗口会在
+///   有效期内捕获第二次重复。
 ///
-/// The window is keyed on `nonce` only (not session-token), because the
-/// envelope's own nonce is globally unique by design.  Entries are lazily
-/// evicted once they fall outside the `windowMillis` expiry horizon.
+/// 窗口只以 `nonce` 为键（不拼接 session-token），因为信封 nonce 本身设计为全局唯一。
+/// 条目超过 `windowMillis` 有效期后会被惰性清理。
 internal final class ClientNonceWindow: @unchecked Sendable {
 
-    // MARK: Shared instance
+    // MARK: 共享实例
 
-    /// Process-global singleton.  All `ReportEnvelope.create()` calls share
-    /// this window so that cross-session duplicates are also detected.
+    /// 进程级单例。所有 `ReportEnvelope.create()` 共用该窗口，
+    /// 因此跨会话的重复 nonce 也能被发现。
     static let shared = ClientNonceWindow()
 
-    // MARK: State
+    // MARK: 状态
 
-    private var entries: [String: Int64] = [:]   // nonce → ts at registration
+    private var entries: [String: Int64] = [:]   // nonce → 注册时间戳（毫秒）
     private let lock = NSLock()
     private let windowMillis: Int64
 
-    // MARK: Init
+    // MARK: 初始化
 
+    /// - Parameter windowMillis: 去重窗口长度，默认 5 分钟，与信封 nonce 有效期保持一致。
     init(windowMillis: Int64 = 300_000) {
         self.windowMillis = windowMillis
     }
 
-    // MARK: API
+    // MARK: 对外接口
 
-    /// Attempts to register `nonce` with the given timestamp.
+    /// 尝试注册 `nonce` 及其时间戳。
     ///
-    /// - Returns: `true` if the nonce had not been seen before and was
-    ///   successfully registered; `false` if it was already present within the
-    ///   active window (duplicate detected).
+    /// - Returns: `true` 表示窗口内首次出现且注册成功；`false` 表示有效期内已存在（判定为重复）。
     func registerIfNew(_ nonce: String, ts: Int64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -53,8 +51,9 @@ internal final class ClientNonceWindow: @unchecked Sendable {
         return true
     }
 
-    // MARK: Private
+    // MARK: 私有方法
 
+    /// 清理超出窗口的条目，防止长期运行时内存无界增长。
     private func evictExpired(now: Int64) {
         let cutoff = now - windowMillis
         entries = entries.filter { $0.value > cutoff }

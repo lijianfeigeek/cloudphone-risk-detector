@@ -21,6 +21,8 @@ final class BasebandIsolationProvider: RiskSignalProvider {
 
     let id = "baseband_isolation"
 
+    /// 在真机上执行无蜂窝运营商与系统 App 缺失两项检查；模拟器返回空。
+    /// 两项检查都依赖主线程，统一通过 `runOnMainIfNeeded` 派发。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []

@@ -15,6 +15,7 @@ final class NetworkInterfaceProvider: RiskSignalProvider {
 
     let id = "network_interface"
 
+    /// 模拟器返回 `.unavailable`；真机调用 `collectSignals`。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return [
@@ -34,6 +35,9 @@ final class NetworkInterfaceProvider: RiskSignalProvider {
     }
 
     #if !targetEnvironment(simulator)
+    /// 通过 `getifaddrs` 枚举接口，汇总四类异常证据到一条 `network_interface_anomaly` 信号。
+    /// - 读取失败返回 `.unavailable` 并携带 errno；
+    /// - 多类证据命中时用 ";" 拼接，置信度统一为 0.55，避免单一弱证据过度计分。
     private func collectSignals(snapshot: RiskSnapshot) -> [RiskSignal] {
         var addresses: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addresses) == 0, let first = addresses else {

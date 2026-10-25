@@ -1,11 +1,14 @@
+// 本地风控的基础类型：评估场景、内部/公开风险等级、处置动作与兼容别名。
+// 内部等级为 4 级（low/medium/high/critical），公开协议只暴露 3 级；
+// 本文件同时负责两者的映射与数值化排序，是 LocalAssessment 的数据契约。
+
 import Foundation
 
-// MARK: - Risk Types (Unified with Architecture Protocol)
+// MARK: - 风险类型（与架构协议统一）
 //
-// This file defines the unified risk types that align with the architecture's
-// DecisionEngine protocol while preserving enhanced functionality.
+// 本文件定义与 DecisionEngine 协议对齐的统一风控类型，同时保留增强能力。
 
-// MARK: - Risk Scenario
+// MARK: - 风险场景
 /// 风险评估场景
 /// 定义不同的业务场景，每个场景可以有不同的策略配置
 @objc(CPR_RiskScenario) public enum RiskScenario: Int, Sendable, Codable, CaseIterable {
@@ -60,9 +63,9 @@ import Foundation
     }
 }
 
-// MARK: - Internal Risk Level (4-level for fine-grained control)
-/// 内部风险等级（4级，更精细控制）
-/// 对外API映射为协议定义的3级
+// MARK: - 内部风险等级（4 级，细粒度控制）
+/// 内部风险等级（4 级，更精细控制）。
+/// 对外 API 只暴露协议定义的 3 级；内部多出的 `critical` 用于更早触发拒绝。
 public enum InternalRiskLevel: String, Codable, Sendable {
     /// 低风险：正常用户，允许通过
     case low = "low"
@@ -86,15 +89,18 @@ public enum InternalRiskLevel: String, Codable, Sendable {
     /// 从分数计算风险等级
     /// 无效分数（NaN/无穷/负值）统一返回 .low，避免误判
     public static func from(score: Double) -> InternalRiskLevel {
+        // 非有限值或负分说明上游计分异常，按最低风险处理，避免 NaN 参与比较导致分级错乱。
         if !score.isFinite { return .low }
         if score < 0 { return .low }
+        // 30/55/80 是通用策略的默认分界；场景策略可覆盖，本方法只用于无策略上下文的兜底。
         if score < 30 { return .low }
         if score < 55 { return .medium }
         if score < 80 { return .high }
         return .critical
     }
 
-    /// 映射到公开API的3级风险等级
+    /// 映射到公开 API 的 3 级风险等级。
+    /// 公开协议没有 `critical`，因此与 `high` 合并；调用方若要区分严重程度需读 `internalLevel`。
     public func toPublicRiskLevel() -> PublicRiskLevel {
         switch self {
         case .low: return .low
@@ -104,7 +110,7 @@ public enum InternalRiskLevel: String, Codable, Sendable {
     }
 }
 
-// MARK: - Public Risk Level (3-level per protocol)
+// MARK: - 公开风险等级（3 级，符合协议）
 /// 公开风险等级（3级，符合协议定义）
 @objc(CPR_PublicRiskLevel) public enum PublicRiskLevel: Int, Sendable, Codable, CaseIterable {
     /// 低风险 - 可以直接通过
@@ -123,7 +129,7 @@ public enum InternalRiskLevel: String, Codable, Sendable {
         }
     }
 
-    /// 颜色值（用于 UI 显示）
+    /// 颜色值（用于 UI 显示），ARGB 十六进制常量，与等级语义一一对应。
     public var colorValue: Int {
         switch self {
         case .low: return 0x4CAF50    // Green
@@ -133,9 +139,9 @@ public enum InternalRiskLevel: String, Codable, Sendable {
     }
 }
 
-// MARK: - Risk Action
-/// 风险处理动作
-/// 定义针对不同风险级别的处理建议
+// MARK: - 风险处置动作
+/// 风险处理动作：定义针对不同风险级别的处理建议。
+/// `severity` 用于并行决策时挑选最严格动作，数值越大越严格。
 @objc(CPR_RiskAction) public enum RiskAction: Int, Sendable, Codable, CaseIterable {
     /// 允许 - 直接放行
     case allow = 0
@@ -166,7 +172,8 @@ public enum InternalRiskLevel: String, Codable, Sendable {
         }
     }
 
-    /// 映射到公开API的3种动作
+    /// 映射到公开 API 的 3 种动作。
+    /// 公开协议没有 `stepUpAuth`，与 `challenge` 合并，统一表达“需要用户额外验证”。
     public func toPublicRiskAction() -> PublicRiskAction {
         switch self {
         case .allow: return .allow
@@ -176,8 +183,8 @@ public enum InternalRiskLevel: String, Codable, Sendable {
     }
 }
 
-// MARK: - Public Risk Action (3-type per protocol)
-/// 公开风险动作（3种，符合协议定义）
+// MARK: - 公开风险动作（3 种，符合协议）
+/// 公开风险动作（3 种，符合协议定义）
 @objc(CPR_PublicRiskAction) public enum PublicRiskAction: Int, Sendable, Codable, CaseIterable {
     /// 允许 - 直接放行
     case allow = 0
@@ -196,7 +203,7 @@ public enum InternalRiskLevel: String, Codable, Sendable {
     }
 }
 
-// MARK: - Type Aliases for Backward Compatibility
-/// 类型别名，保持向后兼容
+// MARK: - 兼容旧版的类型别名
+/// 类型别名，保持向后兼容；新代码应直接使用右侧的真实类型名。
 public typealias DetectionScenario = RiskScenario
 public typealias RiskLevel = InternalRiskLevel

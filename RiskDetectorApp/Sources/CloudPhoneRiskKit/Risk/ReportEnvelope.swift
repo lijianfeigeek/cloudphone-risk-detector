@@ -1,3 +1,9 @@
+// 上报链路·安全信封核心：规范化 payload，按签名版本拼签名输入，做 HMAC 签名与本地校验。
+// v3 签名域 = v2 字段 + trustLevel + sha256(assertion) + sha256(reAttestationAssertion)；legacy 版本默认拒绝签发。
+// 隐私边界：离开设备的是信封字段（payload/nonce/ts/sessionToken/reportId/signature/attestation 证明）；
+// 签名密钥、DeviceKey、HKDF 派生材料只在本地存在。
+// 失败语义：时间、签名、重放任一失败即拒绝；v3 签名后字段不可再改（相关方法静默 no-op 以保护 HMAC）。
+
 import CRiskCore
 import CryptoKit
 import Foundation
@@ -10,11 +16,12 @@ public enum SigningKeyEncoding: Sendable {
     case hex
 }
 
-/// 上报信封，用于防止重放和篡改
+/// 上报信封，用于防止重放和篡改。
 /// v2 签名输入：sigVer|nonce|ts(ms)|sessionToken|reportId|keyId|fieldMappingVersion|attestationKeyId|payloadCanonical
+/// 安全不变量：HMAC 覆盖全部参与判决的字段；nonce 一次性；时间戳带容差窗口；v3 额外绑定证明材料。
 public struct ReportEnvelope: Codable, Sendable {
 
-    // MARK: - Properties
+    // MARK: - 属性
 
     /// 防重放随机数，使用 UUID 字符串
     public let nonce: String
@@ -65,7 +72,7 @@ public struct ReportEnvelope: Codable, Sendable {
     /// 该值不是额外密钥材料，但可以帮助区分“签名不匹配”与“签名输入/绑定上下文漂移”。
     public let bindingDigest: String?
 
-    /// Local transport policy; the collector independently enforces its own policy.
+    /// 本地传输策略；Collector 会独立执行自己的策略，本字段不能替代服务端校验。
     public let requireHardwareAttestation: Bool
 
     /// 是否具备完整硬件信任根（attestationKeyId 与 attestationAssertion 均存在且非空）。
@@ -76,12 +83,19 @@ public struct ReportEnvelope: Codable, Sendable {
         return true
     }
 
+    /// 材料绑定观测结果：用于区分“签名不匹配”与“绑定上下文漂移”，不含密钥材料。
     public struct MaterialBindingObservation: Sendable, Equatable {
+        /// 绑定的签名版本/模式。
         public let mode: String?
+        /// 信封中携带的绑定摘要。
         public let envelopeDigestHex: String?
+        /// 按当前字段重算的绑定摘要。
         public let recomputedDigestHex: String
+        /// 是否携带绑定元数据。
         public let isPresent: Bool
+        /// 元数据是否内部一致且与重算摘要相同。
         public let isConsistent: Bool
+        /// 不一致时的稳定原因码。
         public let failureReason: String?
 
         public init(
@@ -101,8 +115,9 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
-    // MARK: - Configuration
+    // MARK: - 配置
 
+    /// 信封创建/校验配置。
     public struct Config: Sendable {
         /// nonce 防重放窗口（毫秒），默认 5 分钟
         public var nonceExpirationMillis: Int64 = 300_000
@@ -122,15 +137,15 @@ public struct ReportEnvelope: Codable, Sendable {
         /// 且必须在调用处注释过渡原因；新调用方不得开启。
         public var allowLegacySignatureVersions: Bool = false
 
-        /// When `true`, `create()` rejects requests that lack an `attestationKeyId`
-        /// and `toGrpcRequestBytes()` / `toCompressedGrpcRequestBytes()` reject
-        /// envelopes where `hasHardwareAttestation == false`.
+        /// 为 `true` 时，`create()` 拒绝缺少 `attestationKeyId` 的请求，
+        /// `toGrpcRequestBytes()` / `toCompressedGrpcRequestBytes()` 拒绝
+        /// `hasHardwareAttestation == false` 的信封。
         ///
-        /// Set to `true` for high-risk operations (payment, account takeover
-        /// prevention) where a hardware trust root is mandatory.
-        /// Default: `false` — attestation is optional and advisory.
+        /// 高风险操作（支付、防账号接管）应设为 `true`，强制硬件信任根。
+        /// 默认 `false`：attestation 为可选、建议性。
         public var requireHardwareAttestation: Bool = false
 
+        /// 构造配置；默认签发 v3，且不允许 legacy 版本。
         public init(
             nonceExpirationMillis: Int64 = 300_000,
             timeDriftToleranceMillis: Int64 = 300_000,
@@ -146,8 +161,9 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
-    // MARK: - Error
+    // MARK: - 错误
 
+    /// 信封创建/校验错误；`reasonCode` 提供稳定机器码。
     public enum ReportEnvelopeError: Error, LocalizedError {
         case invalidPayload
         case signatureMismatch
@@ -181,8 +197,9 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
-    // MARK: - Codable
+    // MARK: - 编解码
 
+    // 短键序列化：键名即协议，变更需同步服务端与历史信封兼容逻辑。
     enum CodingKeys: String, CodingKey {
         case nonce = "n"
         case ts = "t"
@@ -202,6 +219,7 @@ public struct ReportEnvelope: Codable, Sendable {
         case requireHardwareAttestation = "rh"
     }
 
+    /// 直接构造信封（不做签名/校验）；业务代码应优先使用 `create(...)`。
     public init(
         nonce: String,
         ts: Int64,
@@ -238,6 +256,7 @@ public struct ReportEnvelope: Codable, Sendable {
         self.requireHardwareAttestation = requireHardwareAttestation
     }
 
+    /// 解码信封；缺失的 `sigVer`/`keyId` 回退为 v1/k1，以兼容历史信封。
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         nonce = try container.decode(String.self, forKey: .nonce)
@@ -258,9 +277,9 @@ public struct ReportEnvelope: Codable, Sendable {
         requireHardwareAttestation = try container.decodeIfPresent(Bool.self, forKey: .requireHardwareAttestation) ?? false
     }
 
-    // MARK: - Factory
+    // MARK: - 工厂方法
 
-    /// 从风险报告创建 ReportEnvelope
+    /// 从风险报告创建 ReportEnvelope。
     /// - Parameters:
     ///   - payloadData: 原始 payload（JSON）
     ///   - reportId: 报告 ID
@@ -271,6 +290,8 @@ public struct ReportEnvelope: Codable, Sendable {
     ///   - attestationKeyId: App Attest 密钥 ID（可选）
     ///   - trustLevel: 端侧信任等级（SDK 5.0），Keychain 被清或 attestation 过期时应传 .degraded
     ///   - config: 签名配置
+    /// - Returns: 已签名的信封；payload 已按映射重命名（若提供映射）。
+    /// - Throws: 时间戳异常、legacy 版本未授权、证明缺失、nonce 重复、payload/密钥编码失败时拒绝。
     public static func create(
         payloadData: Data,
         reportId: String,
@@ -300,6 +321,7 @@ public struct ReportEnvelope: Codable, Sendable {
         )
     }
 
+    /// 内部创建入口：支持外部签名提供者（v2a 走 CRiskCore 派生密钥）与自定义绑定模式。
     internal static func create(
         payloadData: Data,
         reportId: String,
@@ -318,12 +340,9 @@ public struct ReportEnvelope: Codable, Sendable {
         let nonce = UUID().uuidString
         let ts = currentTimestampMillis()
 
-        // Sanity-check the device clock at creation time: only the lower bound
-        // (≥ 2020-01-01T00:00:00Z, i.e. 1_577_836_800_000 ms) is enforced here.
-        // The upper bound (not too far in the future) is checked by the verifier
-        // via isTimestampValid().  A clock stuck at epoch 0 or wrong by years is
-        // caught before the server ever sees the envelope, giving a clearer error
-        // than a silent timestampOutOfRange on the server side.
+        // 创建时只强制时间戳下界（≥ 2020-01-01T00:00:00Z，即 1_577_836_800_000 ms）。
+        // 上界（不能过于超前）由校验方通过 isTimestampValid() 检查。时钟停在 epoch 0
+        // 或偏差数年的设备会在信封离开本地前被拦截，返回比服务端静默失败更清晰的错误。
         let minReasonableTs: Int64 = 1_577_836_800_000  // 2020-01-01 UTC
         guard ts >= minReasonableTs else {
             throw ReportEnvelopeError.timestampOutOfRange
@@ -338,17 +357,14 @@ public struct ReportEnvelope: Codable, Sendable {
             throw ReportEnvelopeError.signingFailed
         }
 
-        // Attestation enforcement: if the caller requires a hardware trust root,
-        // the attestationKeyId must be provided at create() time (it is included
-        // in the signature domain).  The assertion itself is added post-create via
-        // withAttestation(); callers should call envelope.requireAttestation()
-        // before transmitting to ensure it is complete.
+        // Attestation 强制：调用方要求硬件信任根时，attestationKeyId 必须在 create() 时提供
+        //（它会被纳入签名域）。断言本身可在创建后通过 withAttestation() 附加；
+        // 发送前应调用 envelope.requireAttestation() 确认证明完整。
         if config.requireHardwareAttestation && (attestationKeyId == nil || attestationKeyId!.isEmpty) {
             throw ReportEnvelopeError.attestationIncomplete
         }
 
-        // Client-side nonce deduplication: guard against UUID-generator
-        // tampering or accidental envelope reuse within the replay window.
+        // 客户端 nonce 去重：防止 UUID 生成器被篡改或调用方意外复用信封。
         guard ClientNonceWindow.shared.registerIfNew(nonce, ts: ts) else {
             throw ReportEnvelopeError.replayDetected
         }
@@ -361,13 +377,10 @@ public struct ReportEnvelope: Codable, Sendable {
         }
 
         let canonicalPayload = try canonicalJSONString(from: effectivePayload)
-        // For v3, the signature domain includes self-reported envelope fields
-        // (trustLevel + assertion digests).  Callers must finalise these BEFORE
-        // signing — i.e., pass the intended trustLevel here, and the assertion
-        // (if any) must be obtained from AppAttestSigner.generateAssertion()
-        // *before* calling create() so its digest can be bound into the HMAC.
-        // For v2/v2a/v2d/v2h, these arguments are ignored in the signature
-        // domain (legacy behaviour preserved).
+        // v3 的签名域包含自报字段（trustLevel + 断言摘要）。调用方必须在签名前确定这些值：
+        // 即在此传入目标 trustLevel，且断言（若有）需在调用 create() 之前由
+        // AppAttestSigner.generateAssertion() 取得，以便其摘要进入 HMAC。
+        // v2/v2a/v2d/v2h 的签名域忽略这些参数（保持 legacy 行为）。
         let signatureInput = buildSignatureInput(
             sigVer: config.signatureVersion,
             nonce: nonce,
@@ -394,10 +407,9 @@ public struct ReportEnvelope: Codable, Sendable {
             }
             defer { secureZeroData(&baseKeyData) }
             if config.signatureVersion == "v2h" {
-                // HKDF per-request key derivation (v2h only): effective key =
-                // HKDF(IKM=signingKey, salt=nonce|ts, info="cprisk.report.hmac.v2h").
-                // Each envelope gets a unique effective key, preventing statistical
-                // HMAC key recovery from a corpus of (input, MAC) pairs.
+                // v2h 按请求派生密钥：effective key =
+                // HKDF(IKM=signingKey, salt=nonce|ts, info="cprisk.report.hmac.v2h")。
+                // 每个信封使用唯一有效密钥，防止攻击者从 (input, MAC) 样本集统计恢复 HMAC 密钥。
                 var derivedKey = Self.hkdfDerivedKey(baseKey: baseKeyData, nonce: nonce, ts: ts)
                 defer { secureZeroData(&derivedKey) }
                 signatureHex = hmacHex(message: signatureData, keyData: derivedKey)
@@ -417,10 +429,8 @@ public struct ReportEnvelope: Codable, Sendable {
             fieldMappingVersion: fieldMapping?.version,
             signature: signatureHex,
             attestationKeyId: attestationKeyId,
-            // For v3 the assertion bytes were folded into the HMAC, so the envelope
-            // emits them at signing time (callers must NOT use withAttestation()
-            // afterwards to swap them out).  For legacy versions, assertion is
-            // attached post-signing via withAttestation() as before.
+            // v3 在签名时已把断言字节折入 HMAC，因此信封在签名时直接携带断言
+            //（调用方之后不得再用 withAttestation() 替换）。legacy 版本则在签名后附加断言。
             attestationAssertion: attestationAssertion,
             trustLevel: trustLevel,
             reAttestationAssertion: reAttestationAssertion,
@@ -440,9 +450,8 @@ public struct ReportEnvelope: Codable, Sendable {
     /// 防止破坏 HMAC（导致 envelope 验签失败）。
     public func withAttestation(attestationKeyId: String, assertion: Data) -> ReportEnvelope {
         if sigVer == "v3" {
-            // v3 demands assertion bytes are in the HMAC domain at signing time;
-            // mutating them post-sign would invalidate the signature.  Caller
-            // must use create(attestationAssertion:) instead.
+            // v3 要求断言字节在签名时就在 HMAC 域内；签名后修改会使签名失效。
+            // 调用方必须改用 create(attestationAssertion:)。
             return self
         }
         return ReportEnvelope(
@@ -465,11 +474,12 @@ public struct ReportEnvelope: Codable, Sendable {
         )
     }
 
-    /// 设置信任等级（SDK 5.0）
+    /// 设置信任等级（SDK 5.0）。
     ///
     /// ⚠️ v3 (SDK 7.3.0, Version.current): trustLevel 已纳入签名域，签名后修改会破坏 HMAC。
     /// 必须在 `create(trustLevel:)` 时传入正确值；该方法对 v3 envelope 静默 no-op。
     public func withTrustLevel(_ level: TrustLevel) -> ReportEnvelope {
+        // v3 的 trustLevel 已被签名，返回原对象而非生成签名失效的副本。
         if sigVer == "v3" {
             return self
         }
@@ -493,16 +503,18 @@ public struct ReportEnvelope: Codable, Sendable {
         )
     }
 
-    /// 附加 re-attestation 断言（SDK 5.0）
+    /// 附加 re-attestation 断言（SDK 5.0）。
     ///
     /// ⚠️ v3: reAttestationAssertion 已纳入签名域，需在 `create()` 时传入；v3 此方法 no-op。
     public func withReAttestationAssertion(_ assertion: Data?) -> ReportEnvelope {
+        // v3 签名后修改会使 HMAC 失效，因此静默返回原对象。
         if sigVer == "v3" {
             return self
         }
         return _withReAttestationAssertionLegacy(assertion)
     }
 
+    /// legacy 版本的 re-attestation 附加实现；仅由 `withReAttestationAssertion` 调用。
     private func _withReAttestationAssertionLegacy(_ assertion: Data?) -> ReportEnvelope {
         ReportEnvelope(
             nonce: nonce,
@@ -524,12 +536,14 @@ public struct ReportEnvelope: Codable, Sendable {
         )
     }
 
-    // MARK: - Parser
+    // MARK: - 解析
 
+    /// 从 JSON Data 解码信封；不验签，调用方需另行调用 `validate(...)`。
     public static func fromJSON(_ data: Data) throws -> ReportEnvelope {
         try JSONDecoder().decode(ReportEnvelope.self, from: data)
     }
 
+    /// 从 JSON 字符串解码信封；UTF-8 转换失败时抛 `invalidPayload`。
     public static func fromJSON(_ jsonString: String) throws -> ReportEnvelope {
         guard let data = jsonString.data(using: .utf8) else {
             throw ReportEnvelopeError.invalidPayload
@@ -537,17 +551,15 @@ public struct ReportEnvelope: Codable, Sendable {
         return try fromJSON(data)
     }
 
-    // MARK: - Attestation Enforcement
+    // MARK: - 证明强制
 
-    /// Throws `.attestationIncomplete` if this envelope does not carry a complete
-    /// hardware attestation pair (`attestationKeyId` + `attestationAssertion`).
+    /// 当信封缺少完整硬件证明对（`attestationKeyId` + `attestationAssertion`）时抛 `.attestationIncomplete`。
     ///
-    /// Call this **before** `toGrpcRequestBytes()` when transmitting envelopes
-    /// for high-risk operations that mandate App Attest hardware trust roots:
+    /// 对强制要求 App Attest 硬件信任根的高风险操作，应在调用 `toGrpcRequestBytes()` **之前**调用：
     /// ```swift
     /// let envelope = try ReportEnvelope.create(..., attestationKeyId: keyId)
     ///     .withAttestation(attestationKeyId: keyId, assertion: assertion)
-    /// try envelope.requireAttestation()   // throws if assertion missing
+    /// try envelope.requireAttestation()   // assertion 缺失时抛错
     /// let bytes = try envelope.toGrpcRequestBytes()
     /// ```
     public func requireAttestation() throws {
@@ -556,10 +568,11 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
-    // MARK: - Verification
+    // MARK: - 验签
 
-    /// 通过 key resolver 验签（支持 key rotation）
-    /// - Parameter keyEncoding: 密钥编码，.utf8 为 UTF-8 字符串，.hex 为 hex 编码（用于 DeviceKey 派生场景）
+    /// 通过 key resolver 验签（支持 key rotation）。
+    /// - Parameter keyEncoding: 密钥编码，`.utf8` 为 UTF-8 字符串，`.hex` 为 hex 编码（用于 DeviceKey 派生场景）。
+    /// - Returns: resolver 找不到 key 或签名不匹配时返回 false。
     public func verifySignature(
         using keyResolver: (String) -> String?,
         keyEncoding: SigningKeyEncoding = .utf8
@@ -570,7 +583,7 @@ public struct ReportEnvelope: Codable, Sendable {
         return verifySignature(signingKey, keyEncoding: keyEncoding)
     }
 
-    /// 验签（支持 hex 编码密钥）
+    /// 验签（支持 hex 编码密钥）；密钥解码失败直接返回 false。
     public func verifySignature(_ signingKey: String, keyEncoding: SigningKeyEncoding = .utf8) -> Bool {
         let keyData: Data?
         switch keyEncoding {
@@ -583,10 +596,10 @@ public struct ReportEnvelope: Codable, Sendable {
         return verifySignature(keyData: keyData)
     }
 
-    /// 验签（内部实现，使用 Data 密钥）
+    /// 验签（内部实现，使用 Data 密钥）。
+    /// 除 HMAC 外还会重算 material binding 摘要；绑定元数据不一致同样视为验签失败。
     private func verifySignature(keyData: Data) -> Bool {
-        // For v2h: mirror the HKDF derivation used in create() so the effective
-        // verification key matches.  For v1/v2/v2a/v2d: use the raw key as before.
+        // v2h：复现 create() 中的 HKDF 派生，确保校验密钥一致；v1/v2/v2a/v2d 使用原始密钥。
         var effectiveKey: Data
         if sigVer == "v2h" {
             effectiveKey = Self.hkdfDerivedKey(baseKey: keyData, nonce: nonce, ts: ts)
@@ -624,19 +637,24 @@ public struct ReportEnvelope: Codable, Sendable {
         return timingSafeCompare(expectedSignature, signature)
     }
 
-    /// 检查 nonce 是否超时
+    /// 检查 nonce 是否超出有效期（以信封时间戳为基准）。
     public func isExpired(_ config: Config = Config()) -> Bool {
         let now = Self.currentTimestampMillis()
         return abs(now - ts) > config.nonceExpirationMillis
     }
 
-    /// 检查时间戳是否在允许范围内
+    /// 检查时间戳是否在允许的时钟偏差范围内。
     public func isTimestampValid(_ config: Config = Config()) -> Bool {
         let now = Self.currentTimestampMillis()
         return abs(now - ts) <= config.timeDriftToleranceMillis
     }
 
-    /// 完整验证：时钟 + 签名 + 重放窗口
+    /// 完整验证：时钟 + 签名 + 重放窗口。
+    /// - Parameters:
+    ///   - signingKey: HMAC 密钥。
+    ///   - nonceStore: 重放存储；nil 时跳过重放消费（仅做时间/签名校验）。
+    ///   - config: 时间容差与 nonce 有效期。
+    /// - Returns: 首个失败原因；全部通过返回 `.success(())`。
     public func validate(
         signingKey: String,
         nonceStore: NonceReplayProtecting? = nil,
@@ -669,6 +687,7 @@ public struct ReportEnvelope: Codable, Sendable {
         return .success(())
     }
 
+    /// 内部完整验证：使用自定义签名校验器（v2a 走 CRiskCore 派生密钥路径）。
     internal func validate(
         signatureValidator: (Data, String) -> Bool,
         nonceStore: NonceReplayProtecting? = nil,
@@ -728,7 +747,8 @@ public struct ReportEnvelope: Codable, Sendable {
         return .success(())
     }
 
-    /// 完整验证：通过 key resolver 验签（支持 key rotation）
+    /// 完整验证：通过 key resolver 验签（支持 key rotation）。
+    /// resolver 找不到 key 时返回 `.signingFailed`，不静默接受。
     public func validate(
         keyResolver: (String) -> String?,
         nonceStore: NonceReplayProtecting? = nil,
@@ -741,8 +761,9 @@ public struct ReportEnvelope: Codable, Sendable {
         return validate(signingKey: signingKey, nonceStore: nonceStore, config: config)
     }
 
-    // MARK: - JSON
+    // MARK: - JSON 序列化
 
+    /// 编码为 JSON Data；`prettyPrinted` 仅用于调试，生产建议 false。
     public func toJSONData(prettyPrinted: Bool = false) throws -> Data {
         let encoder = JSONEncoder()
         if prettyPrinted {
@@ -751,6 +772,7 @@ public struct ReportEnvelope: Codable, Sendable {
         return try encoder.encode(self)
     }
 
+    /// 编码为 JSON 字符串；UTF-8 转换失败时抛 `encodingFailed`。
     public func toJSONString(prettyPrinted: Bool = false) throws -> String {
         let data = try toJSONData(prettyPrinted: prettyPrinted)
         guard let string = String(data: data, encoding: .utf8) else {
@@ -759,8 +781,9 @@ public struct ReportEnvelope: Codable, Sendable {
         return string
     }
 
-    // MARK: - Internals
+    // MARK: - 内部实现
 
+    /// 返回 payload 的规范化 JSON 字符串（键排序，作为签名输入的一部分）。
     public func canonicalPayloadString() throws -> String {
         try Self.canonicalJSONString(from: payload)
     }
@@ -885,10 +908,9 @@ public struct ReportEnvelope: Codable, Sendable {
     ) -> String {
         let fmv = fieldMappingVersion ?? ""
         let akId = attestationKeyId ?? ""
-        // v3 binds previously-unsigned envelope fields (trustLevel + assertion bytes)
-        // into the HMAC domain so an attacker holding the signing key cannot tamper
-        // these self-reported fields after signing without breaking the signature.
-        // See SHA-256("") trap analysis: any field NOT in this domain is forgeable.
+        // v3 把此前未签名的信封字段（trustLevel + 断言字节）绑定进 HMAC 域，
+        // 使持有签名密钥的攻击者在签名后篡改这些自报字段也会破坏签名。
+        // 依据 SHA-256("") 陷阱分析：不在此域内的字段都可被伪造。
         if sigVer == "v3" {
             let tl = trustLevel?.rawValue ?? ""
             let aaHex = attestationAssertion.map { sha256Hex($0) } ?? ""
@@ -902,28 +924,26 @@ public struct ReportEnvelope: Codable, Sendable {
         CPRiskMessageAuth.authenticationCodeHex(for: message, keyData: keyData)
     }
 
-    /// Derives a 32-byte per-request HMAC key using HKDF-SHA-256.
+    /// 使用 HKDF-SHA-256 派生 32 字节的按请求 HMAC 密钥。
     ///
-    /// `IKM`  = static `baseKey` provided by the caller
-    /// `salt` = `"<nonce>|<ts>"` — unique per envelope, prevents key reuse
+    /// `IKM`  = 调用方提供的静态 `baseKey`
+    /// `salt` = `"<nonce>|<ts>"`，每个信封唯一，防止密钥复用
     /// `info` = `"cprisk.report.hmac.v2h"` || BE32(emuFlags)
     ///
-    /// ## Emulator-probe poisoning
-    /// Emulator detection results (bitmask from C-layer probes) are mixed into
-    /// the HKDF `info` field.  On a real device all flags are 0 — the info is
-    /// effectively `"cprisk.report.hmac.v2h\0\0\0\0"` and the server verifies
-    /// successfully.  On unidbg at least one flag bit is set → info changes →
-    /// derived key differs → HMAC mismatch → server rejects, silently.
+    /// ## 模拟器探针投毒
+    /// C 层探针得到的模拟器检测位图会混入 HKDF `info`。真机上所有位为 0，
+    /// info 实际为 `"cprisk.report.hmac.v2h\0\0\0\0"`，服务端可正常验签；
+    /// 在 unidbg 等环境至少一位被置位 → info 改变 → 派生密钥不同 → HMAC 不匹配，
+    /// 服务端会静默拒绝。
     ///
-    /// Two probes are combined:
-    /// - `cprisk_emulator_probe()` — cached; runs full 8-check suite at VM init.
-    /// - `cprisk_emulator_quick_probe()` — live, uncached re-probe of 3 fast checks
-    ///   (kern.ostype, stack address, watchdog stuck).  Resists attacks where the
-    ///   attacker zeroes the probe cache between VM init and signing.
+    /// 两类探针会合并：
+    /// - `cprisk_emulator_probe()` — 带缓存，VM 初始化时跑完整 8 项检查。
+    /// - `cprisk_emulator_quick_probe()` — 实时、无缓存复检 3 项快速检查
+    ///   （kern.ostype、栈地址、watchdog 卡死），抵御攻击者在 VM 初始化与签名之间清空缓存。
     private static func hkdfDerivedKey(baseKey: Data, nonce: String, ts: Int64) -> Data {
         let salt = Data("\(nonce)|\(ts)".utf8)
 
-        // Combine cached probe with live re-probe; OR so any set bit poisons.
+        // 缓存探针与实时探针按位或合并：任一位被置位都会污染派生密钥。
         let emuCached = cprisk_emulator_probe()
         let emuQuick  = cprisk_emulator_quick_probe()
         let emuFlags  = emuCached | emuQuick
@@ -940,6 +960,7 @@ public struct ReportEnvelope: Codable, Sendable {
         return derived.withUnsafeBytes { Data($0) }
     }
 
+    /// 根据签名是否由外部提供者生成，以及签名版本，给出默认绑定模式标签。
     private static func defaultBindingMode(signatureProviderPresent: Bool, sigVer: String = "v2h") -> String {
         if signatureProviderPresent { return "external_signature_provider_v1" }
         switch sigVer {
@@ -949,6 +970,7 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
+    /// 计算签名输入的 SHA-256 hex，用于绑定一致性观测。
     private static func bindingDigestHex(for signatureInputData: Data) -> String {
         Data(SHA256.hash(data: signatureInputData)).map { String(format: "%02x", $0) }.joined()
     }
@@ -957,6 +979,7 @@ public struct ReportEnvelope: Codable, Sendable {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// 校验绑定模式与签名版本是否匹配；不匹配说明信封被跨版本改写，需拒绝。
     private static func isBindingModeCompatible(_ mode: String, sigVer: String) -> Bool {
         switch mode {
         case "hkdf_hmac_v1":
@@ -976,6 +999,7 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
+    /// 把签名输入转为 UTF-8 字节；转换失败抛 `signingFailed`。
     private static func signatureInputData(from signatureInput: String) throws -> Data {
         guard let signatureData = signatureInput.data(using: .utf8) else {
             throw ReportEnvelopeError.signingFailed
@@ -983,10 +1007,13 @@ public struct ReportEnvelope: Codable, Sendable {
         return signatureData
     }
 
+    /// 当前 Unix 毫秒时间戳，与 `ts` 字段及 nonce 有效期同一时间轴。
     private static func currentTimestampMillis() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
+    /// 生成规范化 JSON：解析后按 key 排序重新编码，确保签名输入不受空白/键序影响。
+    /// 非法 JSON 或非对象片段抛 `invalidPayload`。
     private static func canonicalJSONString(from payloadData: Data) throws -> String {
         let object = try JSONSerialization.jsonObject(with: payloadData, options: [.fragmentsAllowed])
         guard JSONSerialization.isValidJSONObject(object) else {
@@ -999,6 +1026,8 @@ public struct ReportEnvelope: Codable, Sendable {
         return canonicalString
     }
 
+    /// 根据签名输入重算绑定摘要，并与信封携带的元数据比对。
+    /// 未携带绑定元数据的旧信封视为一致（isPresent=false）。
     private func materialBindingObservation(signatureInputData: Data) -> MaterialBindingObservation {
         let recomputedDigestHex = Self.bindingDigestHex(for: signatureInputData)
         let metadataPresent = bindingMode != nil || bindingDigest != nil
@@ -1056,6 +1085,7 @@ public struct ReportEnvelope: Codable, Sendable {
         )
     }
 
+    /// 在未携带 bindingMode 时，根据签名版本推断绑定模式（仅用于诊断展示）。
     private func inferredBindingMode(for signatureVersion: String) -> String {
         switch signatureVersion {
         case "v2h":
@@ -1071,6 +1101,7 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
+    /// 描述 attestationKeyId 与 attestationAssertion 的配对状态。
     private func attestationPairState() -> String {
         let hasKeyId = attestationKeyId.map { !$0.isEmpty } ?? false
         let hasAssertion = attestationAssertion.map { !$0.isEmpty } ?? false
@@ -1086,6 +1117,7 @@ public struct ReportEnvelope: Codable, Sendable {
         }
     }
 
+    /// 从 payload 中读取信号摘要元数据（`sd`/`dv2`），用于诊断与连续性校验。
     private func payloadBindingMetadata() -> (signalsDigestPresent: Bool, signalsDigestVersion: String?, signalsDigest: String?) {
         guard let object = try? JSONSerialization.jsonObject(with: payload, options: [.fragmentsAllowed]) as? [String: Any] else {
             return (false, nil, nil)
@@ -1097,20 +1129,24 @@ public struct ReportEnvelope: Codable, Sendable {
 
 }
 
-// MARK: - Replay Protection
+// MARK: - 重放保护
 
 /// 服务器侧/网关侧推荐实现；SDK 内提供内存实现用于联调和测试。
+/// 重放保护存储抽象：由服务端/网关或本地存储实现。
+/// - 实现必须保证 `consumeIfNew` 的原子性，避免并发重复消费同一 nonce。
 public protocol NonceReplayProtecting: AnyObject {
     /// - Returns: true 表示首次消费；false 表示已见过（重放）
     func consumeIfNew(sessionToken: String, nonce: String, expiresAtMillis: Int64) -> Bool
 }
 
+/// 进程内 nonce 重放存储（仅供测试/联调）；重启后状态丢失，不可用于生产网关。
 public final class InMemoryNonceReplayStore: NonceReplayProtecting {
     private var storage: [String: Int64] = [:]
     private let lock = UnfairLock()
 
     public init() {}
 
+    /// 首次消费返回 true；有效期内重复返回 false；过期条目清理后可再次消费。
     public func consumeIfNew(sessionToken: String, nonce: String, expiresAtMillis: Int64) -> Bool {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let key = "\(sessionToken):\(nonce)"
@@ -1129,11 +1165,11 @@ public final class InMemoryNonceReplayStore: NonceReplayProtecting {
     }
 }
 
-// MARK: - Convenience
+// MARK: - 便捷方法
 
 #if DEBUG
 extension ReportEnvelope {
-    /// Test-only convenience; excluded from Release builds.
+    /// 仅测试用便捷方法；Release 构建不包含。
     /// ⚠️ `"default-test-key"` 是测试专用占位密钥，仅在 DEBUG 下编译，
     /// Release 二进制中不存在；生产路径禁止使用默认/零密钥，
     /// 无密钥时 `create(...)` 会抛 `signingFailed` 硬失败。
@@ -1153,6 +1189,7 @@ extension ReportEnvelope {
 #endif
 
 public extension ReportEnvelope.ReportEnvelopeError {
+    /// 稳定的机器可读原因码，供日志与指标聚合。
     var reasonCode: String {
         switch self {
         case .invalidPayload:

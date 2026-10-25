@@ -3,18 +3,27 @@ import Foundation
 import UIKit
 #endif
 
-/// 环境一致性检测：热状态、电池状态、屏幕亮度等长期不变可能暗示云手机/模拟器
+// 环境一致性 Provider。
+// 跨调用记录热状态、电池状态与屏幕亮度，检测长期“冻结不变”的维度。
+// 云手机/虚拟环境通常没有真实传感器与电源，多个维度同时静止是强线索。
+// 依赖 UserDefaults 历史，首次运行或样本不足时不产生信号。
+
+/// 环境一致性检测器：输出 `thermal_state_static`、`battery_state_static`、
+/// `battery_level_static`、`no_charge_state_change`、`screen_brightness_static`
+/// 以及三维联合的 `environment_freeze_lock`。
 final class EnvironmentConsistencyProvider: RiskSignalProvider {
     static let shared = EnvironmentConsistencyProvider()
     private init() {}
 
     let id = "environment_consistency"
 
+    // 历史持久化键与窗口上限；10 个点足以观察趋势，又不会无限增长。
     private static let thermalHistoryKey = "cprk_thermal_history"
     private static let batteryHistoryKey = "cprk_battery_history"
     private static let thermalHistoryMaxCount = 10
     private static let batteryHistoryMaxCount = 10
 
+    /// 执行四项一致性检查；顺序可按远程策略扰动。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []
@@ -44,6 +53,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         #endif
     }
 
+    /// 从远程策略读取变异参数；无策略时返回 nil。
     private func activeMutationStrategy() -> MutationStrategy? {
         guard let mutation = PolicyManager.shared.activePolicy?.mutation else { return nil }
         return MutationStrategy(
@@ -54,8 +64,10 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         )
     }
 
-    // MARK: - thermal_state_static
+    // MARK: - 热状态静止
 
+    /// 记录当前热状态；最近 5 次以上完全一致时输出 `thermal_state_static`。
+    /// 真实设备在 CPU 负载变化时会进入 fair/serious；长期 nominal 更符合虚拟环境。
     private func thermalStateStaticSignals() -> [RiskSignal] {
         let current = thermalStateString(ProcessInfo.processInfo.thermalState)
         appendToHistory(key: Self.thermalHistoryKey, value: current, maxCount: Self.thermalHistoryMaxCount)
@@ -82,6 +94,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         ]
     }
 
+    /// 把 `ProcessInfo.ThermalState` 转成稳定字符串，便于持久化与比较。
     private func thermalStateString(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
         case .nominal: return "nominal"
@@ -92,8 +105,9 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         }
     }
 
-    // MARK: - battery_state_static
+    // MARK: - 电池状态静止
 
+    /// 平台分发：仅 UIKit 平台可读取电池状态，其他平台直接返回空。
     private func batteryStateStaticSignals() -> [RiskSignal] {
         #if canImport(UIKit)
         return batteryStateStaticSignalsUIKit()
@@ -103,8 +117,12 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
     }
 
     #if canImport(UIKit)
+    /// 记录电池状态；最近 2 次以上均为充电且电量几乎不变时，输出一组静止信号。
+    /// - 电量变化范围 < 0.01（约 1%）才视为完全不变；
+    /// - 同时输出 `battery_state_static`、`battery_level_static`、`no_charge_state_change`。
     private func batteryStateStaticSignalsUIKit() -> [RiskSignal] {
         let entry: String
+        // UIDevice 是 @MainActor，后台调用时必须同步切到主线程读取。
         if Thread.isMainThread {
             entry = captureBatteryEntry()
         } else {
@@ -123,6 +141,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         guard allCharging else { return [] }
 
         let levelRange = (levels.max() ?? 0) - (levels.min() ?? 0)
+        // 电量范围小于 1% 视为完全静止；真实设备即使充电也会有轻微波动。
         guard levelRange < 0.01 else { return [] }
 
         return [
@@ -176,6 +195,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         return "\(batteryStateString(state)):\(String(format: "%.4f", level))"
     }
 
+    /// 把电池状态转成字符串，便于持久化。
     private func batteryStateString(_ state: UIDevice.BatteryState) -> String {
         switch state {
         case .unknown: return "unknown"
@@ -186,6 +206,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         }
     }
 
+    /// 解析 "state:level" 历史条目；格式非法或数值越界返回 nil。
     private func parseBatteryEntry(_ entry: String) -> (state: UIDevice.BatteryState, level: Double)? {
         let parts = entry.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
         guard parts.count == 2,
@@ -203,8 +224,9 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
     }
     #endif
 
-    // MARK: - screen_brightness_static
+    // MARK: - 屏幕亮度静止
 
+    /// 平台分发：仅 UIKit 平台可读取屏幕亮度。
     private func screenBrightnessStaticSignals() -> [RiskSignal] {
         #if canImport(UIKit)
         return screenBrightnessStaticSignalsUIKit()
@@ -214,6 +236,8 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
     }
 
     #if canImport(UIKit)
+    /// 连续采样 5 次亮度；方差 < 0.001 时输出 `screen_brightness_static`。
+    /// 真实设备在自动亮度/用户操作下通常有轻微波动。
     private func screenBrightnessStaticSignalsUIKit() -> [RiskSignal] {
         let samples = captureBrightnessSamples()
         guard samples.count >= 5 else { return [] }
@@ -277,7 +301,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         return squaredDiffs.reduce(0, +) / Double(series.count - 1)
     }
 
-    // MARK: - environment_freeze_lock
+    // MARK: - 环境冻结联合检测
 
     /// CVD 云手机三维环境冻结联合检测：
     /// 热状态 + 电池 + 屏幕亮度三者同时静止是真实设备上极不可能的组合。
@@ -355,8 +379,9 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
     }
     #endif
 
-    // MARK: - Persistence
+    // MARK: - 持久化
 
+    /// 追加一条历史并裁剪到 maxCount，写回 UserDefaults。
     private func appendToHistory(key: String, value: String, maxCount: Int) {
         var history = loadHistory(key: key)
         history.append(value)
@@ -366,6 +391,7 @@ final class EnvironmentConsistencyProvider: RiskSignalProvider {
         UserDefaults.standard.set(history.joined(separator: ","), forKey: key)
     }
 
+    /// 读取逗号分隔的历史条目；无记录返回空数组。
     private func loadHistory(key: String) -> [String] {
         guard let raw = UserDefaults.standard.string(forKey: key), !raw.isEmpty else {
             return []

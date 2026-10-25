@@ -1,6 +1,11 @@
+// 上报链路·风险报告模型：把评估结果打包为可上报 payload（短键），并提供本地加密/解密入口。
+// 离开设备的字段为 `Payload` 编码后的 JSON（设备指纹、网络/行为信号、探针绑定等）；
+// DeviceKey、Keychain 盐等密钥材料不进入该结构。明文 payload 仅用于调试，生产必须走加密+安全信封。
+
 import CryptoKit
 import Foundation
 
+/// 一次评估的原始上下文：设备指纹、网络/行为信号与越狱检测结果。
 public struct RiskContext: Sendable {
     var device: DeviceFingerprint
     var deviceID: String
@@ -9,6 +14,7 @@ public struct RiskContext: Sendable {
     var jailbreak: DetectionResult
 }
 
+/// 评分引擎输出：分数、信号、压缩摘要与处置动作。
 public struct RiskScoreReport: Sendable {
     public var score: Double
     public var isHighRisk: Bool
@@ -26,15 +32,17 @@ public struct RiskScoreReport: Sendable {
     public var decisionMetadata: [String: String]? = nil
 }
 
+/// Objective-C 桥接用信号；用于把 Swift `RiskSignal` 暴露给 ObjC 调用方。
 @objc(CPR_RiskSignal)
 public final class CPRiskSignal: NSObject {
     @objc public let id: String
     @objc public let category: String
     @objc public let score: Double
     @objc public let evidenceJSON: String
-    /// Stable string representation of signal state for digest computation.
+    /// 信号状态的稳定字符串表示，供摘要计算使用（避免浮点抖动）。
     public let stateDescription: String
 
+    /// 从 Swift 信号构造；证据 JSON 编码失败时回退为 `{}`，不阻断报告生成。
     init(_ signal: RiskSignal) {
         self.id = signal.id
         self.category = signal.category
@@ -48,15 +56,17 @@ public final class CPRiskSignal: NSObject {
         }
     }
 
+    /// 返回状态的稳定离散标签，确保同一状态跨调用生成相同摘要。
     private static func stableStateString(_ state: RiskSignalState?) -> String {
         SignalDigest.stableStateTag(state)
     }
 }
 
+/// 面向 SDK 使用方的风险报告对象；内部持有可序列化的 `Payload`。
 @objc(CPR_RiskReport)
 public final class CPRiskReport: NSObject {
     @objc public let deviceID: String
-    /// 设备指纹（用于 TrustChainManager.evaluateTrustLevel 等）
+    /// 设备指纹（用于 TrustChainManager.evaluateTrustLevel 等）。
     public var device: DeviceFingerprint { payload.device }
     @objc public let reportID: String
     @objc public let score: Double
@@ -72,6 +82,7 @@ public final class CPRiskReport: NSObject {
 
     private var payload: Payload
 
+    /// 从评估上下文与评分结果构造报告；tampered 由篡改状态信号数量决定。
     init(context: RiskContext, report: RiskScoreReport) {
         let builtPayload = Payload(context: context, report: report)
         self.deviceID = context.deviceID
@@ -87,6 +98,7 @@ public final class CPRiskReport: NSObject {
         self.payload = builtPayload
     }
 
+    /// 设置图算法绑定字段（账户/会话/场景）；这些字段随后续 payload 上报。
     func setGraphBindings(accountId: String?, sessionId: String?, sceneTag: String?) {
         self.accountId = accountId
         self.sessionId = sessionId
@@ -95,7 +107,7 @@ public final class CPRiskReport: NSObject {
         payload.sceneTag = sceneTag
     }
 
-    /// 用于上报的 JSON（未加密）。
+    /// 用于上报的 JSON（未加密）。编码失败返回空 Data，调用方应改用 `securePayload()`。
     @objc public func unencryptedPayloadData(prettyPrinted: Bool = false) -> Data {
         do {
             return try JSON.encode(payload, prettyPrinted: prettyPrinted)
@@ -105,9 +117,8 @@ public final class CPRiskReport: NSObject {
         }
     }
 
-    /// Serialize the secure-upload view without mutating the reusable report.
-    /// Configuration controls the model field before CodingKeys encode it as
-    /// `cb`; callers never need to know or duplicate that wire key.
+    /// 序列化“安全上传视图”，不修改可复用的报告对象。
+    /// `includeChallengeBinding` 控制是否携带 `cb` 挑战绑定字段；调用方无需感知 wire 键。
     internal func secureUploadPayloadData(includeChallengeBinding: Bool) throws -> Data {
         var uploadPayload = payload
         if !includeChallengeBinding {
@@ -116,10 +127,12 @@ public final class CPRiskReport: NSObject {
         return try JSON.encode(uploadPayload, prettyPrinted: false)
     }
 
+    /// 未加密 JSON 字符串；编码失败回退为 `{}`。
     @objc public func unencryptedPayloadString(prettyPrinted: Bool = false) -> String {
         String(data: unencryptedPayloadData(prettyPrinted: prettyPrinted), encoding: .utf8) ?? "{}"
     }
 
+    /// 已废弃：返回明文数据，仅供调试；Release 下会触发断言提醒改用 `securePayload()`。
     @available(*, deprecated, message: "Use securePayload() for production. jsonData() returns unencrypted data suitable only for debugging.")
     @objc public func jsonData(prettyPrinted: Bool = false) -> Data {
         #if DEBUG
@@ -130,11 +143,12 @@ public final class CPRiskReport: NSObject {
         return unencryptedPayloadData(prettyPrinted: prettyPrinted)
     }
 
+    /// 明文 JSON 字符串（同 `jsonData`，仅调试用）。
     @objc public func jsonString(prettyPrinted: Bool = false) -> String {
         unencryptedPayloadString(prettyPrinted: prettyPrinted)
     }
 
-    /// AES-GCM 加密后的 payload（生产环境推荐）。
+    /// AES-GCM 加密后的 payload（生产环境推荐）；密钥由 Keychain 管理，不随数据输出。
     @objc public func securePayload() throws -> Data {
         let plaintext = try JSON.encode(payload, prettyPrinted: false)
         return try PayloadCrypto.encrypt(plaintext)
@@ -191,26 +205,31 @@ public final class CPRiskReport: NSObject {
         payload.server = signals
     }
 
+    /// 写入端侧本地信号（时间模式/云手机本地证据），随后续 payload 上报。
     func setLocalSignals(_ signals: LocalSignals?) {
         payload.local = signals
     }
 
+    /// 写入挑战绑定信息；用于服务端校验探针结果与本次挑战的关联。
     func setChallengeBinding(_ challengeBinding: ChallengeBindingPayload?) {
         payload.challengeBinding = challengeBinding
     }
 
+    /// 写入图节点描述符（用于服务端图聚合）。
     func setGraphNodeDescriptor(_ descriptor: GraphNodeDescriptor?) {
         payload.graphNode = descriptor
     }
 
+    /// 返回当前挑战绑定信息（若有）。
     public func challengeBinding() -> ChallengeBindingPayload? {
         payload.challengeBinding
     }
 
-    /// Server-facing scene bound into the report payload. Empty means the caller did not set one.
+    /// 上报给服务端的场景绑定；空表示调用方未设置。
     public var sceneTag: String? { payload.sceneTag }
 }
 
+/// 上报正文模型：字段以短键编码，减少体积；仅该结构会被序列化/加密后离开设备。
 private struct Payload: Codable {
     var sdkVersion: String
     var reportId: String
@@ -233,13 +252,17 @@ private struct Payload: Codable {
     var compressedDigestHex: String?
     var signalMappingVersion: String?
 
+    // 信号摘要及其版本，供服务端校验信号集合未被篡改。
     var signalsDigest: String?
     var signalsDigestVersion: String?
 
+    // 服务端聚合字段（端侧注入值不被服务端采信，见 `ServerSignals` 注释）。
     var server: ServerSignals?
 
+    // 端侧本地证据：不依赖服务端聚合，随报告一起上报供复核。
     var local: LocalSignals?
 
+    // 挑战/探针绑定：证明本次信号来自服务端指定的探针集。
     var challengeBinding: ChallengeBindingPayload?
 
     var gpuName: String?
@@ -254,9 +277,9 @@ private struct Payload: Codable {
     /// 应用安装时间戳（Unix 秒，CR-006）
     var installDate: Double?
 
-    /// Battery level (0.0 to 1.0). Nil if monitoring is disabled or unavailable (CR-004).
+    /// 电池电量（0.0–1.0）；监控关闭或不可用时为 nil（CR-004）。
     var batteryLevel: Double?
-    /// Battery state: "charging" / "unplugged" / "full" / "unknown". Nil if monitoring is disabled or unavailable (CR-004).
+    /// 电池状态："charging" / "unplugged" / "full" / "unknown"；不可用时为 nil（CR-004）。
     var batteryState: String?
 
     var accountId: String?
@@ -271,6 +294,7 @@ private struct Payload: Codable {
 
     var textSegmentIntegrity: TextSegmentIntegrityPayload?
 
+    // 短键映射：键名属于上报协议，改动会破坏服务端解析与既有签名语义。
     private enum CodingKeys: String, CodingKey {
         case sdkVersion = "sv"
         case reportId = "ri"
@@ -317,6 +341,7 @@ private struct Payload: Codable {
         case textSegmentIntegrity = "ti"
     }
 
+    /// 从上下文与评分结果组装上报正文；缺失的可选信号保持 nil，不伪造默认值。
     init(context: RiskContext, report: RiskScoreReport) {
         self.sdkVersion = Version.current
         self.reportId = UUID().uuidString
@@ -366,6 +391,7 @@ private struct Payload: Codable {
         self.textSegmentIntegrity = Self.buildTextSegmentIntegrityPayload()
     }
 
+    /// 从信号证据中提取 libc 直连系统调用回退遥测；没有该信号或缺少 mask 时返回 nil。
     private static func extractLibcFallbackTelemetry(
         from signals: [RiskSignal]
     ) -> (maskHex: String, eventTotal: UInt32?, watchdogSupported: Bool?)? {
@@ -383,6 +409,7 @@ private struct Payload: Codable {
         return (maskHex: maskHex, eventTotal: eventTotal, watchdogSupported: watchdogSupported)
     }
 
+    /// 解析内核版本：优先设备指纹，其次云手机信号中的 kernel_build，最后从 kernel 串提取。
     private static func resolveKernelBuild(context: RiskContext, signals: [RiskSignal]) -> String? {
         if let kernelBuild = context.device.kernelBuild, !kernelBuild.isEmpty {
             return kernelBuild
@@ -402,6 +429,7 @@ private struct Payload: Codable {
         )
     }
 
+    /// 采集 `__TEXT.__text` 完整性信息；当前哈希为空（检测不可用）时不产生上报节点。
     private static func buildTextSegmentIntegrityPayload() -> TextSegmentIntegrityPayload? {
         let result = TextSegmentIntegrityChecker.verify()
         guard !result.currentHash.isEmpty else { return nil }
@@ -415,6 +443,7 @@ private struct Payload: Codable {
         )
     }
 
+    /// 把触摸/运动特征归一化为固定长度向量；无采样时返回 nil，避免上报全零假数据。
     private static func computeBehaviorVector(from behavior: BehaviorSignals) -> [Double]? {
         guard behavior.touch.sampleCount > 0 || behavior.motion.sampleCount > 0 else { return nil }
         return [
@@ -477,6 +506,7 @@ public enum ChallengeExecutionStatus: String, Codable, Sendable {
     case unsupported
 }
 
+/// 挑战/探针绑定载荷：证明本次信号来自服务端下发的挑战与探针集合。
 public struct ChallengeBindingPayload: Codable, Sendable {
     public var challengeId: String
     public var seed: String
@@ -581,6 +611,7 @@ public struct ChallengeBindingPayload: Codable, Sendable {
     }
 }
 
+/// 端侧本地信号容器：时间模式与云手机本地证据，随报告上报供服务端复核。
 public struct LocalSignals: Codable, Sendable {
     public var timePattern: TimePattern?
     public var cloudPhone: CloudPhoneLocalSignals?
@@ -670,6 +701,7 @@ public struct ServerSignals: Codable, Sendable {
     }
 }
 
+/// 越狱检测结果的精简上报视图。
 private struct DetectionResultPayload: Codable {
     var isJailbroken: Bool
     var confidence: Double
@@ -691,20 +723,19 @@ private struct DetectionResultPayload: Codable {
     }
 }
 
+/// 上报正文中的 SDK 版本；修改版本号属于协议变更，需同步服务端兼容矩阵。
 enum Version {
     static let current = "9.0.0"
 }
 
-// MARK: - Signal Digest
+// MARK: - 信号摘要
 
-/// Shared signal digest computation used by SignedRiskConclusion, Payload, and signal continuity checks.
+/// 信号摘要计算，供 SignedRiskConclusion、Payload 与信号连续性检查共用。
 ///
-/// Score and confidence are quantized to discrete buckets so that minor floating-point
-/// jitter between successive evaluations does not change the digest. This prevents
-/// false-positive HMAC mismatches on legitimate devices while still detecting
-/// meaningful manipulation (e.g., an attacker zeroing out a score).
+/// 分数与置信度会被量化到离散桶，避免连续评估间的浮点抖动改变摘要——
+/// 既防止合法设备产生误报的 HMAC 不匹配，又能发现有意义的人为篡改（例如把分数清零）。
 enum SignalDigest {
-    /// Full digest: SHA-256 of sorted "id:scoreBucket:stateTag" entries.
+    /// 完整摘要：排序后的 `"id:scoreBucket:stateTag"` 条目做 SHA-256。
     static func computeFullDigest(_ signals: [RiskSignal]) -> String {
         let entries = signals.map { signal in
             "\(signal.id):\(scoreBucket(signal.score)):\(stableStateTag(signal.state))"
@@ -714,7 +745,7 @@ enum SignalDigest {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Full digest from CPRiskSignal array.
+    /// 基于 `CPRiskSignal` 数组计算完整摘要（ObjC 桥接对象）。
     static func computeFullDigest(_ signals: [CPRiskSignal]) -> String {
         let entries = signals.map { signal in
             "\(signal.id):\(scoreBucket(signal.score)):\(signal.stateDescription)"
@@ -724,8 +755,8 @@ enum SignalDigest {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Quantize score into coarse 10-point buckets so small fluctuations don't flip the digest.
-    /// 0 → "0", 7 → "0", 15 → "10", 25 → "20", 100 → "100".
+    /// 把分数量化到 10 分一档，避免小幅波动翻转摘要。
+    /// 0 → "0"，7 → "0"，15 → "10"，25 → "20"，100 → "100"。
     static func scoreBucket(_ score: Double) -> String {
         let clamped = max(0, min(score, 100))
         if clamped < 1 { return "0" }
@@ -733,8 +764,7 @@ enum SignalDigest {
         return "\(bucket)"
     }
 
-    /// Stable discrete tag for signal state. Confidence is quantized to integer percentage
-    /// via floor (e.g. 0.7444 and 0.7449 both become "74"), eliminating ±0.0001 jitter.
+    /// 状态的稳定离散标签。置信度向下取整到整数百分比（如 0.7444/0.7449 均为 "74"），消除抖动。
     static func stableStateTag(_ state: RiskSignalState?) -> String {
         guard let state else { return "none" }
         switch state {
@@ -752,6 +782,7 @@ enum SignalDigest {
         }
     }
 
+    /// 与 `stableStateTag` 等价的字符串入口，供 ObjC 桥接对象复用。
     static func stableStateString(_ state: RiskSignalState?) -> String {
         stableStateTag(state)
     }

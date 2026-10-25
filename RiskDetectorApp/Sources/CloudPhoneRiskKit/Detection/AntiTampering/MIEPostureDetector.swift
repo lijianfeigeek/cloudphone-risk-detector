@@ -1,3 +1,8 @@
+// MTE/MIE 内存标记姿态检测：读取 sysctl hw.optional.arm.FEAT_MTE* 系列能力位，并结合 CRiskCore
+// 的原生 canary/自检快照，输出四档姿态（none / pacOnly / miePartial / mieFull）。
+// 基线信号 miePosture 固定 0 分，只作为证据上报；仅当能力位与硬件代际矛盾、进程内 MTE 自检失败
+// 或 canary 被破坏时才产生软/篡改信号。缺失、不可读或全零的能力位一律保守解释为“不具备”。
+
 import CRiskCore
 import Foundation
 
@@ -9,6 +14,7 @@ import Foundation
 /// - 文档口径按“A17/A17 Pro 及后续较新产品线可能具备，最终以系统实际导出能力为准”表述。
 struct MIEPostureDetector: Detector, Sendable {
 
+    /// 四档内存标记姿态，字符串值直接进入证据，便于跨版本统计。
     enum Level: String, Sendable, CaseIterable {
         case none
         case pacOnly
@@ -16,6 +22,7 @@ struct MIEPostureDetector: Detector, Sendable {
         case mieFull
     }
 
+    /// 一次评估的完整快照：能力位、硬件代际、原生 canary 状态与降级原因。
     struct Assessment: Sendable {
         let level: Level
         let machine: String
@@ -35,6 +42,8 @@ struct MIEPostureDetector: Detector, Sendable {
         let downgradeReason: String?
     }
 
+    /// 执行一次评估并把姿态摘要写入 methods。
+    /// - 分值取 `asSignals()` 中所有信号的最高分，避免同一事实重复计分。
     func detect() throws -> DetectorResult {
         let assessment = Self.evaluate()
         let methods = [
@@ -47,6 +56,13 @@ struct MIEPostureDetector: Detector, Sendable {
         return DetectorResult(score: score, methods: methods)
     }
 
+    /// 读取能力位与本地快照并判定姿态等级。
+    ///
+    /// - 模拟器或非 arm64 架构：返回全空 + 降级原因，不读取任何能力位。
+    /// - 低于 PAC 代表世代（A12）：姿态直接为 none。
+    /// - MTE 能力位全部不可读：降级为 pacOnly 并记录 `mte_sysctl_unreadable`。
+    /// - MTE3/MTE4 任一为真：mieFull；仅 MTE/MTE2 为真：miePartial。
+    /// - 全部可读但全为 0：仍判 pacOnly，并区分“确实全零”与“部分缺失”两种降级原因。
     static func evaluate() -> Assessment {
 #if targetEnvironment(simulator)
         return Assessment(
@@ -93,6 +109,7 @@ struct MIEPostureDetector: Detector, Sendable {
         let pAuth = Sysctl.int("hw.optional.arm.FEAT_PAuth")
         let arm64e = Sysctl.int("hw.optional.arm64e")
 
+        // 不同 iOS/芯片导出的 MTE 能力位不同，逐个读取；读不到保留 nil，不做“缺失即支持”的推断。
         let mte = Sysctl.int("hw.optional.arm.FEAT_MTE")
         let mte2 = Sysctl.int("hw.optional.arm.FEAT_MTE2")
         let mte3 = Sysctl.int("hw.optional.arm.FEAT_MTE3")
@@ -101,6 +118,7 @@ struct MIEPostureDetector: Detector, Sendable {
         let mteStoreOnly = Sysctl.int("hw.optional.arm.FEAT_MTE_STORE_ONLY")
 
         var nativeSnapshot = cprisk_mte_guard_snapshot_t()
+        // 返回 0 表示原生层成功填充快照；失败时全部字段按未安装/无异常处理。
         let hasNativeSnapshot = cprisk_mte_guard_snapshot(&nativeSnapshot) == 0
 
         let level: Level
@@ -110,6 +128,7 @@ struct MIEPostureDetector: Detector, Sendable {
             level = .none
             downgrade = "below_pac_representative_generation"
         } else if mte3 == nil && mte4 == nil && mte == nil && mte2 == nil {
+            // 四个核心位都读不到：无法判断是否支持 MTE，保守降级为仅 PAC。
             level = .pacOnly
             downgrade = "mte_sysctl_unreadable"
         } else {
@@ -122,6 +141,7 @@ struct MIEPostureDetector: Detector, Sendable {
                 level = .miePartial
             } else {
                 level = .pacOnly
+                // 区分“能力位齐全但全零”（硬件确实不支持）与“部分位缺失”（系统裁剪）。
                 downgrade = [mte, mte2, mte3, mte4].allSatisfy({ $0 != nil })
                     ? "mte_family_sysctl_all_zero"
                     : "partial_mte_sysctl_missing"
@@ -149,6 +169,11 @@ struct MIEPostureDetector: Detector, Sendable {
 #endif
     }
 
+    /// 生成信号：
+    /// - `miePosture`：基线证据，固定 0 分、hard(detected: false)，不参与评分。
+    /// - `mteUnavailableOnCapable`：新硬件上能力位形态矛盾，22 分软信号。
+    /// - `mteInactiveForProcess`：硬件支持 MTE 但进程内自检失败（rc < 0），28 分软信号。
+    /// - `mteCanaryTampered`：原生 canary 违规计数 >0，48 分 tampered。
     func asSignals() -> [RiskSignal] {
         let a = Self.evaluate()
         var signals: [RiskSignal] = []
@@ -176,6 +201,7 @@ struct MIEPostureDetector: Detector, Sendable {
             baseEvidence["downgrade_reason"] = downgradeReason
         }
 
+        // 基线信号：分数为 0，仅把姿态与降级原因带给服务端做分布分析。
         signals.append(
             RiskSignal(
                 id: SignalID.miePosture,
@@ -203,6 +229,7 @@ struct MIEPostureDetector: Detector, Sendable {
         }
 
         if (a.level == .miePartial || a.level == .mieFull) && a.nativeSelfTestRC < 0 {
+            // 硬件声称支持 MTE，但进程内原生自检失败：可能是 MTE 被关闭或运行时被篡改。
             signals.append(
                 RiskSignal(
                     id: SignalID.mteInactiveForProcess,
@@ -221,6 +248,7 @@ struct MIEPostureDetector: Detector, Sendable {
         }
 
         if a.nativeCanaryViolationCount > 0 {
+            // canary 被越界写或篡改，直接指向内存破坏/注入，给篡改判定。
             signals.append(
                 RiskSignal(
                     id: SignalID.mteCanaryTampered,
@@ -241,6 +269,8 @@ struct MIEPostureDetector: Detector, Sendable {
         return signals
     }
 
+    /// 只在“PAC 能力 + 较新硬件”前提下检查能力位形态矛盾：
+    /// MTE 明确为 0，但 EMTE4 非零且 MTE2 为 0，这种“窄能力位”分布不符合正常硬件导出。
     private static func mteSysctlContradiction(assessment a: Assessment) -> [String: String]? {
         guard a.pacCapable, a.likelyNewHardware else { return nil }
         let mte = a.sysctlFeatMTE
@@ -258,6 +288,7 @@ struct MIEPostureDetector: Detector, Sendable {
         return nil
     }
 
+    /// 能力位缺失时输出 "unavailable"，与真实的 0 区分，避免误读为“不支持”。
     private static func intEvidence(_ value: Int?) -> String {
         if let value {
             return "\(value)"
@@ -265,6 +296,7 @@ struct MIEPostureDetector: Detector, Sendable {
         return "unavailable"
     }
 
+    /// 按 `hw.machine` 判断是否 A12 或更新：iPhone 11,x / iPad 8,x / iPod 9,x 起。
     private static func isA12OrLater(machine: String) -> Bool {
         guard let parsed = parseMachine(machine) else { return false }
         switch parsed.family {
@@ -279,6 +311,7 @@ struct MIEPostureDetector: Detector, Sendable {
         }
     }
 
+    /// 按 `hw.machine` 粗略判断是否 A17 或更新：iPhone 16,x / iPad 14,x 起；仅用于证据标注与矛盾检测。
     private static func isA17OrLater(machine: String) -> Bool {
         guard let parsed = parseMachine(machine) else { return false }
         switch parsed.family {
@@ -291,6 +324,7 @@ struct MIEPostureDetector: Detector, Sendable {
         }
     }
 
+    /// 解析 `hw.machine` 为家族名与主版本号；无法解析时返回 nil。
     private static func parseMachine(_ machine: String) -> (family: String, major: Int)? {
         let lower = machine.lowercased()
         let families = ["iphone", "ipad", "ipod"]

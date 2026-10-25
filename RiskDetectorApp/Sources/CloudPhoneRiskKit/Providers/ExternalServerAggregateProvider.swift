@@ -1,10 +1,13 @@
 import CryptoKit
 import Foundation
 
-/// Local injection point for future "server aggregation" signals (IP/ASN/datacenter/IP聚合度...).
-/// You can set these fields locally (even without a backend) and they'll be:
-/// - embedded into the JSON payload under `server`
-/// - optionally contribute to score via generated `RiskSignal`s
+// 服务端聚合信号 Provider。
+// 承载服务端/联调注入的 IP、ASN、机房、IP 聚合度与图风控特征，并将其转为 RiskSignal。
+// 端侧注入默认不可信：只有经 CPRisk-MAC 验签的 `setVerified` 数据才被采信；
+// 服务端必须以自己聚合的信息为准，端侧 `server` 字段仅用于回显/联调。
+
+/// 服务端聚合信号的本地注入点与验签入口。
+/// 线程安全：内部状态由 `UnfairLock` 保护；验签使用独立 generation 防止并发覆盖。
 final class ExternalServerAggregateProvider: RiskSignalProvider {
     static let shared = ExternalServerAggregateProvider()
     private init() {}
@@ -24,10 +27,11 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
     private var currentIsVerified: Bool = false
     private var graphFeatures: GraphFeatures?
     private var serverSignalKey: SymmetricKey?
-    /// Invalidates verification already in flight when the key or session changes.
+    // 密钥或会话变更时递增，使已经在途的验签结果失效，避免旧数据被回写。
     private var verificationGeneration: UInt64 = 0
     private var realtimeTelemetryFeedback: RealtimeTelemetryFeedback?
 
+    /// 图风控特征（社区、风险密度、硬件画像度数等），由服务端图计算返回。
     struct GraphFeatures {
         var communityId: String?
         var communityRiskDensity: Double?
@@ -37,6 +41,9 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         var riskTags: [String]?
     }
 
+    /// 实时遥测反馈：动态调整评估频率与权重倍率。
+    /// - `riskPressure` 0...1；`minEvaluationIntervalMillis` 0...60000；
+    /// - `*WeightScaleBps` 以万分比表示权重倍率，合法范围 1000...20000。
     struct RealtimeTelemetryFeedback: Sendable {
         var riskPressure: Double?
         var minEvaluationIntervalMillis: Int?
@@ -59,6 +66,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         }
     }
 
+    /// 清理后的实时自适应快照，供评估管线读取。
     struct RealtimeAdaptiveFeedbackSnapshot: Sendable {
         let riskPressure: Double?
         let minEvaluationIntervalMillis: Int?
@@ -67,6 +75,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         let source: String
     }
 
+    /// 从 riskTags 解析出的自适应提示；`hasAny` 表示至少有一项有效。
     private struct AdaptiveTagHints {
         var riskPressure: Double?
         var minEvaluationIntervalMillis: Int?
@@ -98,7 +107,8 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         lock.withLock { realtimeTelemetryFeedback = nil }
     }
 
-    /// Configure the CPRisk-MAC key used by `setVerified(_:signature:)`.
+    /// 配置 CPRisk-MAC 验签密钥。
+    /// - 空 Data 表示禁用验签；同时清空旧数据并递增 generation，使在途验签失效。
     func configureServerSignalKey(_ key: Data) {
         lock.withLock {
             verificationGeneration &+= 1
@@ -143,8 +153,9 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         #endif
     }
 
-    /// Accept server signals only after custom SHA-256 MAC verification.
-    /// `signature` = MAC(serverSignalKey, canonicalJSON(signals)).
+    /// 接受服务端信号，但必须先通过自定义 SHA-256 MAC 验签。
+    /// 签名算法：`signature = MAC(serverSignalKey, canonicalJSON(signals))`（键排序后的 JSON）。
+    /// - Returns: 验签并成功写入返回 true；无密钥、编码失败、MAC 不符或期间密钥变更返回 false。
     @discardableResult
     func setVerified(_ signals: ServerSignals, signature: Data) -> Bool {
         let (key, generation) = lock.withLock { (serverSignalKey, verificationGeneration) }
@@ -166,6 +177,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         }
 
         let accepted = lock.withLock { () -> Bool in
+            // 验签期间若密钥被替换或 clear() 递增了 generation，则丢弃本次结果，防止旧会话数据复活。
             guard verificationGeneration == generation, serverSignalKey != nil else { return false }
             current = signals
             currentIsVerified = true
@@ -179,6 +191,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return true
     }
 
+    /// 注入图风控特征（可由服务端图计算结果转换而来）。
     func setGraphFeatures(
         communityId: String?,
         communityRiskDensity: Double?,
@@ -276,6 +289,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         )
     }
 
+    /// 返回合并后的服务端信号，仅包含验签数据与图特征；二者都没有时返回 nil。
     func serverSignals(snapshot: RiskSnapshot) -> ServerSignals? {
         // 仅采信验签来源的 server 信号；未验签的端侧注入默认丢弃。
         // 即使验签通过，服务端也必须忽略端侧 `server` 字段、仅以服务端聚合为准。
@@ -298,6 +312,10 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return merged
     }
 
+    /// 把服务端/图特征转换为评分信号。
+    /// - IP/ASN/AS Org/riskTags 以 `.serverRequired` 上报，由服务端最终判定；
+    /// - 数据中心、IP 聚合度、图风险直接带分数，参与本地评分；
+    /// - 未验签的端侧注入不会产生任何信号。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         // 与 serverSignals() 一致：未验签的端侧 server 信号不产生评分信号。
         let (rawSignals, verified, gf) = lock.withLock { (current, currentIsVerified, graphFeatures) }
@@ -347,10 +365,12 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         }
 
         if s.isDatacenter == true {
+            // 机房 IP 是强代理特征，直接给 20 分。
             out.append(RiskSignal(id: SignalID.datacenterIP, category: SignalCategory.server, score: 20, evidence: ["is_datacenter": "true"]))
         }
 
         if let n = s.ipDeviceAgg {
+            // 同一 IP 关联设备数分档：200+ / 50+ / 20+ 分别计 25/15/8 分。
             let score: Double
             if n >= 200 { score = 25 }
             else if n >= 50 { score = 15 }
@@ -362,6 +382,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         }
 
         if let n = s.ipAccountAgg {
+            // 同一 IP 关联账号数分档：500+ / 100+ / 30+ 分别计 25/15/8 分。
             let score: Double
             if n >= 500 { score = 25 }
             else if n >= 100 { score = 15 }
@@ -387,6 +408,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         }
 
         if let gf {
+            // 社区风险密度 > 50 才计分，80 以上给 20 分。
             if let density = gf.communityRiskDensity, density > 50 {
                 let score: Double = density > 80 ? 20 : (density > 65 ? 12 : 5)
                 out.append(RiskSignal(
@@ -402,6 +424,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
                 ))
             }
 
+            // 硬件画像度数反映同型号/同配置设备聚集程度，10 以上开始计分。
             if let degree = gf.hwProfileDegree, degree >= 10 {
                 let score: Double = degree >= 100 ? 20 : (degree >= 50 ? 15 : 8)
                 out.append(RiskSignal(
@@ -429,6 +452,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return out
     }
 
+    /// 清洗注入的实时反馈：丢弃非有限值、越界值与未知分类键。
     private func sanitizedRealtimeTelemetryFeedback(_ feedback: RealtimeTelemetryFeedback?) -> RealtimeTelemetryFeedback? {
         guard var feedback else { return nil }
 
@@ -451,6 +475,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return feedback
     }
 
+    /// 反馈是否已过期；无过期时间视为永久有效。
     private func isExpired(_ feedback: RealtimeTelemetryFeedback, nowEpochSeconds: TimeInterval) -> Bool {
         guard let expiresAt = feedback.expiresAtEpochSeconds else {
             return false
@@ -458,6 +483,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return expiresAt < nowEpochSeconds
     }
 
+    /// 解析 `rt_pressure:`、`rt_eval_ms:`、`rt_weight_bps:` 等标签形式的自适应提示。
     private func parseAdaptiveTagHints(from tags: [String]) -> AdaptiveTagHints {
         guard !tags.isEmpty else { return AdaptiveTagHints() }
 
@@ -467,6 +493,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
             if tag.isEmpty { continue }
 
             if let value = parseDoubleTag(tag, prefix: "rt_pressure:") {
+                // 允许 0...1 或 0...100 两种写法，大于 1 时按百分比归一化。
                 let normalized = value > 1.0 ? value / 100.0 : value
                 hints.riskPressure = sanitizedPressure(normalized)
                 continue
@@ -505,21 +532,25 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         return Int(raw)
     }
 
+    /// 把压力值限制在 0...1；NaN/Infinity 返回 nil。
     private func sanitizedPressure(_ value: Double?) -> Double? {
         guard let value, value.isFinite else { return nil }
         return min(max(value, 0), 1)
     }
 
+    /// 把评估间隔限制在 0...60000ms，防止服务端下发异常值拖垮调度。
     private func sanitizedInterval(_ value: Int?) -> Int? {
         guard let value else { return nil }
         return min(max(value, 0), 60_000)
     }
 
+    /// 把权重倍率（万分比）限制在 10%...200%（1000...20000 bps）。
     private func sanitizedWeightBps(_ value: Int?) -> Int? {
         guard let value else { return nil }
         return min(max(value, 1_000), 20_000)
     }
 
+    /// 允许动态调权的分类白名单，避免服务端下发未知键污染评分。
     private static let supportedWeightKeys: Set<String> = [
         "jailbreak",
         "network",
@@ -528,6 +559,7 @@ final class ExternalServerAggregateProvider: RiskSignalProvider {
         "time",
     ]
 
+    /// 规范化分类键：去空白、转小写，非白名单返回 nil。
     private static func normalizedWeightKey(_ raw: String) -> String? {
         let normalized = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)

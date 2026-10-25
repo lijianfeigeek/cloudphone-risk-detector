@@ -2,25 +2,22 @@ import CRiskCore
 import Darwin
 import Foundation
 
-// MARK: - Unix Socket Sweep Detection
+// MARK: - Unix Socket 全量扫描
 //
-// Enumerates all Unix domain socket connections in the process and inspects
-// them for anomalies that may indicate Frida's IPC channels.
-//
-// This detector is DISABLED by default because it may produce false positives
-// on normal system activity. It must be explicitly enabled via remote config
-// (ServerRiskPolicy.enableUnixSocketSweep).
+// 枚举进程内全部 Unix 域套接字连接，检查抽象命名空间、/tmp 路径、Frida 特征串等
+// 异常 IPC 迹象，用于发现 Frida 及其注入器的通信通道。
+// 默认关闭：正常系统活动也可能命中，须由远程配置显式开启，否则返回禁用态。
 
-/// Maximum file descriptor range to scan for Unix domain sockets.
+/// 扫描文件描述符的上限；覆盖常规 App 的 fd 范围，同时限制扫描耗时。
 private let fdScanMax: Int32 = 1024
 
-/// Suspicious path prefixes for Unix domain socket detection.
+/// 可疑的 Unix socket 路径前缀（世界可写的临时目录）。
 private let suspiciousPathPrefixes: [String] = [
     "/tmp/",
     "/var/tmp/",
 ]
 
-/// Marker patterns often associated with Frida's Unix domain sockets.
+/// Frida 及其相关组件常见的 Unix socket 路径/名称特征。
 private let fridaPathMarkers: [String] = [
     "frida",
     "linjector",
@@ -30,7 +27,7 @@ private let fridaPathMarkers: [String] = [
     "pool-frida",
 ]
 
-/// Represents a single Unix domain socket observation.
+/// 单个 Unix 域套接字的观测记录。
 private struct SocketObservation {
     let fd: Int32
     let localPath: String
@@ -40,17 +37,15 @@ private struct SocketObservation {
     let reason: String
 }
 
-/// Unix domain socket full-sweep detector (disabled by default).
+/// Unix 域套接字全量扫描检测器（默认关闭）。
 ///
-/// Enumerates all Unix domain socket connections, detecting anomalous IPC
-/// channels that may indicate Frida or other instrumentation frameworks.
+/// 枚举所有 Unix 域套接字连接，发现可能指向 Frida 或其他插桩框架的异常 IPC 通道。
 ///
-/// Note: This detector is disabled by default because socket enumeration
-/// can produce false positives on normal system activity. Enable via
-/// `ServerRiskPolicy.enableUnixSocketSweep` from remote configuration.
+/// 注意：套接字枚举在正常系统活动上也可能产生误报，因此默认关闭；
+/// 需通过远程配置 `ServerRiskPolicy.enableUnixSocketSweep` 显式开启。
 struct UnixSocketSweepDetector: Detector {
 
-    /// Whether this detector is enabled (reads from remote configuration).
+    /// 是否启用（从远程配置读取，默认关闭）。
     private static var enabled: Bool {
         PolicyManager.shared.activePolicy?.enableUnixSocketSweep ?? false
     }
@@ -58,15 +53,17 @@ struct UnixSocketSweepDetector: Detector {
     @inline(never)
     func detect() throws -> DetectorResult {
 #if targetEnvironment(simulator)
+        // 模拟器 fd 环境与真机不同，直接降级。
         return DetectorResult(score: 0, methods: ["unix_socket_sweep:unavailable_simulator"])
 #else
         return detectKernel()
 #endif
     }
 
-    /// Keep the VMP-targeted `detect()` entry narrow and stable in optimized builds.
+    /// 保持面向 VMP 的 `detect()` 入口在优化构建中窄而稳定，实际逻辑集中于此。
     @inline(never)
     private func detectKernel() -> DetectorResult {
+        // 总开关关闭时不扫描，返回明确的 disabled 标记供 asSignals 丢弃。
         guard Self.enabled else {
             return DetectorResult(score: 0, methods: ["unix_socket_sweep:disabled"])
         }
@@ -76,7 +73,7 @@ struct UnixSocketSweepDetector: Detector {
 
         let observations = sweepUnixSockets()
 
-        // Classify observations
+        // 按可疑类型分类统计
         var abstractCount = 0
         var tmpCount = 0
         var fridaMarkerCount = 0
@@ -100,23 +97,23 @@ struct UnixSocketSweepDetector: Detector {
             methods.append("unix_socket_sweep:fd=\(obs.fd):\(obs.reason):\(obs.localPath)")
         }
 
-        // Scoring
-        // Abstract namespace sockets are extremely rare on iOS
+        // 计分：抽象命名空间在 iOS 上极罕见，单价 10 分；/tmp 路径 8 分；
+        // Frida 特征串最直接，单价 15 分；可疑 socket 数量多时追加组合分。
         if abstractCount >= 1 {
             score += 10.0 * Double(abstractCount)
         }
 
-        // Sockets in /tmp or /var/tmp
+        // /tmp 或 /var/tmp 下的 socket
         if tmpCount >= 1 {
             score += 8.0 * Double(tmpCount)
         }
 
-        // Direct Frida path marker hits
+        // 直接命中 Frida 路径特征
         if fridaMarkerCount >= 1 {
             score += 15.0 * Double(fridaMarkerCount)
         }
 
-        // Multiple suspicious sockets — compound bonus
+        // 多个可疑 socket 同时出现——组合加分
         if totalSuspicious >= 3 {
             score += Double(totalSuspicious) * 3
         }
@@ -124,10 +121,11 @@ struct UnixSocketSweepDetector: Detector {
         return DetectorResult(score: min(score, 80), methods: methods)
     }
 
-    // MARK: - Socket Sweep
+    // MARK: - Socket 扫描
 
-    /// Enumerates file descriptors looking for Unix domain sockets and
-    /// collects their local/peer address information.
+    /// 遍历文件描述符，收集所有 Unix 域套接字的本地/对端地址信息。
+    /// - 扫描范围：fd 3..<1024（0–2 为标准流）；
+    /// - 单项探测失败（非 Unix socket、已关闭 fd）直接跳过，不影响整体扫描。
     private func sweepUnixSockets() -> [SocketObservation] {
         var observations: [SocketObservation] = []
 
@@ -138,9 +136,10 @@ struct UnixSocketSweepDetector: Detector {
             let peerInfo = getSocketPath(fd: fd, getPeer: true)
             let peerPath = peerInfo.path ?? ""
 
+            // 抽象命名空间：sun_path 为空或以 NUL 开头（无文件系统路径）。
             let isAbstract = localPath.isEmpty || localPath.utf8.first == 0
 
-            // Check for suspicious patterns
+            // 检查可疑模式
             var isSuspicious = false
             var reason = ""
 
@@ -162,7 +161,7 @@ struct UnixSocketSweepDetector: Detector {
                 reason = reason.isEmpty ? "frida_marker" : reason + "+frida_marker"
             }
 
-            // Check for socket in unexpected locations (not /var/run, /tmp, or system paths)
+            // 非预期位置：不在白名单前缀下且为相对路径的 socket 属异常。
             if !localPath.isEmpty && !isAbstract {
                 let isExpectedPrefix = localPath.hasPrefix("/var/run/") ||
                     localPath.hasPrefix("/var/tmp/") ||
@@ -171,7 +170,7 @@ struct UnixSocketSweepDetector: Detector {
                     localPath.hasPrefix("/usr/") ||
                     localPath.hasPrefix("/etc/")
                 if !isExpectedPrefix && !localPath.hasPrefix("/") {
-                    // Relative path socket — unusual
+                    // 相对路径 socket——不常见
                     isSuspicious = true
                     reason = reason.isEmpty ? "relative_path" : reason + "+relative_path"
                 }
@@ -190,10 +189,13 @@ struct UnixSocketSweepDetector: Detector {
         return observations
     }
 
-    // MARK: - Socket Address Query
+    // MARK: - Socket 地址查询
 
-    /// Gets the path associated with a Unix domain socket file descriptor.
-    /// Uses getsockname for local address or getpeername for peer address.
+    /// 获取 Unix 域套接字 fd 对应的路径。
+    /// - Parameters:
+    ///   - fd: 目标文件描述符。
+    ///   - getPeer: true 用 getpeername 查对端，false 用 getsockname 查本地。
+    /// - Returns: `(路径, 是否 AF_UNIX)`；非 Unix socket 或调用失败时路径为 nil。
     private func getSocketPath(fd: Int32, getPeer: Bool) -> (path: String?, isUnix: Bool) {
         var addr = sockaddr_un()
         var len = socklen_t(MemoryLayout<sockaddr_un>.size)
@@ -213,18 +215,19 @@ struct UnixSocketSweepDetector: Detector {
             }
         }
 
+        // 调用失败或不是 AF_UNIX 都视为非目标 fd，交由调用方跳过。
         guard result == 0, addr.sun_family == sa_family_t(AF_UNIX) else {
             return (nil, false)
         }
 
-        // Extract path from sockaddr_un
+        // 从 sockaddr_un 提取路径
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
         let path = withUnsafePointer(to: &addr.sun_path) { ptr in
             let cptr = UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self)
             let strLen = strnlen(cptr, maxLen)
             if strLen == 0 {
-                // Could be an abstract namespace socket (sun_path[0] == '\0')
-                // Try to read the abstract name after the leading NUL
+                // 可能是抽象命名空间 socket（sun_path[0] == '\0'）；
+                // 首字节为 NUL 时，真正的名称从第 2 字节开始。
                 if maxLen > 1 && cptr[1] != 0 {
                     let abstractLen = strnlen(cptr + 1, maxLen - 1)
                     return "@" + String(data: Data(bytes: cptr + 1, count: abstractLen), encoding: .utf8)!
@@ -238,13 +241,16 @@ struct UnixSocketSweepDetector: Detector {
     }
 }
 
-// MARK: - Signal Conversion
+// MARK: - 信号转换
 
 extension UnixSocketSweepDetector {
+    /// 将扫描结果转换为 `unix_socket_anomaly` 软信号。
+    /// - 禁用态不产生任何信号（避免默认配置下引入噪声）；
+    /// - score 二次封顶 40、置信度按 score/60 折算，layer 2、weightHint 45。
     func asSignals() throws -> [RiskSignal] {
         let result = try detect()
 
-        // If disabled, emit no signals
+        // 禁用时不上报任何信号
         if result.methods.contains("unix_socket_sweep:disabled") {
             return []
         }

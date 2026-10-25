@@ -1,15 +1,24 @@
+// AppSigningIdentityDetector：校验 App 签名身份的一致性，覆盖 IPA 重签/重打包。
+// 检查 bundle id（运行时 vs Info.plist vs entitlement）、application-identifier、
+// team id、get-task-allow，并与首次运行保存的加密基线比对。
+// 强不一致会毒化 code signing lane；弱异常以 soft 信号上报。
 import CRiskCore
 import CryptoKit
 import Foundation
 import Security
 
+/// 签名身份检测器。
+/// - 线程模型：`inspect()` 同步读取 Bundle 与基线；基线读写在 UnfairLock 下串行化。
+/// - 安全不变量：基线必须加密存储；发现强篡改时毒化 code signing lane。
 struct AppSigningIdentityDetector: Detector {
+    /// Bundle 容器类型：app / appex / 其他（如测试宿主）。
     enum BundleContainer: String, Sendable, Codable {
         case app
         case appExtension = "appex"
         case other
     }
 
+    /// 一次身份采集的快照：entitlement、bundle id、get-task-allow 与容器类型。
     struct IdentitySnapshot: Sendable, Codable, Equatable {
         let teamIdentifierEntitlement: String?
         let applicationIdentifier: String?
@@ -18,19 +27,23 @@ struct AppSigningIdentityDetector: Detector {
         let getTaskAllow: Bool?
         let bundleContainer: BundleContainer
 
+        /// 从 application-identifier 前缀推导 team id（iOS 上 entitlement 不可读时的回退）。
         var derivedTeamIdentifier: String? {
             AppSigningIdentityDetector.teamPrefix(from: applicationIdentifier)
         }
 
+        /// 有效 team id：优先 entitlement，缺失时使用推导值。
         var effectiveTeamIdentifier: String? {
             AppSigningIdentityDetector.normalized(teamIdentifierEntitlement) ?? derivedTeamIdentifier
         }
 
+        /// 有效 bundle id：优先运行时 Bundle，缺失时回退 Info.plist。
         var effectiveBundleIdentifier: String? {
             AppSigningIdentityDetector.normalized(bundleIdentifier)
                 ?? AppSigningIdentityDetector.normalized(infoPlistBundleIdentifier)
         }
 
+        /// 描述本次快照覆盖了哪些身份材料，用于遥测与基线资格判断。
         var materialCoverage: String {
             var components: [String] = []
             if AppSigningIdentityDetector.normalized(teamIdentifierEntitlement) != nil {
@@ -51,21 +64,25 @@ struct AppSigningIdentityDetector: Detector {
             return components.joined(separator: ",")
         }
 
+        /// 身份材料指纹（SHA256），用于检测同一设备上的静默身份变化。
         var bindingFingerprint: String {
             AppSigningIdentityDetector.bindingFingerprint(for: self)
         }
 
+        /// 只有 app/appex 才执行签名身份检查；其他容器直接放行。
         var isExecutableAppContainer: Bool {
             bundleContainer == .app || bundleContainer == .appExtension
         }
     }
 
+    /// 首次运行保存的签名基线三要素。
     struct IdentityBaseline: Codable, Equatable, Sendable {
         let teamIdentifier: String
         let applicationIdentifier: String
         let bundleIdentifier: String
     }
 
+    /// 单条检查发现：信号 id、方法名、分数、证据、状态与是否毒化。
     struct Finding: Sendable, Equatable {
         let signalID: String
         let method: String
@@ -76,27 +93,33 @@ struct AppSigningIdentityDetector: Detector {
         let poison: Bool
     }
 
+    /// 一次完整检查的结果集合。
     struct Inspection: Sendable {
         let snapshot: IdentitySnapshot
         let findings: [Finding]
         let baselineStored: Bool
 
+        /// 是否存在需要毒化 code signing lane 的强篡改发现。
         var shouldPoison: Bool {
             findings.contains(where: \.poison)
         }
 
+        /// 所有发现分数之和，封顶 100。
         var score: Double {
             min(findings.reduce(0) { $0 + $1.score }, 100)
         }
 
+        /// 所有发现的方法名，用于 DetectorResult。
         var methods: [String] {
             findings.map(\.method)
         }
 
+        /// 所有发现的信号 id，用于遥测 reason codes。
         var reasonCodes: [String] {
             findings.map(\.signalID)
         }
 
+        /// 状态码：强篡改 -> tampered；无发现 -> clean；否则 soft_anomaly。
         var statusCode: String {
             if shouldPoison {
                 return "tampered"
@@ -107,6 +130,7 @@ struct AppSigningIdentityDetector: Detector {
             return "soft_anomaly"
         }
 
+        /// 基线资格：三要素齐全才允许写入基线，避免把不完整身份固化。
         var baselineEligibility: String {
             if snapshot.effectiveBundleIdentifier == nil {
                 return "missing_bundle_identifier"
@@ -120,6 +144,7 @@ struct AppSigningIdentityDetector: Detector {
             return "eligible"
         }
 
+        /// 遥测字段：状态、指纹、覆盖材料、原因码与基线资格。
         var telemetry: [String: String] {
             var rows: [String: String] = [
                 "signing_identity_status": statusCode,
@@ -134,13 +159,16 @@ struct AppSigningIdentityDetector: Detector {
             return rows
         }
 
+        /// 转换为 Detector 协议结果。
         var detectorResult: DetectorResult {
             DetectorResult(score: score, methods: methods)
         }
 
+        /// 转换为 RiskSignal 列表：一条聚合信号 + 每条发现一条细分信号。
         var signals: [RiskSignal] {
             guard !findings.isEmpty else { return [] }
 
+            // 按毒化/非毒化分组，便于证据字段区分。
             let findingIDs = findings.map(\.signalID).sorted()
             let poisonFindingIDs = findings.filter(\.poison).map(\.signalID).sorted()
             let softFindingIDs = findings.filter { !$0.poison }.map(\.signalID).sorted()
@@ -177,6 +205,7 @@ struct AppSigningIdentityDetector: Detector {
                 aggregateEvidence["baseline_stored"] = "1"
             }
 
+            // 聚合信号：state 由是否存在毒化发现决定。
             var out = [
                 RiskSignal(
                     id: ObfuscatedConstants.signalAppSigningIdentityTampered,
@@ -189,6 +218,7 @@ struct AppSigningIdentityDetector: Detector {
                 ),
             ]
 
+            // 逐条发现单独成信号，保留各自分数与 weightHint。
             out.append(contentsOf: findings.map { finding in
                 RiskSignal(
                     id: finding.signalID,
@@ -205,21 +235,29 @@ struct AppSigningIdentityDetector: Detector {
         }
     }
 
+    // 签名基线不再明文存 UserDefaults：AES-GCM 加密文件（SecureFileStore）。
+    // 明文基线可被攻击者改写为当前（已篡改）身份，从而掩盖签名变化。
     /// 签名基线不再明文存 UserDefaults：AES-GCM 加密文件（SecureFileStore）。
     /// 遗留明文记录仅做一次性迁移读取，迁移后删除。明文基线可被攻击者
     /// 篡改为当前（已篡改）身份，从而掩盖签名身份变化。
+    // 加密文件中的基线 key。
     private static let baselineStorageKey = "app_signing_identity.baseline.v1"
+    // 遗留明文 UserDefaults key，仅用于一次性迁移读取。
     private static let legacyBaselineDefaultsKey = "com.cloudphone.riskkit.app_signing_identity.baseline.v1"
+    // 基线读写锁，保证迁移与保存不并发。
     private static let baselineLock = UnfairLock()
 
     init() {}
 
+    /// Detector 协议入口：执行检查并返回分数/方法。
     func detect() throws -> DetectorResult {
         inspect().detectorResult
     }
 
+    /// 检查并转换信号；存在毒化发现时同时毒化 code signing lane。
     func asSignals() throws -> [RiskSignal] {
         let inspection = inspect()
+        // 毒化后，后续依赖 code signing lane 的校验会按失败处理（fail-closed）。
         if inspection.shouldPoison {
             Logger.log(
                 "[AppSigningIdentityDetector] forcing integrity poison: " +
@@ -230,10 +268,12 @@ struct AppSigningIdentityDetector: Detector {
         return inspection.signals
     }
 
+    /// 返回遥测字段（不产生信号）。
     func telemetry() -> [String: String] {
         inspect().telemetry
     }
 
+    /// 真机采集当前快照并检查；模拟器返回空快照。
     func inspect() -> Inspection {
 #if targetEnvironment(simulator)
         return Inspection(
@@ -253,7 +293,9 @@ struct AppSigningIdentityDetector: Detector {
 #endif
     }
 
+    /// 对给定快照执行身份一致性检查，并维护基线。
     func inspect(snapshot: IdentitySnapshot, isDebugBuild: Bool) -> Inspection {
+        // 非 app/appex 容器不做签名检查。
         guard snapshot.isExecutableAppContainer else {
             return Inspection(snapshot: snapshot, findings: [], baselineStored: false)
         }
@@ -266,6 +308,7 @@ struct AppSigningIdentityDetector: Detector {
         let explicitTeamIdentifier = Self.normalized(snapshot.teamIdentifierEntitlement)
         let effectiveTeamIdentifier = snapshot.effectiveTeamIdentifier
 
+        // bundle id 双源均缺失：身份信息不完整。
         if bundleIdentifier == nil, infoBundleIdentifier == nil {
             findings.append(Finding(
                 signalID: "app_bundle_identifier_missing",
@@ -282,6 +325,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // application-identifier 不是 team.bundle 形式。
         if let applicationIdentifier,
            Self.teamPrefix(from: applicationIdentifier) == nil || Self.bundleSuffix(from: applicationIdentifier) == nil {
             findings.append(Finding(
@@ -297,6 +341,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // 运行时 Bundle id 与 Info.plist 不一致：常见于重打包。
         if let bundleIdentifier, let infoBundleIdentifier, bundleIdentifier != infoBundleIdentifier {
             findings.append(Finding(
                 signalID: "app_bundle_identifier_mismatch",
@@ -312,6 +357,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // application-identifier 中的 bundle 后缀与运行时不一致。
         if let applicationIdentifier {
             if let entitledBundleIdentifier = Self.bundleSuffix(from: applicationIdentifier),
                let runtimeBundleIdentifier = bundleIdentifier ?? infoBundleIdentifier,
@@ -331,6 +377,7 @@ struct AppSigningIdentityDetector: Detector {
                 ))
             }
 
+            // application-identifier 前缀与 entitlement 中的 team id 不一致。
             if let applicationTeamIdentifier = Self.teamPrefix(from: applicationIdentifier),
                let explicitTeamIdentifier,
                applicationTeamIdentifier != explicitTeamIdentifier {
@@ -347,6 +394,7 @@ struct AppSigningIdentityDetector: Detector {
                     poison: true
                 ))
             }
+        // Release 下缺失 application-identifier（iOS 正常签名应存在）。
         } else if Self.requiresApplicationIdentifierEntitlement && !isDebugBuild {
             findings.append(Finding(
                 signalID: "app_identifier_missing",
@@ -362,6 +410,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // team id 形态异常（Apple Team ID 应为 10 位大写字母/数字）。
         if let effectiveTeamIdentifier {
             if !Self.looksLikeAppleTeamIdentifier(effectiveTeamIdentifier) {
                 findings.append(Finding(
@@ -391,6 +440,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // Release 下 get-task-allow=true：调试权限未关闭，可被动态调试。
         if snapshot.getTaskAllow == true && !isDebugBuild {
             findings.append(Finding(
                 signalID: "app_get_task_allow_enabled",
@@ -406,6 +456,7 @@ struct AppSigningIdentityDetector: Detector {
             ))
         }
 
+        // 与首次运行基线比对；基线变化视为身份被替换。
         let baselineStored = reconcileBaseline(
             bundleIdentifier: bundleIdentifier ?? infoBundleIdentifier,
             applicationIdentifier: applicationIdentifier,
@@ -416,11 +467,13 @@ struct AppSigningIdentityDetector: Detector {
         return Inspection(snapshot: snapshot, findings: findings, baselineStored: baselineStored)
     }
 
+    /// 采集当前进程的签名身份快照。
     private func captureCurrentSnapshot() -> IdentitySnapshot {
         let bundle = Bundle.main
         let pathExtension = bundle.bundleURL.pathExtension.lowercased()
         let bundleContainer: BundleContainer
 
+        // 通过 bundle 扩展名判断容器类型。
         switch pathExtension {
         case "app":
             bundleContainer = .app
@@ -430,6 +483,7 @@ struct AppSigningIdentityDetector: Detector {
             bundleContainer = .other
         }
 
+        // macOS 使用 SecTask 读取 entitlement。
         #if os(macOS)
         let task = SecTaskCreateFromSelf(nil)
         return IdentitySnapshot(
@@ -441,6 +495,7 @@ struct AppSigningIdentityDetector: Detector {
             bundleContainer: bundleContainer
         )
         #else
+        // iOS 无 SecTask 公开 API，仅做 Bundle 一致性校验。
         // SecTask API 仅 macOS 可用，iOS 上仅做 bundle 一致性校验
         return IdentitySnapshot(
             teamIdentifierEntitlement: nil,
@@ -454,10 +509,12 @@ struct AppSigningIdentityDetector: Detector {
     }
 
     #if os(macOS)
+    /// 从 SecTask 读取字符串类型 entitlement，并做空白规范化。
     private func entitlementString(_ key: String, task: SecTask?) -> String? {
         Self.normalized(entitlementValue(for: key, task: task) as? String)
     }
 
+    /// 从 SecTask 读取布尔类型 entitlement，兼容 Bool/NSNumber。
     private func entitlementBool(_ key: String, task: SecTask?) -> Bool? {
         guard let value = entitlementValue(for: key, task: task) else {
             return nil
@@ -471,18 +528,21 @@ struct AppSigningIdentityDetector: Detector {
         return nil
     }
 
+    /// 读取任意 entitlement 原始值。
     private func entitlementValue(for key: String, task: SecTask?) -> Any? {
         guard let task else { return nil }
         return SecTaskCopyValueForEntitlement(task, key as CFString, nil)
     }
     #endif
 
+    /// 将当前身份与加密基线比对；必要时写入首份基线。
     private func reconcileBaseline(
         bundleIdentifier: String?,
         applicationIdentifier: String?,
         teamIdentifier: String?,
         findings: inout [Finding]
     ) -> Bool {
+        // 三要素不齐时不建立基线。
         guard let bundleIdentifier, let applicationIdentifier, let teamIdentifier else {
             return false
         }
@@ -493,6 +553,7 @@ struct AppSigningIdentityDetector: Detector {
             bundleIdentifier: bundleIdentifier
         )
 
+        // 已有基线且字段变化：强篡改，直接毒化。
         if let stored = loadBaseline() {
             let changedFields = changedFields(from: stored, to: current)
             guard !changedFields.isEmpty else {
@@ -519,6 +580,7 @@ struct AppSigningIdentityDetector: Detector {
             return false
         }
 
+        // 本次检查已有发现时不写基线，避免把异常身份固化。
         guard findings.isEmpty else {
             return false
         }
@@ -527,6 +589,7 @@ struct AppSigningIdentityDetector: Detector {
         return true
     }
 
+    /// 比较两份基线，返回发生变化的字段名。
     private func changedFields(from oldValue: IdentityBaseline, to newValue: IdentityBaseline) -> [String] {
         var out: [String] = []
         if oldValue.teamIdentifier != newValue.teamIdentifier {
@@ -541,13 +604,16 @@ struct AppSigningIdentityDetector: Detector {
         return out
     }
 
+    /// 读取加密基线；必要时从遗留明文迁移。
     private func loadBaseline() -> IdentityBaseline? {
         Self.baselineLock.withLock {
+            // 优先读取加密文件。
             if let encrypted = SecureFileStore.shared.read(key: Self.baselineStorageKey),
                let decrypted = try? PayloadCrypto.decrypt(encrypted),
                let baseline = try? JSONDecoder().decode(IdentityBaseline.self, from: decrypted) {
                 return baseline
             }
+            // 遗留明文迁移：读到后转存加密文件并删除明文。
             // 遗留迁移：历史明文 UserDefaults 基线，读到后转存加密文件并删除明文。
             let defaults = UserDefaults.standard
             guard let data = defaults.data(forKey: Self.legacyBaselineDefaultsKey),
@@ -560,10 +626,12 @@ struct AppSigningIdentityDetector: Detector {
         }
     }
 
+    /// 保存基线（加锁）。
     private func saveBaseline(_ baseline: IdentityBaseline) {
         Self.baselineLock.withLock { saveBaselineLocked(baseline) }
     }
 
+    /// 调用方须已持有 `baselineLock`。
     /// 调用方须已持有 `baselineLock`。
     private func saveBaselineLocked(_ baseline: IdentityBaseline) {
         guard let data = try? JSONEncoder().encode(baseline),
@@ -573,6 +641,7 @@ struct AppSigningIdentityDetector: Detector {
         SecureFileStore.shared.write(key: Self.baselineStorageKey, data: encrypted)
     }
 
+    /// 是否为 DEBUG 构建；Release 下 get-task-allow 才被视为异常。
     private static var isDebugBuild: Bool {
 #if DEBUG
         true
@@ -581,6 +650,7 @@ struct AppSigningIdentityDetector: Detector {
 #endif
     }
 
+    /// iOS/UIKit 环境要求存在 application-identifier entitlement。
     private static var requiresApplicationIdentifierEntitlement: Bool {
 #if canImport(UIKit)
         true
@@ -589,6 +659,7 @@ struct AppSigningIdentityDetector: Detector {
 #endif
     }
 
+    /// 去除首尾空白；空字符串返回 nil。
     static func normalized(_ value: String?) -> String? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
             return nil
@@ -596,6 +667,7 @@ struct AppSigningIdentityDetector: Detector {
         return trimmed
     }
 
+    /// 报告 team id 的来源：entitlement / application_identifier_prefix / missing。
     static func teamIdentifierSource(for snapshot: IdentitySnapshot) -> String {
         if normalized(snapshot.teamIdentifierEntitlement) != nil {
             return "entitlement"
@@ -606,6 +678,7 @@ struct AppSigningIdentityDetector: Detector {
         return "missing"
     }
 
+    /// 从 application-identifier 中取第一个 '.' 之前的前缀作为 team id。
     static func teamPrefix(from applicationIdentifier: String?) -> String? {
         guard let applicationIdentifier = normalized(applicationIdentifier),
               let separator = applicationIdentifier.firstIndex(of: ".") else {
@@ -615,6 +688,7 @@ struct AppSigningIdentityDetector: Detector {
         return normalized(prefix)
     }
 
+    /// 从 application-identifier 中取第一个 '.' 之后的 bundle 后缀。
     static func bundleSuffix(from applicationIdentifier: String?) -> String? {
         guard let applicationIdentifier = normalized(applicationIdentifier),
               let separator = applicationIdentifier.firstIndex(of: ".") else {
@@ -624,11 +698,13 @@ struct AppSigningIdentityDetector: Detector {
         return normalized(suffix)
     }
 
+    /// 比较 entitlement 中的 bundle id 与运行时 bundle id，支持通配符。
     static func bundleIdentifierMatches(_ entitledBundleIdentifier: String, _ runtimeBundleIdentifier: String) -> Bool {
         if entitledBundleIdentifier == runtimeBundleIdentifier {
             return true
         }
 
+        // 支持 `com.foo.*` 形式的通配 entitlement。
         guard entitledBundleIdentifier.hasSuffix(".*"),
               entitledBundleIdentifier.count > 2 else {
             return false
@@ -641,7 +717,9 @@ struct AppSigningIdentityDetector: Detector {
         return runtimeBundleIdentifier.hasPrefix(wildcardPrefix + ".")
     }
 
+    /// 校验 Apple Team ID 形态：恰好 10 位大写字母或数字。
     static func looksLikeAppleTeamIdentifier(_ teamIdentifier: String) -> Bool {
+        // Apple Team ID 固定 10 位，长度不符直接判异常。
         guard teamIdentifier.count == 10 else {
             return false
         }
@@ -652,6 +730,7 @@ struct AppSigningIdentityDetector: Detector {
         }
     }
 
+    /// 计算身份材料指纹（SHA256 十六进制）。
     static func bindingFingerprint(for snapshot: IdentitySnapshot) -> String {
         let material = [
             normalized(snapshot.teamIdentifierEntitlement) ?? "",

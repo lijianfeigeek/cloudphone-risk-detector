@@ -1,3 +1,6 @@
+// 上报链路·App Attest 主动探针：实际驱动一次密钥/断言流程，验证 Secure Enclave 真可用。
+// 探针只在后台执行，结果按 TTL 缓存；失败/不可用信号随报告上报，不包含密钥材料。
+
 import Foundation
 #if canImport(DeviceCheck)
 import DeviceCheck
@@ -27,18 +30,22 @@ import DeviceCheck
 ///   - notProbed / probing     → 不发信号（避免在结果未稳定时拍脑袋）
 final class AppAttestActiveProbeProvider: RiskSignalProvider {
 
+    /// 进程级单例，复用探针结果缓存。
     static let shared = AppAttestActiveProbeProvider()
+    /// 信号源稳定标识。
     let id = "app_attest_active_probe"
 
     /// 一次探针结果的有效期。超过后下次 signals() 触发后台复探。
     private static let probeTTL: TimeInterval = 3600
 
+    /// 探针状态机：未探测 → 探测中 → 已探测（结果 + 时间）。
     private enum ProbeState {
         case notProbed
         case probing
         case probed(ProbeOutcome, at: Date)
     }
 
+    /// 探针结论；`unavailable` 表示环境/配置原因无法判定，不直接判风险。
     private enum ProbeOutcome {
         case ok
         case failed(reason: String)
@@ -50,6 +57,7 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
 
     private init() {}
 
+    /// 读取探针信号；首次调用触发后台探针，TTL 到期时保留旧结论并后台复探。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         let action = stateLock.withLock { () -> StateAction in
             switch state {
@@ -82,12 +90,14 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
         }
     }
 
+    /// 状态机输出的下一步动作，避免持锁执行异步探针。
     private enum StateAction {
         case kickOff(currentOutcome: ProbeOutcome?)
         case wait
         case emit(ProbeOutcome)
     }
 
+    /// 把探针结论映射为风险信号：ok 不发信号；unavailable 仅标记测量状态；failed 判硬风险。
     private func signal(for outcome: ProbeOutcome) -> [RiskSignal] {
         switch outcome {
         case .ok:
@@ -119,6 +129,7 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
         }
     }
 
+    /// 触发一次后台探针；若已在探测中或系统明确不支持 App Attest 则不再执行。
     private func kickOffProbe() {
         // 把 state 置为 .probing；如果已经在 probing 中（其他线程刚开始）就放弃。
         let shouldRun = stateLock.withLock { () -> Bool in
@@ -148,6 +159,8 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
         #endif
     }
 
+    /// 实际执行 `generateKey + attestKey` 流程；只有真机 + 真 Secure Enclave 才能成功。
+    /// 错误映射原则：配置/网络/Keychain 类问题记为 `unavailable`，只有底层能力异常才判 `failed`。
     @available(iOS 14.0, macOS 11.0, *)
     private static func runActiveProbe() async -> ProbeOutcome {
         do {
@@ -156,6 +169,7 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
         } catch let err as AppAttestSigner.AppAttestError {
             switch err {
             case .hardwareTrustUnsupported:
+                // isSupported 已为 false：不把“不支持”重复判成风险，交给 AppAttestSignalProvider 处理。
                 return .ok
             case .invalidPayloadHashSize:
                 return .failed(reason: "invalid_payload_hash_size")
@@ -172,6 +186,7 @@ final class AppAttestActiveProbeProvider: RiskSignalProvider {
                 switch dcErr.code {
                 case .unknownSystemFailure:
                     return .unavailable(reason: "dc_unknown_system_failure")
+                // featureUnsupported / invalidKey / invalidInput 说明 isSupported=true 与实际能力矛盾，按失败处理。
                 case .featureUnsupported:
                     return .failed(reason: "dc_feature_unsupported")
                 case .invalidKey:

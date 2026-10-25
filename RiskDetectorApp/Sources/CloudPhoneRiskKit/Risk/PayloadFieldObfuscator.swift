@@ -1,3 +1,7 @@
+// 上报链路·字段重命名（历史名“混淆”）：按映射表把语义键替换为短键，降低流量可读性。
+// 本机制不提供加密/机密性；机密性由 ReportEnvelope 的 AES-GCM 与 HMAC/v3 签名承担。
+// 映射若存在冲突、过期或反向歧义，一律抛错拒绝（fail-closed），不得降级为明文键继续上报。
+
 import CryptoKit
 import Foundation
 
@@ -11,17 +15,13 @@ import Foundation
 /// 命名上保留历史名称 `Obfuscator` / `obfuscate` 仅为兼容，请按
 /// “字段重命名”理解，不要按“加密/混淆即安全”理解。
 public struct PayloadFieldMapping: Codable, Sendable {
-    /// Depth scope at which key renaming is applied. The previous default
-    /// (top-level only) left nested signal dictionaries with literal
-    /// names like "jailbreak" / "frida" / "ptrace" — readable on the wire
-    /// even when the outer envelope was renamed. Per the P2a red-team
-    /// finding, nested signal names ARE the sensitive surface; so the
-    /// default is now `all` for any new mapping.
+    /// 键重命名的作用深度。此前默认只处理顶层，导致嵌套信号字典仍以
+    /// `"jailbreak"` / `"frida"` / `"ptrace"` 等明文键上线；根据 P2a 红队结论，
+    /// 嵌套信号名本身就是敏感面，因此新映射默认使用 `.all`。
     public enum DepthScope: String, Codable, Sendable {
-        /// Only rename top-level keys (legacy behavior). Use only when
-        /// downstream parsers depend on nested key stability.
+        /// 只重命名顶层键（旧行为）。仅当下游解析器依赖嵌套键稳定时使用。
         case topLevel
-        /// Rename keys at every nesting depth.
+        /// 在任意嵌套深度重命名键。
         case all
     }
 
@@ -37,11 +37,10 @@ public struct PayloadFieldMapping: Codable, Sendable {
         case depthScope = "ds"
     }
 
-    /// Default scope is `.topLevel` for backwards compatibility with existing
-    /// callers (DecoyFieldInjector, legacy server-pushed mappings). New
-    /// integrations that want full nested renaming should pass
-    /// `depthScope: .all` explicitly, or use `deriveSessionMapping(...)`
-    /// which forces .all.（重命名 ≠ 机密性，见上方 `PayloadFieldMapping` 注释。）
+    /// 默认作用域为 `.topLevel`，兼容既有调用方（DecoyFieldInjector、服务端下发的旧映射）。
+    /// 需要完整嵌套重命名的集成应显式传 `depthScope: .all`，或使用
+    /// `deriveSessionMapping(...)`（其内部强制 `.all`）。
+    /// （重命名 ≠ 机密性，见上方 `PayloadFieldMapping` 注释。）
     public init(version: String, mappings: [String: String], expiresAtMillis: Int64? = nil, depthScope: DepthScope = .topLevel) {
         self.version = version
         self.mappings = mappings
@@ -54,26 +53,26 @@ public struct PayloadFieldMapping: Codable, Sendable {
         self.version = try c.decode(String.self, forKey: .version)
         self.mappings = try c.decode([String: String].self, forKey: .mappings)
         self.expiresAtMillis = try c.decodeIfPresent(Int64.self, forKey: .expiresAtMillis)
-        // Old persisted mappings without `ds` default to `.topLevel` for
-        // strict compatibility — server is expected to push a v2 mapping
-        // with `ds: "all"` when nested obfuscation is desired.
+        // 旧持久化映射可能没有 `ds` 字段，默认按 `.topLevel` 处理以保证严格兼容；
+        // 需要嵌套重命名时由服务端下发带 `ds: "all"` 的 v2 映射。
         self.depthScope = try c.decodeIfPresent(DepthScope.self, forKey: .depthScope) ?? .topLevel
     }
 
+    /// 判断映射是否已过期；无过期时间（nil）视为当前会话内长期有效。
     public func isExpired(nowMillis: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> Bool {
         guard let expiresAtMillis else { return false }
         return nowMillis > expiresAtMillis
     }
 
-    /// Validate that the mapping is collision-free in both directions, so
-    /// that obfuscate(deobfuscate(x)) == x is well-defined. A duplicate
-    /// target value would corrupt deobfuscation.
+    /// 校验映射在正反两个方向都无冲突，保证 `deobfuscate(obfuscate(x)) == x` 成立。
+    /// 目标短键重复会导致反向还原结果不确定，因此必须拒绝。
     public func validate() -> Bool {
         let targets = Array(mappings.values)
         return Set(targets).count == targets.count
     }
 }
 
+/// 字段重命名执行器：只改键名，不做任何加密或值变换。
 public enum PayloadFieldObfuscator {
     /// 使用映射将语义字段重命名为上报字段（仅重命名，不加密；见 `PayloadFieldMapping` 注释）。
     public static func obfuscate(jsonData: Data, mapping: PayloadFieldMapping) throws -> Data {
@@ -119,11 +118,9 @@ public enum PayloadFieldObfuscator {
             var transformed: [String: Any] = [:]
             transformed.reserveCapacity(dictionary.count)
             for (key, nestedValue) in dictionary {
-                // P2a fix: previously only depth==0 keys were renamed, leaving
-                // nested signal names ("jailbreak", "frida", "ptrace") visible
-                // in cleartext on the wire. Under .all scope every dictionary
-                // key consults the mapping; .topLevel preserves legacy behavior
-                // for callers that depend on nested key stability.
+                // P2a 修复：此前只重命名 depth==0 的键，嵌套信号名（"jailbreak"、
+                // "frida"、"ptrace"）仍以明文上线。`.all` 会对每一层字典键查表；
+                // `.topLevel` 保留旧行为，供依赖嵌套键稳定的调用方使用。
                 let shouldRename: Bool
                 switch scope {
                 case .all:
@@ -132,10 +129,8 @@ public enum PayloadFieldObfuscator {
                     shouldRename = (depth == 0)
                 }
                 let targetKey = shouldRename ? (mapping[key] ?? key) : key
-                // A mapped key may collide with an unmapped key in the actual
-                // payload (for example a->b while b already exists). Reject the
-                // whole payload instead of silently keeping an iteration-order
-                // dependent winner.
+                // 映射目标可能与真实载荷中的未映射键碰撞（例如 a->b 且 b 已存在）。
+                // 此时整份 payload 直接拒绝，而不是保留一个依赖字典遍历顺序的随机赢家。
                 guard transformed[targetKey] == nil else {
                     throw ReportEnvelope.ReportEnvelopeError.invalidPayload
                 }
@@ -158,13 +153,12 @@ public enum PayloadFieldObfuscator {
         return value
     }
 
-    /// Derive a session-scoped mapping by renaming each known semantic key to
-    /// `HMAC(sessionKey, "cprisk.field.v1" || keyName)[..8].hex`. The server,
-    /// holding the same sessionKey, recomputes the same hash and reverses the
-    /// mapping. Compared to a static mapping table downloaded from config,
-    /// the session-derived form means an attacker's traffic snapshot from one
-    /// session yields field names that don't match the next session's traffic
-    /// — pattern recognition becomes a per-session reverse-engineering task.
+    /// 派生会话级映射：把每个已知语义键重命名为
+    /// `HMAC(sessionKey, "cprisk.field.v1" || keyName)[..8].hex`。
+    /// 服务端持有同一 sessionKey，可复算相同短键并反向还原。
+    /// 相比配置下发的静态映射表，会话派生使同一攻击者从一次会话抓到的字段名
+    /// 在下次会话中不再匹配——模式识别被迫变成逐会话逆向。
+    /// - Parameter sessionKey: 会话级对称密钥，仅在本地与服务端持有，不随 payload 上报。
     public static func deriveSessionMapping(
         baseKeys: [String],
         sessionKey: SymmetricKey,
@@ -178,9 +172,8 @@ public enum PayloadFieldObfuscator {
             msg.append(label)
             msg.append(Data(key.utf8))
             let mac = HMAC<SHA256>.authenticationCode(for: msg, using: sessionKey)
-            // 8 bytes = 16 hex chars — short enough to keep payloads small,
-            // wide enough that collision across the SDK's known-key set
-            // (~150 entries) is astronomically unlikely.
+            // 8 字节 = 16 个十六进制字符：足够短以控制载荷体积，也足够宽，
+            // 使 SDK 已知键集合（约 150 个）发生碰撞的概率可忽略。
             let hex = mac.prefix(8).map { String(format: "%02x", $0) }.joined()
             pairs[key] = hex
         }

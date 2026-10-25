@@ -1,3 +1,6 @@
+// 完整性印章计算：SHA-256 摘要再叠加 GF(2) 128-bit 仿射变换，得到 16 字节不可逆指纹。
+// 作为证据字段嵌在风险信号里，供上游审计或服务器侧签名锚点使用。
+
 import CRiskCore
 import CryptoKit
 import Foundation
@@ -21,9 +24,11 @@ import Foundation
 enum IntegritySealComputer {
 
     /// 16 字节印章。
+    /// `Equatable` 便于测试与缓存比对；字节数组本身不提供常量时间比较，勿用于密钥校验。
     struct Seal: Equatable {
         let bytes: [UInt8]
 
+        /// 小写十六进制表示，固定 32 个字符，便于放进 JSON evidence。
         var hexString: String {
             bytes.map { String(format: "%02x", $0) }.joined()
         }
@@ -33,6 +38,7 @@ enum IntegritySealComputer {
     /// 流程：SHA-256 → 取前 16 字节 → GF(2) 仿射变换。
     static func seal(_ data: Data) -> Seal {
         let hash = SHA256.hash(data: data)
+        // 只取前 16 字节（128 bit），正好匹配仿射矩阵维度；截断不会增加碰撞可行性。
         return sealFromDigestPrefix(Array(hash.prefix(16)))
     }
 
@@ -41,6 +47,7 @@ enum IntegritySealComputer {
     /// policy 上的 `IntegritySealComputer.sealFromDigestPrefix` 条目不至于变成死 entry。
     @inline(never)
     static func sealFromDigestPrefix(_ input: [UInt8]) -> Seal {
+        // 维度必须严格为 16；输入错误属于编程错误，用 precondition 在 Debug 直接暴露。
         precondition(input.count == 16, "GF(2) affine input must be exactly 16 bytes")
         var output = [UInt8](repeating: 0, count: 16)
         input.withUnsafeBufferPointer { inBuf in
@@ -78,6 +85,7 @@ enum IntegritySealComputer {
         defer { cacheLock.unlock() }
 
         let now = Date()
+        // 命中 TTL 缓存直接返回，避免在热路径上重复做 FNV-1a。
         if let cached = cachedIntact, let at = cachedAt, now.timeIntervalSince(at) < cacheTTL {
             return cached
         }
@@ -99,8 +107,11 @@ enum IntegritySealComputer {
     }
 
     // MARK: - F5 cache state
+    // 保护 cachedIntact / cachedAt 的读写；临界区只做赋值，不调用 CRC 以外的外部代码。
     private static let cacheLock = NSLock()
+    // nil 表示尚未探测过；false 表示检测到矩阵篡改。
     private static var cachedIntact: Bool? = nil
     private static var cachedAt: Date? = nil
+    // 5 秒折中：更短会放大热路径成本，更长会推迟篡改上报。
     private static let cacheTTL: TimeInterval = 5.0
 }

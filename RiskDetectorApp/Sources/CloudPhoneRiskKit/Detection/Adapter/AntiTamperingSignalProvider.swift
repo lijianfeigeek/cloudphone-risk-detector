@@ -1,6 +1,12 @@
+// 反篡改信号提供者（AntiTamperingSignalProvider）
+// 职责：把反篡改/反调试/注入检测器的输出统一映射为 RiskSignal（id/score/state/layer/weightHint）。
+// 管道位置：Detection/Adapter 层，作为 RiskSignalProvider 插入 RiskDetectionEngine 的聚合链路。
+// 安全要点：检测器异常按 `.tampered` 处理；会话 nonce 与 C 层证明链由相关检测器写入，本文件负责转换、去重与一致性加分。
 import CRiskCore
 import Foundation
 
+/// 本文件专用的控制流平坦化（CFF）参数与运行时盐派生。
+/// 盐值混入快照、阈值与变异策略，使每次评估的状态编码不同，降低静态定位与 Hook 稳定性。
 private enum AntiTamperingSignalProviderCFF {
     static let signalsConfig = CFFConfig.adaptive(
         functionSeed: 0x63AF_19D2_8C54_B7E1,
@@ -11,6 +17,8 @@ private enum AntiTamperingSignalProviderCFF {
     /// Non-semantic CFF domain tag to avoid leaking concrete symbol names.
     static let signalsDomainTag = "atsp_core_v1"
 
+    /// 从快照状态派生盐值：越狱分数、命中方法数、阈值、抖动策略与设备 ID 都参与，
+    /// 保证不同设备/不同评估轮次的状态机编码不同。
     static func salt(snapshot: RiskSnapshot, threshold: Double) -> UInt32 {
         CFFRuntimeSalt.derive(
             functionSeed: signalsConfig.functionSeed,
@@ -45,6 +53,14 @@ private enum AntiTamperingSignalProviderCFF {
 /// - 遵循职责分离原则：检测器专注检测，SignalProvider 负责信号转换
 /// - 实现 RiskSignalProvider 协议，可插拔到 RiskDetectionEngine
 /// - 支持动态配置启用/禁用特定检测器
+///
+/// ## 信号语义
+/// - `id`：稳定的信号标识，部分来自混淆常量表；同一根因使用同一 id 便于服务端聚合。
+/// - `score`：该信号对总风险的贡献分，通常 0–100；多个信号可叠加，重叠组另行去重。
+/// - `state`：`.hard(detected:)` 为确定性证据，`.soft(confidence:)` 为概率证据，
+///   `.tampered` 表示主动篡改/绕过痕迹（权重最高，常直接触发 fail-closed）。
+/// - `layer`：证据层级，1 为进程内直接观测，2 为派生/交叉验证，3 为多族共识。
+/// - `weightHint`：建议权重，供上层判决或服务端解释使用，不直接等于最终分数。
 public final class AntiTamperingSignalProvider: RiskSignalProvider {
 
     /// 单例实例，供 registerProviders 使用；seal 后禁止替换，否则触发 provider_instance_replaced
@@ -52,9 +68,11 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
 
     // MARK: - RiskSignalProvider
 
+    /// Provider 标识；与反篡改检测器的 id 对齐，便于注册与日志关联。
     public let id = ObfuscatedConstants.detectorIDAntiTampering
-    
-    /// 配置选项
+
+    /// 检测能力开关与过滤阈值。
+    /// 每个 `enableXxx` 对应 `CheckPlan` 中的一行检测；关闭后该检测器不会执行。
     public struct Configuration: Sendable {
         var enableAntiTampering: Bool = true
         var enableDebugger: Bool = true
@@ -101,25 +119,32 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         var enableLibcDirectSyscallFallbackReporting: Bool = true
         var enableEmulatorLayoutDetect: Bool = true
         var enableEmulatorBehaviorDetect: Bool = true
+        /// 信号过滤阈值：分数低于该值的信号在最终输出前被丢弃（默认 0 = 不过滤）。
         var minScoreThreshold: Double = 0
-        
+
         public static let `default` = Configuration()
     }
-    
+
+    /// 创建时固定的配置；实例生命周期内只读，可安全并发调用 `signals`。
     private let configuration: Configuration
+    /// 随机化检测器的作用域标识，参与 `MutationPlanner` 的确定性洗牌。
     private static let randomizedDetectorScope = ObfuscatedConstants.detectorScopeAntiTamperingProviderCoreChecks
+    /// 允许合并的重复信号 id：同一 id 多次命中时保留最强一条，避免同源重复计分。
     private static let protectedDuplicateSignalIDs: Set<String> = [
         SignalID.softwareBreakpointDetected,
         SignalID.exceptionDeliveryTimeout,
     ]
 
+    /// 一条检测任务：`id` 用于异常归因与日志，`execute` 延迟到状态机执行时才调用。
     private struct DetectorCheck {
         let id: String
         let execute: () throws -> [RiskSignal]
     }
-    
+
     // MARK: - 初始化
-    
+
+    /// 创建 Provider。
+    /// - Parameter configuration: 检测开关与过滤阈值，默认 `.default`（几乎全部启用）。
     public init(configuration: Configuration = .default) {
         self.configuration = configuration
     }
@@ -131,13 +156,20 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
     
     // MARK: - RiskSignalProvider 实现
     
+    /// 收集本轮所有反篡改信号。
+    ///
+    /// 执行流程：按配置构建检测计划 -> 可选确定性洗牌 -> 状态机逐个执行 ->
+    /// mprotect 补充检测 -> 去重/关联/一致性加分 -> MIE 加权 -> 阈值过滤。
+    /// - Parameter snapshot: 当前风险评估快照（提供越狱基础分、变异策略与设备 ID）。
+    /// - Returns: 过滤后的 `RiskSignal` 列表；单个检测器抛错会转成 `.tampered` 异常信号。
     public func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         var signals: [RiskSignal] = []
         let baseJailbreakScore = snapshot.jailbreak.confidence
         let ordered = orderedChecks(snapshot: snapshot, baseScore: baseJailbreakScore)
         let cffConfig = AntiTamperingSignalProviderCFF.signalsConfig
         let salt = AntiTamperingSignalProviderCFF.salt(snapshot: snapshot, threshold: configuration.minScoreThreshold)
-        /* Salt-derived CFF state rung (7 consecutive values) — avoids a fixed 0x61…0x67 signature in TEXT. */
+        // 由盐派生的 7 个连续状态值：避免在 TEXT 段留下固定的 0x61…0x67 状态签名。
+        // 状态值随快照变化，静态扫描无法直接对应到具体执行阶段。
         let stateBase = UInt32(0x40) + (salt % 120)
         let entryState: UInt32 = stateBase
         let iterateState: UInt32 = stateBase &+ 1
@@ -150,6 +182,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         let cffKey = CFFStateCodec.deriveSeed(function: AntiTamperingSignalProviderCFF.signalsDomainTag, config: cffConfig)
         let effectiveSalt = cffConfig.enableRuntimeSalt ? salt : salt ^ 0x13579BDF
 
+        // 状态编码/解码的局部快捷函数：统一注入本次评估的 key、salt 与编码风格。
         func encodeState(_ rawState: UInt32) -> UInt32 {
             CFFStateCodec.encode(state: rawState, key: cffKey, salt: effectiveSalt, style: cffConfig.codecStyle)
         }
@@ -164,16 +197,24 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         var sink = CFFReturnSink<[RiskSignal]>()
         var encodedState = encodeState(entryState)
 
+        /// 收尾流水线：去重 -> 多族关联 -> 交叉一致性 -> MIE 加权 -> 噪声 -> 阈值过滤。
+        /// 关联信号只基于已合并结果生成，避免重复驱动同一根因。
         func finalizeSignals() -> [RiskSignal] {
+            // 第一步：同 id 重复信号合并，保留分数/权重最高者。
             let merged = coalesceProtectedDuplicateSignals(signals)
+            // 第二步：Frida、反调试策略、签名链三族共识；各自要求至少两个子族同时命中。
             let withCorrelation = merged
                 + fridaCorrelationSignals(from: merged)
                 + antiDebugStrategySignals(from: merged)
                 + signingChainSignals(from: merged)
+            // 第三步：轻量跨族一致性（PAC/VMRemap/TaskPort/dyld/JIT）。
             let withCross = withCorrelation + crossConsistencySignals(from: withCorrelation)
+            // 第四步：MIE 姿态只对少数高价值信号做小幅加分，不改变证据状态。
             var weighted = applyMiePostureWeighting(withCross)
+            // 第五步：在最低分信号上注入随时间变化的微小噪声，增加分数指纹的不确定性。
             injectSigningEpochNoise(&weighted)
 
+            // 附带一条 0 分的自适应 hint，供服务端调整后续检测强度。
             let hintLevel = computeAdaptiveWatchdogHint(from: weighted)
             weighted.append(RiskSignal(
                 id: ObfuscatedConstants.signalWatchdogAdaptiveHint,
@@ -185,10 +226,12 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 weightHint: 0
             ))
 
+            // 低分信号在输出前统一丢弃；阈值默认 0，性能模式下会设为 15。
             return weighted.filter { $0.score >= configuration.minScoreThreshold }
         }
 
         while !sink.isResolved {
+            // 预算耗尽时返回已完成部分，避免状态机异常导致整轮评估卡死。
             guard loopBudget > 0 else {
                 sink.store(finalizeSignals())
                 break
@@ -267,6 +310,12 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return sink.resolve(or: finalizeSignals())
     }
 
+    /// 隔离执行单个检测器并追加结果；任何抛出都不能中断其余检测。
+    /// - Parameters:
+    ///   - label: 检测器标识，用于异常信号归因。
+    ///   - signals: 累计信号列表。
+    ///   - block: 检测闭包。
+    /// - Note: 异常按 `.tampered`、score 80 处理：检测能力被破坏本身即高风险。
     private func isolatedAppend(
         _ label: String,
         _ signals: inout [RiskSignal],
@@ -276,6 +325,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             let result = try block()
             signals.append(contentsOf: result)
         } catch {
+            // fail-closed：检测器抛错可能是资源问题，也可能是被 Hook；统一按篡改证据上报。
             Logger.log("[ATSP] \(label) threw error(\(error)), treating as suspicious")
             signals.append(RiskSignal(
                 id: "detector_anomaly_\(label)",
@@ -289,13 +339,18 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
     }
 
+    /// 给最低分信号叠加 0–0.06 的时间噪声。
+    /// 目的不是改变判决，而是让分数指纹随时间轻微漂移，降低攻击者用固定分数反推检测逻辑的成功率。
     private func injectSigningEpochNoise(_ signals: inout [RiskSignal]) {
         guard !signals.isEmpty else { return }
+        // 30 秒为一个大致的“纪元”单位，只取模 7，噪声幅度远小于任何判决阈值。
         let epochNonce = mach_absolute_time() / 30_000_000_000
         guard let lowestIdx = signals.enumerated().min(by: { $0.element.score < $1.element.score })?.offset else { return }
         signals[lowestIdx].score += Double(epochNonce % 7) * 0.01
     }
 
+    /// 计算自适应 hint：篡改证据越多，建议的检测强度越高（1 最高，3 最低）。
+    /// 该值仅作为 0 分信号上报，供服务端下轮策略参考，不参与本地判决。
     private func computeAdaptiveWatchdogHint(from signals: [RiskSignal]) -> Int {
         let tamperedCount = signals.filter { $0.state == .tampered }.count
         if tamperedCount >= 3 { return 1 }
@@ -303,16 +358,20 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return 3
     }
 
+    /// 返回本次会参与随机化的检测器 id（仅核心检查可洗牌，顺序不影响语义的才纳入）。
     func orderedRandomizedDetectorIDs(snapshot: RiskSnapshot) -> [String] {
         orderedChecks(snapshot: snapshot, baseScore: snapshot.jailbreak.confidence)
             .map(\.id)
             .filter { Self.randomizableDetectorIDs.contains($0) }
     }
 
+    /// 返回当前配置实际启用的检测器 id（未洗牌，按计划表顺序），用于配置自检与测试。
     func configuredCheckIDs(snapshot: RiskSnapshot) -> [String] {
         buildChecks(snapshot: snapshot, baseScore: snapshot.jailbreak.confidence).map(\.id)
     }
 
+    /// 允许参与顺序随机化的检测器 id 白名单。
+    /// 只包含相互独立、顺序不影响结论的检查；有依赖关系的检查仍保持固定顺序。
     private static let randomizableDetectorIDs: Set<String> = [
         ObfuscatedConstants.detectorIDAntiTampering,
         ObfuscatedConstants.detectorIDDebugger,
@@ -328,21 +387,27 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         ObfuscatedConstants.detectorIDAntiDebugWatchdog,
     ]
 
-    /// Descriptor-driven plan：`internalToken` 仅用于降低“整表能力清单”在静态阅读时的直观性，不改变对外 `DetectorCheck.id`。
+    /// 描述表驱动的检测计划。
+    /// `internalToken` 仅降低“整表能力清单”在静态阅读时的直观性，不改变对外 `DetectorCheck.id`，
+    /// 也不参与任何判决逻辑。
     private enum CheckPlan {
+        /// 一行检测计划：`enabled` 决定是否构建，`make` 延迟构造实际检测闭包。
         private struct Row {
             let internalToken: UInt64
             let enabled: (Configuration) -> Bool
             let make: (AntiTamperingSignalProvider, RiskSnapshot, Double) -> DetectorCheck
         }
 
+        /// token 洗牌掩码，让源码行序与运行时 token 分布脱钩。
         private static let tokenMix: UInt64 = 0xBADC_0FFE_EEDD_F011
 
+        /// 生成下一个内部 token；仅用于降低静态可读性。
         private static func nextKey(_ counter: inout UInt64) -> UInt64 {
             counter &+= 0x19E1_7000_0000_0003
             return counter ^ tokenMix
         }
 
+        /// 全部检测计划行；顺序即默认执行顺序，可随机化的子集随后会被洗牌。
         private static let rows: [Row] = {
             var c: UInt64 = 0x5010_0000_0000_0000
             return [
@@ -694,6 +759,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             ]
         }()
 
+        /// 按配置过滤计划行并构造检测任务；被关闭的检测器不会产生任何闭包开销。
         static func makeChecks(
             configuration: Configuration,
             provider: AntiTamperingSignalProvider,
@@ -711,6 +777,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
     }
 
+    /// 使用当前配置构建检测任务列表。
     private func buildChecks(snapshot: RiskSnapshot, baseScore: Double) -> [DetectorCheck] {
         CheckPlan.makeChecks(
             configuration: configuration,
@@ -720,6 +787,9 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         )
     }
 
+    /// 构建检测任务并对其中的可随机化子集做确定性洗牌。
+    /// 洗牌由 `MutationPlanner` 按设备 ID/策略驱动：同一设备同一策略可复现，
+    /// 不同设备或策略不同，从而削弱“按固定顺序蹲守某个检测器”的绕过方式。
     private func orderedChecks(snapshot: RiskSnapshot, baseScore: Double) -> [DetectorCheck] {
         let checks = buildChecks(snapshot: snapshot, baseScore: baseScore)
         let planner = MutationPlanner(
@@ -728,6 +798,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             deviceID: snapshot.deviceID
         )
 
+        // 只挑出白名单内的检查参与洗牌，并把洗牌结果写回原索引位置。
         let selectedIndices = checks.indices.filter { Self.randomizableDetectorIDs.contains(checks[$0].id) }
         guard selectedIndices.count > 1 else { return checks }
 
@@ -743,6 +814,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return ordered
     }
 
+    /// 合并受保护的重复信号（软件断点、异常投递超时等可能被多个路径同时上报）。
+    /// 非保护 id 原样透传；保护 id 每组只输出一条最强信号，并保留合并来源证据。
     func coalesceProtectedDuplicateSignals(_ signals: [RiskSignal]) -> [RiskSignal] {
         var grouped: [String: [RiskSignal]] = [:]
         var orderedIDs: [String] = []
@@ -764,6 +837,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return passthrough + merged
     }
 
+    /// 合并同 id 的多条信号：取最高分/最高权重，任意一条为 `.tampered` 则结果保持 `.tampered`。
+    /// - Returns: 合并后的信号；输入为空时返回 nil。
     private func mergeSignals(_ signals: [RiskSignal]) -> RiskSignal? {
         guard let strongest = signals.max(by: { lhs, rhs in
             if lhs.score == rhs.score {
@@ -803,15 +878,17 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
     }
     
     // MARK: - 检测方法
-    
-    /// 反调试检测
+
+    /// 反调试检测：输出一条聚合信号，并把每个命中方法拆成独立信号便于溯源。
+    /// - Parameter baseScore: 旧引擎基础分（当前不参与本函数计分）。
+    /// - Returns: 聚合信号 + 逐方法信号；无命中时为空数组。
     private func detectAntiTampering(baseScore: Double) throws -> [RiskSignal] {
         var signals: [RiskSignal] = []
-        
+
         let result = try AntiTamperingDetector().detect()
-        
+
         if result.score > 0 {
-            // 基础反调试信号
+            // 基础反调试信号：`.tampered` 表示主动篡改痕迹，权重高于普通 .hard 证据。
             signals.append(
                 RiskSignal(
                     id: ObfuscatedConstants.detectorIDAntiTampering,
@@ -827,11 +904,12 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 )
             )
             
-            // 分解具体方法为独立信号
+            // 分解具体方法为独立信号：方法名中的 ":" 替换为 "_" 生成稳定 id，
+            // 分数由 `extractScore` 按关键词估算，便于服务端按技术手段聚类。
             for method in result.methods {
                 let signalID = method.replacingOccurrences(of: ":", with: "_")
                 let methodScore = extractScore(from: method)
-                
+
                 signals.append(
                     RiskSignal(
                         id: signalID,
@@ -846,13 +924,17 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
     
-    /// 调试器检测
+    /// 调试器检测：聚合父进程、监听端口、软件断点与异常投递超时等证据。
+    /// 聚合信号使用 `.soft(0.7)`，因为调试器可能来自开发/测试环境；
+    /// 软件断点与异常投递超时另有专门的强证据信号。
+    /// - Parameter baseScore: 旧引擎基础分（当前不参与本函数计分）。
     private func detectDebugger(baseScore: Double) throws -> [RiskSignal] {
         var signals: [RiskSignal] = []
+        // 先取一次 Watchdog 快照，供软件断点/异常超时信号补充旁路证据。
         let watchdogSnapshot = CPRiskKit.shared.antiDebugWatchdogSnapshot()
-        
+
         let result = try DebuggerDetector().detect()
-        
+
         if result.score > 0 {
             signals.append(
                 RiskSignal(
@@ -869,7 +951,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 )
             )
             
-            // 分解具体调试器类型
+            // 分解具体调试器类型：父进程/端口属于弱证据，
+            // 软件断点/异常投递超时则合并 Watchdog 旁路证据后单独计分。
             for method in result.methods {
                 if method.hasPrefix("debugger:parent:") {
                     let debuggerName = method.replacingOccurrences(of: "debugger:parent:", with: "")
@@ -909,6 +992,11 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
 
+    /// 构造软件断点信号；直接扫描（detail 可解析为整数）比 Watchdog 旁证更强。
+    /// - Parameters:
+    ///   - detail: 断点数量字符串（直接扫描）或其他细节描述。
+    ///   - snapshot: Watchdog 快照，用于补充旁路计数。
+    /// - Returns: `.tampered` 信号；直接扫描 58 分，仅旁证 34 分。
     private func softwareBreakpointSignal(
         detail: String,
         snapshot: CPRiskKit.AntiDebugWatchdogSnapshot
@@ -936,6 +1024,9 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         )
     }
 
+    /// 构造异常投递超时信号：异常端口被劫持时，异常无法按时送达，属于调试器/注入的强旁证。
+    /// 异常标志位已置或异常次数大于 1 时提高分数与置信度。
+    /// - Parameter snapshot: Watchdog 快照。
     private func exceptionDeliveryTimeoutSignal(
         snapshot: CPRiskKit.AntiDebugWatchdogSnapshot
     ) -> RiskSignal {
@@ -961,6 +1052,10 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         )
     }
 
+    /// 追加 mprotect 篡改信号：C 层标记页面权限被改写时调用。
+    /// 根据“直接调用失败/回退成功”的组合给出不同语义分，并在直接路径失败但回退仍成功时
+    /// 额外输出一条语义绕过信号（说明 Hook 只拦截了直连路径）。
+    /// - Parameter signals: 累计信号列表。
     private func appendMprotectSignals(_ signals: inout [RiskSignal]) {
         guard cprisk_is_mprotect_tampered() != 0 else { return }
 
@@ -972,6 +1067,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         let baseScore: Double
         let baseWeightHint: Double
 
+        // 组合语义：直接失败+回退成功 = 最可疑（直连 syscall 被定向拦截）；
+        // 直接失败+回退也失败 = 系统级限制或更深层 Hook；仅有回退成功 = 直连路径不可用。
         switch (directFailed, fallbackSucceeded) {
         case (true, true):
             semanticCase = "direct_failure_with_fallback_success"
@@ -1013,6 +1110,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             weightHint: baseWeightHint
         ))
 
+        // 直连路径被拦、回退路径仍可用：典型的定向 Hook 语义绕过，单独再加一条证据。
         if directFailed && fallbackSucceeded {
             signals.append(RiskSignal(
                 id: ObfuscatedConstants.signalMemoryProtectionSemanticBypass,
@@ -1031,14 +1129,18 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
     }
     
-    /// Frida 检测
+    /// Frida 检测：聚合信号按方法前缀拆分为端口、协议、文件、符号等独立信号。
+    /// 聚合分上限 55，防止单一 FridaDetector 结果压过其他族证据；
+    /// 疑似本地监听端口只给 4 分软信号，避免误伤正常开发工具。
+    /// - Parameter baseScore: 旧引擎基础分（当前不参与本函数计分）。
     private func detectFrida(baseScore: Double) throws -> [RiskSignal] {
         var signals: [RiskSignal] = []
-        
+
         let result = try FridaDetector().detect()
         let fridaPrefix = ObfuscatedConstants.keywordFrida
 
         if result.score > 0 {
+            // 聚合信号：`.tampered` + 85 权重，表示运行时表面已确认被注入。
             signals.append(
                 RiskSignal(
                     id: "\(fridaPrefix)_detected",
@@ -1056,6 +1158,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             )
         }
 
+        // 方法前缀 -> (信号 id 前缀, 基础分) 映射；分值按证据强度递减，
+        // 例如运行时融合特征 48 分，普通监听/文件痕迹 14–20 分。
         let fridaCategories = [
             (ObfuscatedConstants.methodPrefixFridaPort, "\(fridaPrefix)_port", 30),
             (ObfuscatedConstants.methodPrefixFridaProto, "\(fridaPrefix)_proto", 34),
@@ -1109,16 +1213,18 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
 
+    /// Frida 模块检测：直接复用具名检测器的信号转换，保持 id/分数语义一致。
     private func detectFridaModule(baseScore: Double) throws -> [RiskSignal] {
         try FridaModuleDetector().asSignals()
     }
-    
-    /// 代码签名验证
+
+    /// 代码签名验证：聚合分使用 `.soft(0.8)`（签名异常也可能来自企业分发），
+    /// 并把 invalid/resigned/permissions 拆成固定分值的独立信号。
     private func detectCodeSignatureIssues(baseScore: Double) throws -> [RiskSignal] {
         var signals: [RiskSignal] = []
-        
+
         let result = try CodeSignatureValidator().detect()
-        
+
         if result.score > 0 {
             signals.append(
                 RiskSignal(
@@ -1135,7 +1241,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 )
             )
             
-            // 分解具体签名问题
+            // 分解具体签名问题：重签（resigned）比单纯校验失败更能说明 IPA 被二次打包。
             for method in result.methods {
                 if method.contains("invalid") {
                     signals.append(
@@ -1175,17 +1281,18 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
 
-    /// App 签名身份一致性检测
+    /// App 签名身份一致性检测：校验 bundle id / team id / entitlement 与基线是否一致。
+    /// 与代码签名互补：前者防重签，后者防身份伪装。
     private func detectAppSigningIdentityIssues(baseScore: Double) throws -> [RiskSignal] {
         try AppSigningIdentityDetector().asSignals()
     }
-    
-    /// 内存完整性检查
+
+    /// 内存完整性检查：聚合信号为 `.tampered`，并把函数 Hook / 方法交换 / inline patch 拆分上报。
     private func detectMemoryIntegrityIssues(baseScore: Double) throws -> [RiskSignal] {
         var signals: [RiskSignal] = []
-        
+
         let result = try MemoryIntegrityChecker().detect()
-        
+
         if result.score > 0 {
             signals.append(
                 RiskSignal(
@@ -1202,7 +1309,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 )
             )
             
-            // 分解具体内存问题
+            // 分解具体内存问题：Hook、ObjC swizzle、inline patch 分别映射到不同 id 前缀。
             for method in result.methods {
                 if method.hasPrefix(ObfuscatedConstants.methodPrefixMemoryHook) {
                     let functionName = method.replacingOccurrences(of: ObfuscatedConstants.methodPrefixMemoryHook, with: "")
@@ -1245,11 +1352,15 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
 
+    /// 反调试 Watchdog 信号：把 C 层周期巡检快照与反调试计划执行状态转换为 RiskSignal。
+    /// 覆盖追踪、拒绝附加、异常端口、硬件/软件断点、DBI、时序侧信道、PAC、dyld 注入等证据。
+    /// - Returns: Watchdog 基础信号 + csops/断点/计划执行等补充信号。
     private func detectAntiDebugWatchdogSignals() -> [RiskSignal] {
         let watchdogSnapshot = CPRiskKit.shared.antiDebugWatchdogSnapshot()
         let planSnapshot = CPRiskKit.shared.antiDebugPlanSnapshot()
         var signals = antiDebugWatchdogSignals(from: watchdogSnapshot)
 
+        // CS_DEBUGGED 是内核态标记：权限被改写为可调试时，几乎可以确认非正常分发。
         if watchdogSnapshot.csopsDebugged {
             signals.append(RiskSignal(
                 id: SignalID.csopsDebugged,
@@ -1333,7 +1444,9 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             ))
         }
 
+        // 以下探针依赖 arm64 硬件特性与 C 层实现，模拟器上不执行。
         #if (arch(arm64) || arch(arm64e)) && !targetEnvironment(simulator)
+        // 硬件计数器不可用：常见于被 Hook/虚拟化的环境，作为软证据而非定性结论。
         if cprisk_is_cntpct_clock_available() == 0 {
             signals.append(RiskSignal(
                 id: "cntpct_clock_unavailable",
@@ -1370,6 +1483,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
         #endif
 
+        // 反调试计划段缺失/无效：说明配置数据被裁剪或解析被干扰，按软证据上报。
         if !planSnapshot.sectionPresent || !planSnapshot.sectionValid {
             signals.append(RiskSignal(
                 id: "antidebug_plan_unavailable",
@@ -1388,6 +1502,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             let hasConsumedPlan = planSnapshot.consumeCount > 0
             let hasAppliedPolicy = planSnapshot.lastAppliedPolicyBits != 0
 
+            // 计划段存在但从未被消费/应用：说明执行链路可能被短路。
             if !hasConsumedPlan && !hasAppliedPolicy {
                 signals.append(RiskSignal(
                     id: "antidebug_plan_not_consumed",
@@ -1406,6 +1521,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 ))
             }
 
+            // 计划被多次消费：给 18–36 的软分，次数越多说明反调试动作越频繁。
             if hasConsumedPlan {
                 let consumeScore = min(18 + Double(min(planSnapshot.consumeCount, 6)) * 3, 36)
                 signals.append(RiskSignal(
@@ -1425,6 +1541,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 ))
             }
 
+            // 已应用策略按置位数计分：策略位越多，说明命中的检测面越广。
             if hasAppliedPolicy {
                 let appliedBitCount = planSnapshot.lastAppliedPolicyBits.nonzeroBitCount
                 let unionBitCount = planSnapshot.policyUnionBits.nonzeroBitCount
@@ -1446,6 +1563,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 ))
             }
 
+            // inline patch 失败/被篡改：攻击者尝试改写反调试桩代码，按 86 分强证据处理。
             if planSnapshot.inlinePatchFailureCount > 0 || planSnapshot.inlinePatchTampered {
                 signals.append(RiskSignal(
                     id: "antidebug_inline_patch_tamper",
@@ -1467,6 +1585,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 planSnapshot.lastSoftFailMode ||
                 planSnapshot.escalationCount > 0 ||
                 planSnapshot.trapEventCount > 0 {
+                // 升级事件按严重度分档：陷阱命中/升级次数 88 分，软失败 74，仅门关闭 66。
                 let escalationSignalScore: Double
                 if planSnapshot.trapEventCount > 0 || planSnapshot.escalationCount > 0 {
                     escalationSignalScore = 88
@@ -1500,7 +1619,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
     
     // MARK: - 辅助方法
     
-    /// 从方法字符串中提取分数
+    /// 从方法字符串中按关键词估算分数（检测器未提供结构化分数时的兜底）。
+    /// 分值按技术手段的危险程度排序：Frida 35 > 追踪/签名/父进程 25–30 > 通用 Hook 20 > 其他 15。
     private func extractScore(from method: String) -> Double {
         // 方法格式通常为 "category:method" 或 "category:method:(+score)"
         // 这里返回默认分数，实际应用中可以从配置中获取
@@ -1524,7 +1644,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
     }
 
-    /// Emits a soft signal when CRiskCore reported use of libc (or arc4random) because direct-syscall paths were unavailable.
+    /// CRiskCore 报告因直连 syscall 路径不可用而回退到 libc/arc4random 时，输出软信号。
+    /// - Parameter snapshot: 风险快照，携带回退位图与事件总数。
     func libcDirectSyscallFallbackSignals(from snapshot: RiskSnapshot) -> [RiskSignal] {
         libcDirectSyscallFallbackSignals(
             mask: snapshot.libcFallbackUsedMask,
@@ -1533,7 +1654,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         )
     }
 
-    /// Emits a soft signal when CRiskCore reported use of libc (or arc4random) because direct-syscall paths were unavailable.
+    /// 同上，输入为 Watchdog 快照；`supported` 用于标记快照是否由受支持的平台产出。
     func libcDirectSyscallFallbackSignals(from snapshot: CPRiskKit.AntiDebugWatchdogSnapshot) -> [RiskSignal] {
         libcDirectSyscallFallbackSignals(
             mask: snapshot.libcFallbackUsedMask,
@@ -1542,6 +1663,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         )
     }
 
+    /// 归一化实现：按位图区分“平台不支持”与“真实 syscall 表面回退”。
+    /// 真机上只有 libc 路径可用是较强的 Hook/篡改提示；模拟器上则属正常现象。
     private func libcDirectSyscallFallbackSignals(
         mask: UInt32,
         eventTotal: UInt32,
@@ -1551,13 +1674,14 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             return []
         }
         let labels = Self.libcFallbackClassLabels(mask: mask)
+        // 去掉“平台不支持”位，剩余位才代表真正的 syscall 表面回退。
         let syscallSurfaceBits = mask & ~UInt32(CPRISK_LIBC_FALLBACK_USED_UNSUPPORTED_PLATFORM)
         #if targetEnvironment(simulator)
         let score: Double = 20
         let confidence: Double = 0.72
         let weightHint: Double = syscallSurfaceBits != 0 ? 24 : 12
         #else
-        /* Device: direct SVC is expected; libc-only syscall surfaces are stronger tamper/hook hints than build-flavor. */
+        // 真机预期可走直接 SVC；只能走 libc 的 syscall 表面比构建形态更能提示 Hook/篡改。
         let score: Double = syscallSurfaceBits != 0 ? 34 : 14
         let confidence: Double = syscallSurfaceBits != 0 ? 0.82 : 0.55
         let weightHint: Double = syscallSurfaceBits != 0 ? 34 : 18
@@ -1566,6 +1690,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             RiskSignal(
                 id: SignalID.libcDirectSyscallFallback,
                 category: ObfuscatedConstants.categoryAntiTamper,
+                // 事件总数每 4 次补 1 分，最多补 12 分，避免高频事件把软信号顶成硬结论。
                 score: score + min(12, Double(eventTotal) * 0.25),
                 evidence: [
                     "libc_fallback_used_mask": "\(mask)",
@@ -1582,6 +1707,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         ]
     }
 
+    /// 把回退位图解码为可读的类别列表；未知位统一标记为 `reserved`。
     private static func libcFallbackClassLabels(mask: UInt32) -> String {
         let pairs: [(UInt32, String)] = [
             (UInt32(CPRISK_LIBC_FALLBACK_USED_DIRECT_MPROTECT), "mprotect"),
@@ -1609,7 +1735,15 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return parts.joined(separator: ",")
     }
 
+    /// 把 C 层 Watchdog 快照展开为逐族信号。
+    ///
+    /// 位图（`anomalyFlags`）中的每个异常位对应一条独立信号；同时累计 `maxScore` 与
+    /// `anomalyKinds`，最后在数组头部插入一条“总览”信号，id 为
+    /// `antiDebugWatchdogAnomaly`，分数取所有族中的最高分（不是求和），避免重复计分。
+    /// - Parameter snapshot: C 层周期巡检快照。
+    /// - Returns: 逐族信号 + 一条总览信号；平台不支持或无异常时返回空数组。
     func antiDebugWatchdogSignals(from snapshot: CPRiskKit.AntiDebugWatchdogSnapshot) -> [RiskSignal] {
+        // 不支持或完全无异常时不产出信号，避免给干净设备增加噪声。
         guard snapshot.supported, snapshot.hasAnyAnomaly else {
             return []
         }
@@ -1641,6 +1775,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         let vmImageLayoutDriftFlag =
             (snapshot.anomalyFlags & UInt32(CPRISK_ANTI_DEBUG_WATCHDOG_ANOMALY_VM_IMAGE_WHITELIST)) != 0
 
+        // 总览信号取各族最高分（maxScore），anomalyKinds 用于服务端解释命中面。
         var maxScore = 0.0
         var anomalyKinds: [String] = []
         var signals: [RiskSignal] = []
@@ -2135,6 +2270,8 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             )
         }
 
+        // 总览信号插到首位：上层按顺序取“首条强证据”时可优先看到聚合结论，
+        // 同时保留后面逐族明细供服务端下钻。
         signals.insert(
             RiskSignal(
                 id: SignalID.antiDebugWatchdogAnomaly,
@@ -2181,7 +2318,12 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         return signals
     }
 
+    /// Frida 多表面关联：把运行时、模块、线程、Socket、可执行内存、补丁、加载器
+    /// 七族证据做共识。至少两个族命中且包含行为族时才输出，避免单一线索误报。
+    /// - Parameter signals: 已完成同 id 合并的原始信号。
+    /// - Returns: 一条 `.tampered` 或 `.soft` 的共识信号；不足两族时为空数组。
     internal func fridaCorrelationSignals(from signals: [RiskSignal]) -> [RiskSignal] {
+        // 每族的 (名称, 触发阈值, 匹配谓词)；阈值用于过滤低分噪声，tampered 状态可越过阈值。
         let familyRules: [(family: String, threshold: Double, predicate: (RiskSignal) -> Bool)] = [
             (
                 "runtime_surface",
@@ -2287,14 +2429,18 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
 
         let families = familyDrivers.keys.sorted()
+        // 至少两族同时命中才认为存在跨表面关联，单族命中交给各自信号处理。
         guard families.count >= 2 else { return [] }
 
+        // 必须包含至少一个“行为族”（线程/Socket/可执行内存/补丁/加载器），
+        // 只有静态特征（运行时/模块）不足以构成 Frida 共识。
         let behavioralFamilies = families.filter {
             ["thread_surface", "socket_surface", "exec_surface", "patch_surface", "loader_surface"].contains($0)
         }
         guard !behavioralFamilies.isEmpty else { return [] }
 
         let matched = families.compactMap { familyDrivers[$0] }
+        // 基础 26 分 + 每族 6 分 + 每行为族 4 分 + 补丁族额外 6 分，上限 58。
         let score = min(
             58,
             26
@@ -2327,6 +2473,10 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         ]
     }
 
+    /// 反调试多策略关联：调试器、Watchdog、断点、反调试计划、签名、syscall 六族共识。
+    /// 与 Frida 关联互补：这里覆盖“调试/断点/计划被干扰”类证据。
+    /// - Parameter signals: 已合并的原始信号。
+    /// - Returns: 至少两族命中时输出一条共识信号，否则空数组。
     internal func antiDebugStrategySignals(from signals: [RiskSignal]) -> [RiskSignal] {
         let familyRules: [(family: String, threshold: Double, predicate: (RiskSignal) -> Bool)] = [
             (
@@ -2416,6 +2566,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
 
         let families = familyDrivers.keys.sorted()
+        // 两族起判；三族及以上升级为 `.tampered`，否则保持概率证据。
         guard families.count >= 2 else { return [] }
         let matched = families.compactMap { familyDrivers[$0] }
         let confidence = min(0.90, 0.56 + Double(families.count) * 0.09)
@@ -2441,7 +2592,11 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         ]
     }
 
+    /// 签名链关联：代码签名异常与签名身份异常同时出现时，说明 IPA 很可能被重签并伪装身份。
+    /// - Parameter signals: 已合并的原始信号。
+    /// - Returns: 两者都命中时输出一条签名链共识信号，否则空数组。
     internal func signingChainSignals(from signals: [RiskSignal]) -> [RiskSignal] {
+        // 代码签名族阈值 22：低于该值的零散权限/校验信号不足以驱动共识。
         let codeSignature = strongestSignal(in: signals, threshold: 22) {
             [
                 "code_signature_invalid",
@@ -2451,6 +2606,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                 "sdk_code_signature_missing",
             ].contains($0.id)
         }
+        // 签名身份族阈值 18：身份不一致通常是重签的直接后果。
         let signingIdentity = strongestSignal(in: signals, threshold: 18) {
             [
                 ObfuscatedConstants.signalAppSigningIdentityTampered,
@@ -2496,6 +2652,9 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         ]
     }
 
+    /// 在满足谓词的信号中挑出最强一条。
+    /// 入选条件：`.tampered` 可越过阈值，其余必须达到 `threshold`；
+    /// 同分时比较 `weightHint`，再取分数最高者。
     private func strongestSignal(
         in signals: [RiskSignal],
         threshold: Double,
@@ -2511,8 +2670,12 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
             }
     }
 
-    /// Lightweight multi-family consensus; `internal` for `@testable` regression tests.
+    /// 轻量跨族一致性：PAC、VMRemap、TaskPort、dyld 共享缓存、dyld 拓扑、LLDB JIT 六族。
+    /// 至少两族命中才输出软共识信号；`internal` 以便 `@testable` 回归测试直接调用。
+    /// - Parameter signals: 已合并的原始信号。
+    /// - Returns: 一条软共识信号；不足两族时为空数组。
     func crossConsistencySignals(from signals: [RiskSignal]) -> [RiskSignal] {
+        // 每族的 (名称, 信号 id 集合, 入选阈值)；tampered 状态可越过阈值。
         let familyRules: [(family: String, ids: Set<String>, threshold: Double)] = [
             ("pac", [SignalID.pacDisabled, SignalID.pacPointerInvalid], 42),
             (ObfuscatedConstants.keywordVMRemap, [SignalID.vmRemapSharedAnonymous, SignalID.vmRemapImageAlias], 42),
@@ -2569,12 +2732,14 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
 
         let families = familyDrivers.keys.sorted()
         let matched = families.compactMap { familyDrivers[$0] }
+        // 两族起判；跨层（含 layer 1 直接观测）会略微提高置信度。
         guard families.count >= 2 else { return [] }
 
         let layers = Set(matched.compactMap(\.layer))
         let averageDriverScore = matched.reduce(0.0) { $0 + $1.score } / Double(matched.count)
         let hasLayer1 = layers.contains(1)
         let confidence = min(0.86, 0.52 + Double(families.count) * 0.08 + (hasLayer1 ? 0.04 : 0))
+        // 基础 20 + 每族 5 + 超过 40 分的驱动证据按 10% 追加，总分上限 44（保持软证据定位）。
         let score = min(20 + Double(families.count) * 5 + max(0, averageDriverScore - 40) * 0.10, 44)
 
         return [
@@ -2599,6 +2764,9 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
     }
 
     /// 在 `miePartial` / `mieFull` 时对少数高价值抗注入/内存族信号做**小幅**加分，并写入 `device_mie_level` 供服务端解释。
+    /// 加分幅度刻意很小（2/4 分）：MIE 姿态是环境属性，不能单独把软证据抬成硬结论。
+    /// - Parameter signals: 已完成关联/一致性的信号。
+    /// - Returns: 复制并加权后的信号；未启用或缺少 MIE 证据时原样返回。
     private func applyMiePostureWeighting(_ signals: [RiskSignal]) -> [RiskSignal] {
         guard configuration.enableMIEPosture else { return signals }
         guard let mie = signals.first(where: { $0.id == SignalID.miePosture }),
@@ -2632,6 +2800,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
                     weightHint: signal.weightHint
                 )
             }
+            // mieFull 比 miePartial 略高，但仍限制在个位数，避免环境因素主导判决。
             let deltaScore: Double = raw == MIEPostureDetector.Level.mieFull.rawValue ? 4 : 2
             let deltaHint: Double = raw == MIEPostureDetector.Level.mieFull.rawValue ? 2 : 1
             return RiskSignal(
@@ -2646,6 +2815,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
         }
     }
 
+    /// 允许受 MIE 姿态小幅加分的信号白名单（抗注入/内存完整性相关的高价值证据）。
     private static let mieBoostSignalIDs: Set<String> = [
         SignalID.fridaModuleDetected,
         SignalID.fridaModuleImage,
@@ -2674,7 +2844,7 @@ public final class AntiTamperingSignalProvider: RiskSignalProvider {
 
 extension AntiTamperingSignalProvider {
     
-    /// 创建高敏感度配置（严格检测）
+    /// 创建高敏感度配置（严格检测）：过滤阈值 0，保留全部信号。
     public static func strictConfiguration() -> Configuration {
         var config = Configuration()
         config.enableAntiTampering = true
@@ -2688,7 +2858,8 @@ extension AntiTamperingSignalProvider {
         return config
     }
     
-    /// 创建性能优先配置（只检测关键项）
+    /// 创建性能优先配置（只检测关键项）：关闭较慢的签名/内存/重映射检查，
+    /// 保留低开销的身份校验与 Watchdog，并用 15 分阈值过滤低价值信号。
     public static func performanceConfiguration() -> Configuration {
         var config = Configuration()
         config.enableAntiTampering = true
@@ -2712,7 +2883,13 @@ extension AntiTamperingSignalProvider {
 /// JailbreakConfig 扩展，支持反篡改检测
 extension JailbreakConfig {
     
-    /// 创建包含反篡改检测的配置
+    /// 创建包含反篡改检测的配置。
+    /// - Parameters:
+    ///   - threshold: 判越狱阈值，默认 30。
+    ///   - enableAntiTampering: 是否启用反篡改检测。
+    ///   - enableDebugger: 是否启用调试器检测。
+    ///   - enableFrida: 是否启用 Frida 检测。
+    /// - Returns: 启用全部旧版越狱路径的配置。
     public static func withAntiTampering(
         threshold: Double = 30,
         enableAntiTampering: Bool = true,

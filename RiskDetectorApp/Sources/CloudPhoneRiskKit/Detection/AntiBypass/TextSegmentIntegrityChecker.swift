@@ -1,3 +1,8 @@
+// 文本段完整性校验：首启计算 SDK 镜像 __TEXT.__text 的 SHA-256 作为基线，后续启动比对；
+// 优先使用服务端下发的参考哈希，缺失时回退 Keychain 本地基线。哈希变化 = 代码被 inline patch。
+// 通过 LC_ENCRYPTION_INFO 跳过加密镜像，并在“待确认窗口”内结合环境检查决定是否信任基线。
+// 所有 Keychain 项使用 kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly，换号重装后自动重建。
+
 import CryptoKit
 import Darwin
 import Foundation
@@ -5,8 +10,6 @@ import MachO
 import Security
 
 /// __TEXT.__text 代码段哈希完整性校验
-///
-/// SDK 4.4 Phase 6: Keychain 用 kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly；换号重装后基线自动重建。
 ///
 /// 自包含方案：首次运行时计算 SDK 镜像 __TEXT.__text 段的 SHA-256 摘要作为基线，
 /// 后续每次校验对比。哈希不一致 = 代码被 inline patch（函数替换、指令修改）。
@@ -17,12 +20,19 @@ import Security
 /// - 通过 LC_ENCRYPTION_INFO 检查加密状态，cryptid != 0 时跳过
 enum TextSegmentIntegrityChecker {
 
+    /// 文本段校验结果。
     struct IntegrityResult {
+        /// 是否完整；首启/升级/环境可疑等不可信窗口固定为 false。
         let isIntact: Bool
+        /// 用于比较的基线哈希（服务端参考值或本地记录）。
         let baselineHash: String
+        /// 本次实测的文本段哈希。
         let currentHash: String
+        /// 当前 SDK 版本号，与服务端参考表按版本匹配。
         let sdkVersion: String
+        /// __TEXT.__text 段大小（字节），便于后端判断镜像规模是否异常。
         let sectionSize: UInt64
+        /// 结果类型：intact / tampered / version_changed / baseline_established 等。
         let detail: String
         /// 是否使用服务端参考哈希完成校验（true=服务端锚点，false=Keychain 本地基线）
         let usedServerReference: Bool
@@ -32,13 +42,14 @@ enum TextSegmentIntegrityChecker {
         let referenceVersion: String?
     }
 
+    // 账号名是持久化契约；改名或版本升级会让旧基线失效并触发重建。
     private static let baselineAccount = "text_hash_baseline_v1"
     private static let versionAccount = "text_hash_version_v1"
     /// 首次建基线后标记为「待确认」，下次启动环境干净且哈希一致才视为可信
     private static let pendingAccount = "text_hash_pending_v1"
 
-    /// Main entry: verify text segment integrity
-    /// 优先使用服务端下发的参考哈希（RemoteConfig.textSegmentHashReference），Keychain 基线仅作本地辅助。
+    /// 主入口：校验文本段完整性。
+    /// 优先使用服务端下发的参考哈希（RemoteConfig.textSegmentReference），Keychain 基线仅作本地辅助。
     /// 无服务端参考时保持向后兼容，仍用 Keychain 本地基线。
     static func verify() -> IntegrityResult {
         let sdkVersion = Version.current
@@ -228,12 +239,15 @@ enum TextSegmentIntegrityChecker {
         )
     }
 
-    /// 从 RemoteConfig 解析当前 SDK 版本的服务端参考哈希
+    /// 从 RemoteConfig 解析当前 SDK 版本的服务端参考哈希。
+    /// 服务端锚点优先级最高：即使本地 Keychain 基线被攻击者改写，也无法伪造出服务端哈希。
     private static func resolveServerReferenceHash(for sdkVersion: String) -> TextSegmentReference? {
         CPRiskKit.shared.resolveTextSegmentReference(for: sdkVersion)
     }
 
-    /// Convert result to RiskSignals
+    /// 把校验结果转换为 `RiskSignal`。
+    /// - 加密镜像不产出信号（无法哈希，属正常分发形态）。
+    /// - 首启/版本变化给软信号；篡改与环境可疑给 tampered 状态的高权重信号。
     static func asSignals(result: IntegrityResult) -> [RiskSignal] {
         switch result.detail {
         case "encrypted_skip":
@@ -356,9 +370,9 @@ enum TextSegmentIntegrityChecker {
         }
     }
 
-    // MARK: - Internal Helpers
+    // MARK: - 内部辅助
 
-    /// Find CloudPhoneRiskKit's Mach-O header and dyld index
+    /// 在已加载镜像中按路径名定位 CloudPhoneRiskKit，返回其 Mach-O 头与 dyld 索引。
     private static func findSDKImage() -> (header: UnsafeRawPointer, index: UInt32)? {
         let count = _dyld_image_count()
         for index in 0..<count {
@@ -372,7 +386,9 @@ enum TextSegmentIntegrityChecker {
         return nil
     }
 
-    /// Compute SHA-256 of __TEXT.__text section
+    /// 计算 __TEXT.__text 的 SHA-256。
+    /// 地址按 slide 修正后指向运行期真实字节；大小限制 50 MB 是防御性上限，
+    /// 避免损坏的段头导致巨量读取或整数溢出。
     static func hashTextSection(header: UnsafeRawPointer, imageIndex: UInt32) -> (hash: String, size: UInt64)? {
         let ptr = header.assumingMemoryBound(to: mach_header_64.self)
         guard ptr.pointee.magic == MH_MAGIC_64 || ptr.pointee.magic == MH_CIGAM_64 else {
@@ -394,6 +410,7 @@ enum TextSegmentIntegrityChecker {
                         if tupleStringEquals(sect.pointee.sectname, "__text") {
                             let addr = UInt64(Int64(sect.pointee.addr) + slide)
                             let size = sect.pointee.size
+                            // 非法/超大段直接放弃：宁可返回 nil（记 hash_failed），也不做不可控读取。
                             guard size > 0, size < 50 * 1024 * 1024,
                                   addr > 0, addr <= UInt64(UInt.max) else { return nil }
                             guard let bytes = UnsafeRawPointer(bitPattern: UInt(addr)) else {
@@ -413,7 +430,8 @@ enum TextSegmentIntegrityChecker {
         return nil
     }
 
-    /// Check LC_ENCRYPTION_INFO / LC_ENCRYPTION_INFO_64 cryptid
+    /// 检查 LC_ENCRYPTION_INFO / LC_ENCRYPTION_INFO_64 的 cryptid。
+    /// cryptid != 0 表示镜像仍处于 App Store 加密态，内存内容不可比，需跳过哈希校验。
     static func isEncrypted(header: UnsafeRawPointer) -> Bool {
         let ptr = header.assumingMemoryBound(to: mach_header_64.self)
         guard ptr.pointee.magic == MH_MAGIC_64 || ptr.pointee.magic == MH_CIGAM_64 else {
@@ -439,6 +457,7 @@ enum TextSegmentIntegrityChecker {
         return false
     }
 
+    /// 读取本地基线（哈希 + 二进制 UUID）；任一缺失或为空均视为无基线。
     static func loadBaseline() -> (hash: String, version: String)? {
         guard let hash = keychainRead(account: baselineAccount),
               let version = keychainRead(account: versionAccount),
@@ -449,6 +468,7 @@ enum TextSegmentIntegrityChecker {
         return (hash, version)
     }
 
+    /// 保存基线；哈希与版本必须同时写入，避免只更新一半导致下一次比较失真。
     static func saveBaseline(hash: String, version: String) {
         _ = keychainSave(account: baselineAccount, value: hash)
         _ = keychainSave(account: versionAccount, value: version)
@@ -460,21 +480,26 @@ enum TextSegmentIntegrityChecker {
         _ = keychainDelete(account: versionAccount)
     }
 
+    /// 读取「待确认」标记；只有字面量 "1" 视为待确认。
     static func loadPending() -> Bool {
         keychainRead(account: pendingAccount) == "1"
     }
 
+    /// 标记基线进入待确认窗口，下次启动确认哈希与环境后才转正。
     private static func savePending() {
         _ = keychainSave(account: pendingAccount, value: "1")
     }
 
+    /// 清除待确认标记（基线被确认或判定不可信后调用）。
     private static func clearPending() {
         _ = keychainDelete(account: pendingAccount)
     }
 
+    // Keychain 配置集中在此，便于审计访问级别；所有项都不随备份迁移到其他设备。
     private static let keychainService = "CloudPhoneRiskKit"
     private static let keychainAccessible = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
+    /// 读取指定账号的 UTF-8 字符串；条目不存在或读取失败返回 nil。
     private static func keychainRead(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -489,6 +514,7 @@ enum TextSegmentIntegrityChecker {
         return String(data: data, encoding: .utf8)
     }
 
+    /// 更新或新增 Keychain 字符串条目；返回是否写入成功。
     private static func keychainSave(account: String, value: String) -> Bool {
         let data = Data(value.utf8)
         let query: [String: Any] = [
@@ -509,6 +535,7 @@ enum TextSegmentIntegrityChecker {
         return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
     }
 
+    /// 删除 Keychain 条目；条目本就不存在也视为成功（幂等清理）。
     private static func keychainDelete(account: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -519,7 +546,7 @@ enum TextSegmentIntegrityChecker {
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
-    /// Extract LC_UUID for version tracking
+    /// 提取 LC_UUID，用作基线的版本标识；无该命令返回 nil。
     static func binaryUUID(header: UnsafeRawPointer) -> String? {
         let ptr = header.assumingMemoryBound(to: mach_header_64.self)
         guard ptr.pointee.magic == MH_MAGIC_64 || ptr.pointee.magic == MH_CIGAM_64 else {
@@ -541,6 +568,8 @@ enum TextSegmentIntegrityChecker {
     }
 }
 
+/// 比较 Mach-O 段名/节名这类固定长度 C 字符数组与目标字符串。
+/// 用 strncmp 限定在数组长度内，避免段名未以 NUL 结尾时越界读取。
 private func tupleStringEquals<T>(_ tuple: T, _ target: String) -> Bool {
     withUnsafePointer(to: tuple) { ptr in
         ptr.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { cPtr in

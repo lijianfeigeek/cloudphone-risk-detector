@@ -1,3 +1,6 @@
+// 信号压缩器：把多维 RiskSignal 列表压成固定 9 字节摘要，供上报时降低体积与可读性。
+// 摘要按四个风险层各取 8 bit，再附跨层关联位与行为熵；相同输入必得相同输出。
+
 import Foundation
 
 // MARK: - 内存语义压缩模块
@@ -9,18 +12,25 @@ import Foundation
 /// - 使用 SecureBuffer 承载敏感中间结果，用完即焚
 /// - 确定性：相同输入 → 相同输出
 
+/// 风险信号的分层压缩器。
+/// 纯函数式实现（不持有可变状态），可安全并发调用；输出字节序由 `mappingVersion` 约定。
 public enum SignalCompressor {
 
     /// 映射表版本，服务端需用同一版本解码
     public static let mappingVersion = "1.2"
+    // 混淆存储的 tampering_detected 信号 ID，避免明文字面量被静态检索。
     private static let signalTamperingDetectedID = StringDeobfuscator.base64Decode("dGFtcGVyaW5nX2RldGVjdGVk")
+    // 越狱设备信号 ID 由混淆常量拼接而成，保持与检测器输出一致。
     private static let signalJailbreakDeviceID = "\(ObfuscatedConstants.signalJailbreak)_device"
 
     /// 压缩结果：9 字节固定长度摘要（1.1：byte8 扩展跨层 + 行为熵迁移）
     public struct CompressResult: Sendable {
+        /// 固定 9 字节二进制摘要，不包含可读信号名。
         public let digest: Data
+        /// 解码所需的映射版本；上报时必须随摘要一起发送。
         public let mappingVersion: String
 
+        /// 摘要的小写十六进制表示（18 个字符），便于日志与 JSON 传输。
         public var digestHex: String {
             digest.map { String(format: "%02x", $0) }.joined()
         }
@@ -30,23 +40,28 @@ public enum SignalCompressor {
     /// - Parameter signals: 风险信号列表（collectSignals 完成后的完整列表）
     /// - Returns: 压缩摘要与映射版本
     public static func compress(signals: [RiskSignal]) -> CompressResult {
+        // 每层独立扫描一次信号 ID，把该层关注的信号映射到 8 个 bit。
         let layer1 = layer1Summary(signals: signals)
         let layer2 = layer2Summary(signals: signals)
         let layer3 = layer3Summary(signals: signals)
         let layer4 = layer4Summary(signals: signals)
         let (crossLayer, extendedByte) = crossLayerBits(signals: signals)
 
+        // 用 SecureBuffer 暂存摘要，避免中间字节在堆上长期驻留。
         let digest = SecureBuffer(size: 9).use { ptr in
             let bytes = ptr.assumingMemoryBound(to: UInt8.self)
             bytes[0] = layer1
             bytes[1] = layer2
             bytes[2] = layer3
             bytes[3] = layer4
+            // crossLayer 为大端序写入 bytes 4-7，保证跨端解码一致。
             bytes[4] = UInt8((crossLayer >> 24) & 0xFF)
             bytes[5] = UInt8((crossLayer >> 16) & 0xFF)
             bytes[6] = UInt8((crossLayer >> 8) & 0xFF)
             bytes[7] = UInt8(crossLayer & 0xFF)
+            // byte 8：行为熵档位（低 3 bit）。
             bytes[8] = extendedByte
+            // 在 SecureBuffer 清零前复制出最终结果。
             return Data(bytes: ptr, count: 9)
         }
 
@@ -55,9 +70,11 @@ public enum SignalCompressor {
 
     // MARK: - Layer 摘要
 
-    /// Layer1 硬件层：云手机、GPU、BoardID、DRM、指纹、挂载等
+    /// Layer1 硬件层：云手机、GPU、BoardID、DRM、指纹、挂载等。
+    /// 每个 bit 聚合一组同源信号，只要命中一条就置位。
     private static func layer1Summary(signals: [RiskSignal]) -> UInt8 {
         var bits: UInt8 = 0
+        // 先转 Set，避免在十余次 contains 中反复线性扫描。
         let ids = Set(signals.map(\.id))
 
         if ids.contains("gpu_virtual") { bits |= 0x01 }
@@ -80,6 +97,7 @@ public enum SignalCompressor {
         if ids.contains(ObfuscatedConstants.signalHookDetected) || ids.contains(Self.signalTamperingDetectedID) { bits |= 0x01 }
         if ids.contains("cross_layer_inconsistency") { bits |= 0x02 }
         if ids.contains(ObfuscatedConstants.signalJailbreak) || ids.contains(Self.signalJailbreakDeviceID) { bits |= 0x04 }
+        // 所有 Frida 变体收敛到同一 bit，避免同类证据重复占位。
         if ids.contains(ObfuscatedConstants.signalFridaDetected)
             || ids.contains(ObfuscatedConstants.signalFridaJSEngineHeap)
             || ids.contains(ObfuscatedConstants.signalFridaUnixSocket)
@@ -148,6 +166,7 @@ public enum SignalCompressor {
         if hasL2Tampered { bits |= 0x0002 }
         if hasL3Virtual { bits |= 0x0004 }
         if ids.contains("cross_layer_inconsistency") { bits |= 0x0008 }
+        // tampered 数量按 1/2/3+ 三档编码，避免数量波动影响高层语义。
         if tamperedCount >= 1 { bits |= 0x0010 }
         if tamperedCount >= 2 { bits |= 0x0020 }
         if tamperedCount >= 3 { bits |= 0x0040 }
@@ -166,6 +185,7 @@ public enum SignalCompressor {
         if ids.contains("no_cellular_provider") { bits |= 0x8000 }
 
         // 行为熵量化：0-7 档，迁移至 extendedByte bits 0-2
+        // 只按 behavior 类信号条数分档，超过 7 条统一封顶，避免高位溢出。
         let behaviorEntropy = min(7, signals.filter { $0.category == "behavior" }.count)
         let extendedByte = UInt8(behaviorEntropy & 0x07)
 

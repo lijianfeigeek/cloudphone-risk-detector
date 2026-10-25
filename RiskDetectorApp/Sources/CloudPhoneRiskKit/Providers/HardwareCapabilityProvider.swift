@@ -20,6 +20,8 @@ final class HardwareCapabilityProvider: RiskSignalProvider {
 
     let id = "hardware_capability"
 
+    /// 模拟器返回空；真机依次检查触感、刷新率与接近传感器能力。
+    /// UI 相关检查派发到主线程；接近传感器检查刻意留在后台线程以避免死锁。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []
@@ -37,13 +39,11 @@ final class HardwareCapabilityProvider: RiskSignalProvider {
         }
         out.append(contentsOf: uiSignals)
 
-        // proximitySensorSignal must NOT run on the main thread: it uses
-        // DispatchQueue.main.asyncAfter + semaphore.wait internally.  When called
-        // from the main thread (via runOnMainIfNeeded), the main queue is blocked by
-        // semaphore.wait so the asyncAfter closure can never fire → guaranteed 1-second
-        // timeout → false-positive proximity_sensor_absent on every invocation.
-        // Call it directly here (background thread) instead; UIDevice accesses inside
-        // are guarded with DispatchQueue.main.sync.
+        // proximitySensorSignal 绝对不能在主线程执行：它内部使用
+        // DispatchQueue.main.asyncAfter + semaphore.wait，若经 runOnMainIfNeeded 在主线程调用，
+        // 主队列会被 semaphore.wait 阻塞，asyncAfter 永不触发，必然 1s 超时，
+        // 从而每次调用都误报 proximity_sensor_absent。
+        // 因此这里直接在后台线程调用；其内部对 UIDevice 的访问由 DispatchQueue.main.sync 保护。
         if let s = proximitySensorSignal(machine: machine) {
             out.append(s)
         }
@@ -67,7 +67,7 @@ final class HardwareCapabilityProvider: RiskSignalProvider {
         return Sysctl.string("hw.machine") ?? ""
     }
 
-    // MARK: - Haptic Engine
+    // MARK: - 触感引擎
 
     /// iPhone 7+ (iPhone9,x 及更新) 应支持 haptics。
     /// 若机型 >= 7 但 supportsHaptics = false -> haptic_capability_mismatch
@@ -107,7 +107,7 @@ final class HardwareCapabilityProvider: RiskSignalProvider {
         return major >= 9
     }
 
-    // MARK: - Refresh Rate
+    // MARK: - 刷新率
 
     /// iPhone 14/15/16 Pro 系列应有 120Hz。若声称 Pro 但 maxFPS=60 -> refresh_rate_mismatch
     private func refreshRateSignal(machine: String) -> RiskSignal? {
@@ -150,30 +150,26 @@ final class HardwareCapabilityProvider: RiskSignalProvider {
         Self.pro120HzMachineIdentifiers.contains(machine.lowercased())
     }
 
-    // MARK: - Proximity Sensor
+    // MARK: - 接近传感器
 
     /// 接近传感器：iPhone 应支持。若无法启用则 proximity_sensor_absent
     /// 设置 isProximityMonitoringEnabled 后需延迟确认（系统有启用延迟），0.5s 足够。
     /// 检测后必须恢复为 false，否则会影响通话等场景的屏幕熄灭逻辑。
     private func proximitySensorSignal(machine: String) -> RiskSignal? {
         #if canImport(UIKit)
-        // Guard: if we are already on the main thread we cannot block it with
-        // semaphore.wait while scheduling work on the main queue – that would
-        // guarantee a 1-second timeout and a false-positive signal every time.
-        // Skip the check in this case rather than report a bogus result.
+        // 防御：若当前已在主线程，不能用 semaphore.wait 阻塞主队列去等待主队列任务，
+        // 否则必然 1s 超时并产生误报；此时直接跳过检测，不返回伪造结果。
         guard !Thread.isMainThread else { return nil }
         guard machine.lowercased().hasPrefix("iphone") else { return nil }
 
         let device = UIDevice.current
-        // UIDevice must be mutated on the main thread.
+        // UIDevice 的属性必须在主线程修改。
         DispatchQueue.main.sync { device.isProximityMonitoringEnabled = true }
 
         let semaphore = DispatchSemaphore(value: 0)
         var enabled = false
-        // Use a global (background) asyncAfter so that semaphore.wait (on the
-        // current background thread) does not block the main queue.  Reading and
-        // restoring isProximityMonitoringEnabled still happens on the main thread
-        // via an inner main.sync.
+        // 使用全局后台队列的 asyncAfter，避免当前后台线程的 semaphore.wait 阻塞主队列；
+        // 读取与恢复 isProximityMonitoringEnabled 仍通过内部的 main.sync 在主线程完成。
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
             DispatchQueue.main.sync {
                 enabled = device.isProximityMonitoringEnabled

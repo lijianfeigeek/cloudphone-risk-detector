@@ -1,16 +1,26 @@
+// 云手机/虚拟环境本地特征：把设备、行为、时序三组判定打包为可上报的
+// `CloudPhoneLocalSignals`（短键编码 d/b/t），供服务端做云手机画像与策略决策。
+// 每个特征都是 `DetectionSignal`（detected + method + evidence + confidence），
+// 强调可解释、可复核，不在本地直接下结论；样本不足时按未命中处理。
 import Foundation
 
+/// 云手机本地信号集合：设备（模拟器/老机型）、行为（触摸/运动）、时序（24h 活动）。
 public struct CloudPhoneLocalSignals: Codable, Sendable {
+    /// 设备层特征
     public var device: CloudPhoneDeviceSignals
+    /// 行为层特征
     public var behavior: CloudPhoneBehaviorSignals
+    /// 时序层特征
     public var time: CloudPhoneTimeSignals
 
+    // 短键压缩上报体积：d=device、b=behavior、t=time。
     private enum CodingKeys: String, CodingKey {
         case device = "d"
         case behavior = "b"
         case time = "t"
     }
 
+    /// 创建信号集合；三组均为必填，缺省能力由各组内部以 detected=false 表达。
     public init(
         device: CloudPhoneDeviceSignals,
         behavior: CloudPhoneBehaviorSignals,
@@ -22,15 +32,20 @@ public struct CloudPhoneLocalSignals: Codable, Sendable {
     }
 }
 
+/// 设备层特征：模拟器检测与老机型启发式（云手机农场常用旧机型）。
 public struct CloudPhoneDeviceSignals: Codable, Sendable {
+    /// 是否运行在模拟器（targetEnvironment 或指纹命中）
     public var isSimulator: DetectionSignal<[String: String]>
+    /// 老机型启发式；nil 表示机型无法解析或未检测
     public var oldDeviceModel: DetectionSignal<[String: String]>?
 
+    // 短键：is=isSimulator、od=oldDeviceModel。
     private enum CodingKeys: String, CodingKey {
         case isSimulator = "is"
         case oldDeviceModel = "od"
     }
 
+    /// 创建设备层信号；oldDeviceModel 可缺省。
     public init(
         isSimulator: DetectionSignal<[String: String]>,
         oldDeviceModel: DetectionSignal<[String: String]>?
@@ -40,16 +55,26 @@ public struct CloudPhoneDeviceSignals: Codable, Sendable {
     }
 }
 
+/// 行为层特征：与 `RiskScorer` 的行为启发式同源，但输出为可上报的判定对象。
 public struct CloudPhoneBehaviorSignals: Codable, Sendable {
+    /// 触摸坐标离散度过低（落点集中）
     public var touchSpreadLow: DetectionSignal<[String: String]>
+    /// 触摸坐标离散度过高（落点发散）
     public var touchSpreadHigh: DetectionSignal<[String: String]>
+    /// 点击间隔过于规律
     public var touchIntervalTooRegular: DetectionSignal<[String: String]>
+    /// 点击间隔过于混乱
     public var touchIntervalTooChaotic: DetectionSignal<[String: String]>
+    /// 滑动轨迹过于笔直
     public var swipeTooLinear: DetectionSignal<[String: String]>
+    /// 滑动轨迹过于弯曲
     public var swipeTooCurvy: DetectionSignal<[String: String]>
+    /// 设备过于静止
     public var motionTooStill: DetectionSignal<[String: String]>
+    /// 触摸与运动弱耦合
     public var touchMotionWeakCoupling: DetectionSignal<[String: String]>
 
+    // 短键：sl/sh/tr/tc/wl/wc/ms/wk，与服务端解析约定一致。
     private enum CodingKeys: String, CodingKey {
         case touchSpreadLow = "sl"
         case touchSpreadHigh = "sh"
@@ -61,6 +86,7 @@ public struct CloudPhoneBehaviorSignals: Codable, Sendable {
         case touchMotionWeakCoupling = "wk"
     }
 
+    /// 创建行为层信号；八个特征均需提供（无样本时内部标记 detected=false）。
     public init(
         touchSpreadLow: DetectionSignal<[String: String]>,
         touchSpreadHigh: DetectionSignal<[String: String]>,
@@ -82,12 +108,18 @@ public struct CloudPhoneBehaviorSignals: Codable, Sendable {
     }
 }
 
+/// 时序层特征：24 小时窗口内的调用量、活跃小时覆盖、夜间占比与平均间隔。
 public struct CloudPhoneTimeSignals: Codable, Sendable {
+    /// 24h 事件量过高
     public var highVolume24h: DetectionSignal<[String: String]>
+    /// 24h 活跃小时覆盖过宽（近乎全天候）
     public var wideHourCoverage24h: DetectionSignal<[String: String]>
+    /// 24h 夜间活动占比过高
     public var nightActivityHigh24h: DetectionSignal<[String: String]>
+    /// 24h 事件频率过高（平均间隔过短）
     public var highFrequency24h: DetectionSignal<[String: String]>
 
+    // 短键：hv/wh/na/hf。
     private enum CodingKeys: String, CodingKey {
         case highVolume24h = "hv"
         case wideHourCoverage24h = "wh"
@@ -95,6 +127,7 @@ public struct CloudPhoneTimeSignals: Codable, Sendable {
         case highFrequency24h = "hf"
     }
 
+    /// 创建时序层信号；无历史时由 builder 填入 detected=false 的低置信度对象。
     public init(
         highVolume24h: DetectionSignal<[String: String]>,
         wideHourCoverage24h: DetectionSignal<[String: String]>,
@@ -108,7 +141,10 @@ public struct CloudPhoneTimeSignals: Codable, Sendable {
     }
 }
 
+/// 从 `DeviceFingerprint`/`BehaviorSignals`/`TimePattern` 构建上报用本地特征。
+/// 所有阈值写死以保证跨端一致；样本不足/无历史时返回 detected=false 的低置信度信号。
 enum CloudPhoneLocalSignalsBuilder {
+    /// 组装三组特征；`timePattern` 为 nil（无历史）时四个时序特征均标记为未检测。
     static func build(device: DeviceFingerprint, behavior: BehaviorSignals, timePattern: TimePattern?) -> CloudPhoneLocalSignals {
         let deviceSignals = CloudPhoneDeviceSignals(
             isSimulator: DetectionSignal(
@@ -144,6 +180,8 @@ enum CloudPhoneLocalSignalsBuilder {
         return CloudPhoneLocalSignals(device: deviceSignals, behavior: behaviorSignals, time: timeSignals)
     }
 
+    /// 老机型启发式：iPhone 代数 ≤11（iPhone X/8 及更早）视为更可能来自设备农场。
+    /// - 无法解析机型时返回 detected=false、confidence=.weak，并在 evidence 记录 note。
     private static func oldDeviceModelSignal(machine: String?) -> DetectionSignal<[String: String]>? {
         guard let machine else { return nil }
         guard let family = parseIPhoneFamily(machine) else {
@@ -155,8 +193,8 @@ enum CloudPhoneLocalSignalsBuilder {
             )
         }
 
-        // Rough heuristic for cloud phone device farms: older families are more common.
-        // iPhone10.* == iPhone X/8 era; treat <= 11 as "old" for now.
+        // 云手机农场的经验特征：新机型成本高，旧机型占比更高。
+        // iPhone10.* 对应 iPhone X/8 时代，目前把 ≤11 视为“老机型”。
         let detected = family <= 11
         return DetectionSignal(
             detected: detected,
@@ -170,6 +208,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 从 "iPhone13,2" 这类 hw.machine 提取主代数（13）；非 iPhone 前缀返回 nil。
     private static func parseIPhoneFamily(_ machine: String) -> Int? {
         guard machine.hasPrefix("iPhone") else { return nil }
         let rest = machine.dropFirst("iPhone".count)
@@ -180,7 +219,9 @@ enum CloudPhoneLocalSignalsBuilder {
         return Int(digits)
     }
 
+    /// 坐标离散度低于 2.0 且点击样本 ≥6：落点过于集中，像脚本固定坐标。
     private static func touchSpreadLowSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
+        // 至少 6 次点击才统计，避免单点噪声；阈值 2.0 为体验校准值。
         let minTaps = 6
         let threshold = 2.0
         let spread = behavior.touch.coordinateSpread
@@ -198,6 +239,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 坐标离散度高于 10.0 且点击样本 ≥6：落点过于发散，像随机注入。
     private static func touchSpreadHighSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minTaps = 6
         let threshold = 10.0
@@ -216,6 +258,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 点击间隔 CV 低于 0.2 且样本 ≥6：节奏过于机械。
     private static func touchIntervalTooRegularSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minTaps = 6
         let threshold = 0.2
@@ -234,6 +277,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 点击间隔 CV 高于 0.6 且样本 ≥6：节奏不符合人类操作。
     private static func touchIntervalTooChaoticSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minTaps = 6
         let threshold = 0.6
@@ -252,6 +296,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 滑动平均线性度高于 0.98 且样本 ≥3：轨迹近似直线插值。
     private static func swipeTooLinearSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minSwipes = 3
         let threshold = 0.98
@@ -270,6 +315,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 滑动平均线性度低于 0.90 且样本 ≥3：轨迹过于弯曲或由曲线合成。
     private static func swipeTooCurvySignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minSwipes = 3
         let threshold = 0.90
@@ -288,6 +334,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 静止率高于 0.98 且操作 ≥10：设备几乎不动，常见于真机托管/云手机。
     private static func motionTooStillSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minActions = 10
         let threshold = 0.98
@@ -307,6 +354,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 触摸-运动相关性低于 0.10、操作 ≥10 且静止率高于 0.95：有触摸输入但传感器无响应。
     private static func touchMotionWeakCouplingSignal(behavior: BehaviorSignals) -> DetectionSignal<[String: String]> {
         let minActions = 10
         let minStillness = 0.95
@@ -314,6 +362,7 @@ enum CloudPhoneLocalSignalsBuilder {
         let corr = behavior.touchMotionCorrelation
         let still = behavior.motion.stillnessRatio
         let actions = behavior.actionCount
+        // 三个条件同时成立才命中，降低“用户坐着操作”造成的误报。
         let detected =
             (corr ?? .greatestFiniteMagnitude) < threshold &&
             actions >= minActions &&
@@ -333,10 +382,12 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 24h 事件量 ≥200 命中；≥500 提升为 strong。
     private static func highVolume24hSignal(pattern: TimePattern?) -> DetectionSignal<[String: String]> {
         guard let pattern else {
             return DetectionSignal(detected: false, method: "history_24h", evidence: ["note": "no_history"], confidence: .weak)
         }
+        // 200/500 是分档阈值：普通用户远低于 200，脚本/农场通常数百以上。
         let high = 500
         let medium = 200
         let detected = pattern.events24h >= medium
@@ -353,6 +404,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 活跃小时覆盖 ≥18 且事件 ≥80：近乎全天候活动，不符合个人设备作息。
     private static func wideHourCoverage24hSignal(pattern: TimePattern?) -> DetectionSignal<[String: String]> {
         guard let pattern else {
             return DetectionSignal(detected: false, method: "history_24h", evidence: ["note": "no_history"], confidence: .weak)
@@ -373,6 +425,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 夜间事件占比高于 0.4 且事件 ≥80：夜间活动异常，常见于跨时区托管。
     private static func nightActivityHigh24hSignal(pattern: TimePattern?) -> DetectionSignal<[String: String]> {
         guard let pattern else {
             return DetectionSignal(detected: false, method: "history_24h", evidence: ["note": "no_history"], confidence: .weak)
@@ -394,6 +447,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 平均事件间隔低于 8 秒且事件 ≥80：调用频率过高，像脚本批量操作。
     private static func highFrequency24hSignal(pattern: TimePattern?) -> DetectionSignal<[String: String]> {
         guard let pattern else {
             return DetectionSignal(detected: false, method: "history_24h", evidence: ["note": "no_history"], confidence: .weak)
@@ -415,6 +469,7 @@ enum CloudPhoneLocalSignalsBuilder {
         )
     }
 
+    /// 过滤 nil 值，保证 evidence 只包含有效字段。
     private static func compactMap(_ kv: [String: String?]) -> [String: String] {
         var out: [String: String] = [:]
         for (k, v) in kv {
@@ -424,6 +479,7 @@ enum CloudPhoneLocalSignalsBuilder {
         return out
     }
 
+    /// 统一保留 4 位小数；NaN/Inf 原样输出，便于服务端识别异常值。
     private static func format(_ d: Double) -> String {
         if d.isNaN || d.isInfinite { return "\(d)" }
         return String(format: "%.4f", d)

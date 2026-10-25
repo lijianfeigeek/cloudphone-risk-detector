@@ -2,12 +2,22 @@ import CRiskCore
 import Foundation
 import Darwin
 
+// 分层一致性 Provider（layer 2/3）。
+// 组合反篡改（关键 libc 符号 inline hook、sysctl/getpid 时序异常）与
+// 行为熵（传感器静止、触摸压感/半径恒定、触摸-运动解耦）两类证据。
+// 输出 `hook_detected`、`timing_anomaly`、`sensor_entropy`、`touch_entropy`、
+// `touch_motion_decoupling`，用于识别 Frida/注入框架与 CVD 云手机的合成输入。
+
+/// 反篡改与行为熵联合检测器。
+/// - 关键符号来自 libc，hook 检测依赖 `LibcPrologueGuard` 的 16 字节 trampoline 匹配；
+/// - 行为信号读取 `RiskSnapshot.behavior`，样本不足时输出 `.unavailable` 而非猜测。
 final class LayeredConsistencyProvider: RiskSignalProvider {
     static let shared = LayeredConsistencyProvider()
     private init() {}
 
     let id = "layered_consistency"
 
+    // 攻击者最常 hook 的 libc 符号；其中 sysctl/getenv 被篡改会直接影响设备指纹采集。
     private static let criticalSymbols: [String] = [
         "sysctlbyname",
         "sysctl",
@@ -16,6 +26,7 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         ObfuscatedConstants.denyAttachToken,
     ]
 
+    /// 依次执行反篡改与行为熵检查，输出顺序可按策略扰动。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         let planner = MutationPlanner(
             strategy: activeMutationStrategy(),
@@ -40,6 +51,7 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         return planner.maybeShuffle(out, salt: "layer23_emit_order")
     }
 
+    /// 从远程策略读取变异参数；无策略时返回 nil。
     private func activeMutationStrategy() -> MutationStrategy? {
         guard let mutation = PolicyManager.shared.activePolicy?.mutation else { return nil }
         return MutationStrategy(
@@ -50,6 +62,10 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         )
     }
 
+    /// 检查关键 libc 符号是否被 inline hook。
+    /// - 无命中：输出 `hook_detected` 的 negative（hard detected:false）；
+    /// - 命中 sysctl/sysctlbyname：视为 critical，给 hard；其他符号给 soft(0.7)；
+    /// - 同时输出 `tampering_detected`（state .tampered）供上层聚合。
     private func detectPrologueIntegrity() -> [RiskSignal] {
         var tampered: [String] = []
         for symbol in Self.criticalSymbols {
@@ -77,6 +93,7 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         }
 
         let hasCriticalHook = tampered.contains("sysctlbyname") || tampered.contains("sysctl")
+        // sysctl 被 hook 会污染几乎所有设备指纹，按 hard 处理；其余符号仅 soft。
         let hookState: RiskSignalState = hasCriticalHook ? .hard(detected: true) : .soft(confidence: 0.7)
 
         return [
@@ -103,6 +120,8 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
 
     /// 动态基线比值检测：先对 getpid 采样建立基准，再用 sysctl_median/getpid_median 比值判断。
     /// 避免 50μs 绝对值在低端机/冷启动时误报，与 KernelHookSideChannel 对齐。
+    /// 检查 getpid/sysctl 调用耗时比值是否异常。
+    /// 各采样 24 次取中位数，避免单次抖动；比值无量纲，不受机型性能影响。
     private func detectTimingAnomaly() -> RiskSignal? {
         let sampleCount = 24
         let getpidMedianNs = measureGetpidMedianNanoseconds(sampleCount: sampleCount)
@@ -115,6 +134,7 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         guard ratio > 15 else { return nil }
 
         let confidence = min(0.9, ratio / 30.0)
+        // 比值越高说明 sysctl 路径被额外拦截/转发，置信度随比值增长，上限 0.9。
         return RiskSignal(
             id: "timing_anomaly",
             category: ObfuscatedConstants.categoryAntiTamper,
@@ -126,6 +146,10 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         )
     }
 
+    /// 传感器熵：真实设备在用户操作时会有持续微动；
+    /// 运动能量接近 0 且“几乎静止”比例极高时，提示传感器被固定/合成。
+    /// - 无运动样本时返回 `.unavailable`；
+    /// - 低噪声 + 高静止各贡献部分置信度，二者叠加才明显。
     private func detectSensorEntropy(snapshot: RiskSnapshot) -> RiskSignal? {
         let motion = snapshot.behavior.motion
         guard motion.sampleCount > 0 else {
@@ -142,7 +166,9 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
 
         let stillness = motion.stillnessRatio ?? 0
         let energy = motion.motionEnergy ?? 0
+        // 1e-7 是经验噪声门槛：低于此值基本可视为传感器无有效读数。
         let lowNoise = energy < 1e-7
+        // 已有 10 次以上操作仍 99.9% 静止，不符合真人触摸时的自然手部微动。
         let suspiciousStillness = stillness > 0.999 && snapshot.behavior.actionCount >= 10
         let confidence = (lowNoise ? 0.45 : 0) + (suspiciousStillness ? 0.35 : 0)
 
@@ -160,6 +186,10 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         )
     }
 
+    /// 触摸熵：检查压感方差与接触半径方差是否同时接近 0。
+    /// 真实手指按压的力度/接触面积会有细微变化；ADB/virtio 注入事件常为固定值。
+    /// - 样本 < 10 或缺少压感/半径数据时返回 `.unavailable`；
+    /// - 两个方差同时极小才给 0.75 置信度。
     private func detectTouchEntropy(snapshot: RiskSnapshot) -> RiskSignal? {
         let touch = snapshot.behavior.touch
         guard touch.sampleCount >= 10 else {
@@ -186,6 +216,7 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
             )
         }
 
+        // 1e-10 / 0.01 为经验阈值：低于该量级说明压感与接触面积几乎没有变化。
         let virtualTouch = forceVar < 1e-10 && radiusVar < 0.01
         let confidence = virtualTouch ? 0.75 : 0
         return RiskSignal(
@@ -241,6 +272,8 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         )
     }
 
+    /// 测量 `cprisk_getpid_direct` 的中位耗时（纳秒）。
+    /// 使用 mach_absolute_time 与 timebase 换算，先排序再取中位数以抵抗离群值。
     private func measureGetpidMedianNanoseconds(sampleCount: Int) -> Double {
         guard sampleCount > 0 else { return 0 }
         var values: [UInt64] = []
@@ -261,6 +294,8 @@ final class LayeredConsistencyProvider: RiskSignalProvider {
         return Double(values[sampleCount / 2])
     }
 
+    /// 测量 `sysctlbyname("hw.machine")` 的中位耗时（纳秒）。
+    /// 与 getpid 基线相除得到无量纲比值，供 hook 判定使用。
     private func measureSysctlMedianNanoseconds(sampleCount: Int) -> Double {
         guard sampleCount > 0 else { return 0 }
         var values: [UInt64] = []

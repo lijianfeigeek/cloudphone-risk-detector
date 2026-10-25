@@ -1,3 +1,6 @@
+// CRiskCore 桥接层：按编译期索引把 C armor 内核导出的函数指针解析为 Swift 可调用的 C 函数。
+// Swift 侧不直接链接这些符号，既降低导入表暴露面，也便于 C 侧统一裁剪/门控测试钩子。
+
 import CRiskCore
 import Foundation
 
@@ -11,9 +14,18 @@ import Foundation
 /// Swift 侧已保证：即使 C 侧符号存在，Swift 也无调用路径。
 /// 另：`CPRISKKIT_ARMOR_ROOT_KEY_HEX` 是密钥供给路径（非测试开关），不在此列。
 enum CRiskCoreBridge {
+    // 保护 cache 的读写；解析通常只发生在首次调用，锁竞争可忽略。
     private static let lock = NSLock()
+    // 索引 → 已解析函数地址缓存；避免每次调用都走一次桥接表查找。
     private static var cache: [UInt32: UnsafeMutableRawPointer] = [:]
 
+    /// 把编译期桥接索引解析为具体 C 函数指针。
+    /// - Parameters:
+    ///   - index: C 侧生成的 `CPRISK_SWIFT_BRIDGE_IMPORT_*` 索引。
+    ///   - type: 目标 `@convention(c)` 函数类型。
+    /// - Returns: 完成 `unsafeBitCast` 的函数值。
+    /// - 失败语义：解析失败直接 `fatalError`。桥接表缺失属于构建/链接错误，
+    ///   继续运行只会让检测静默失效，因此选择 fail-fast。
     static func resolve<T>(_ index: UInt32, as type: T.Type) -> T {
         lock.lock()
         if let cached = cache[index] {
@@ -21,6 +33,7 @@ enum CRiskCoreBridge {
             return unsafeBitCast(cached, to: type)
         }
 
+        // 未命中缓存时才真正解析；解析期间持锁，避免并发重复解析同一索引。
         var addr: UnsafeMutableRawPointer?
         let rc = cprisk_resolve_import(index, &addr)
         guard rc == 0, let resolved = addr else {
@@ -34,6 +47,8 @@ enum CRiskCoreBridge {
     }
 }
 
+// MARK: - C 函数签名别名
+// 只声明桥接表实际需要的调用约定；类型必须与 C 头文件逐字节一致，否则调用会 UB。
 typealias _CRiskVoidFn0 = @convention(c) () -> Void
 typealias _CRiskIntFn0 = @convention(c) () -> CInt
 typealias _CRiskUInt32Fn0 = @convention(c) () -> UInt32
@@ -76,6 +91,8 @@ typealias _CRiskIntFnSign = @convention(c) (UnsafePointer<UInt8>?, Int, UnsafePo
 typealias _CRiskIntFnVerify = @convention(c) (UnsafePointer<UInt8>?, Int, UnsafePointer<UInt8>?, Int, UnsafePointer<UInt8>?, UnsafePointer<CChar>?) -> CInt
 typealias _CRiskWhiteboxEval = @convention(c) (UInt32, UnsafePointer<UInt8>?, UnsafeMutablePointer<UInt8>?) -> CInt
 
+// MARK: - 桥接函数绑定
+// 每个 let 在首次访问该文件静态变量时解析一次并缓存；索引由 C 侧 `CPRISK_SWIFT_BRIDGE_IMPORT_*` 定义。
 let cprisk_access_direct: _CRiskIntFnCStringIntErr =
     CRiskCoreBridge.resolve(UInt32(CPRISK_SWIFT_BRIDGE_IMPORT_ACCESS_DIRECT), as: _CRiskIntFnCStringIntErr.self)
 let cprisk_access_masked: _CRiskIntFnMaskedIntErr =
@@ -211,6 +228,7 @@ let cprisk_whitebox_evaluate_domain: _CRiskWhiteboxEval =
 let cprisk_thread_pc_exec_snapshot: _CRiskIntFnThreadExecSnapshot =
     CRiskCoreBridge.resolve(UInt32(CPRISK_SWIFT_BRIDGE_IMPORT_THREAD_PC_EXEC_SNAPSHOT), as: _CRiskIntFnThreadExecSnapshot.self)
 
+// MARK: - 模拟器探测（Silgen 直接导入）
 /// Emulator probe — not in the bridge index, use silgen import.
 /// Returns a bitmask of CPRISK_EMU_FLAG_* bits for each detected anomaly.
 @_silgen_name("cprisk_emulator_probe") func cprisk_emulator_probe() -> UInt32

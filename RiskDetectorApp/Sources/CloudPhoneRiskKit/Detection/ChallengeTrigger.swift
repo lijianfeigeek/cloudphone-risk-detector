@@ -1,6 +1,13 @@
+// 挑战触发器：根据能力探针异常数与篡改信号数，匹配服务端下发的 BlindRule，决定是否触发
+// 一次性 blindChallenge（服务端下发、带 seed/过期时间，客户端回传执行结果供服务端复核）。
+// 本地仅在 DEBUG 下允许无规则自动触发用于联调；生产必须依赖服务端规则。规则遍历走 CFF 状态机。
+// 同时提供 challenge 载荷构造、签名、防重放哈希与规则复核等辅助方法。
+
 import CryptoKit
 import Foundation
 
+/// `shouldTriggerBlindChallenge` 专用的 CFF 配置与运行时盐派生。
+/// 盐绑定入参摘要与规则预览，使不同判定输入走不同的状态编码路径。
 private enum ChallengeTriggerCFF {
     static let shouldTriggerConfig = CFFConfig.adaptive(
         functionSeed: 0xB5E2_71CA_4D3F_8096,
@@ -9,6 +16,7 @@ private enum ChallengeTriggerCFF {
         codecStyle: .feistelSpn
     )
 
+    /// 用计数、规则数量与前两条规则的 ID 派生盐；只取前两条是为了控制成本，同时保留规则集变化敏感性。
     static func salt(
         capabilityAnomalyCount: Int,
         tamperedCount: Int,
@@ -30,6 +38,7 @@ private enum ChallengeTriggerCFF {
         )
     }
 
+    /// FNV-1a 64 位哈希：稳定映射规则 ID，避免使用每次启动都会变化的 Swift `hashValue`。
     private static func stableHash64(_ value: String) -> UInt64 {
         var hash: UInt64 = 0xCBF29CE484222325
         for byte in value.utf8 {
@@ -47,13 +56,15 @@ private enum ChallengeTriggerCFF {
 /// 注意：SDK 内的“本地合成 challenge”仅用于联调与回归，不代表服务端下发的一次性生产挑战。
 public struct ChallengeTrigger: Sendable {
 
-    /// 服务端下发的一次性 challenge
+    /// 服务端下发的一次性 challenge。
+    /// `seed` 与设备指纹绑定，`expiresAt`（毫秒时间戳）用于服务端防重放；字段均使用短键名压缩。
     public struct BlindChallenge: Codable, Sendable {
         public let challengeId: String
         public let probeIds: [String]
         public let seed: String
         public let expiresAt: Int64
 
+        /// 短键名属于线协议契约，改名会导致与服务端不兼容。
         private enum CodingKeys: String, CodingKey {
             case challengeId = "ci"
             case probeIds = "pi"
@@ -91,23 +102,27 @@ public struct ChallengeTrigger: Sendable {
             self.reason = reason
         }
 
+        /// 未触发时的统一返回值，便于调用方直接比较 `triggered`。
         public static let noTrigger = TriggerResult(triggered: false, matchedRule: nil, reason: "")
     }
 
     // MARK: - 默认阈值
 
-    /// 触发 blindChallenge 的默认能力探针异常数阈值
+    /// 触发 blindChallenge 的默认能力探针异常数阈值（仅 DEBUG 本地联调使用）。
     public static let defaultCapabilityAnomalyThreshold = 2
 
     // MARK: - 触发检查
 
-    /// 检查是否触发 blindChallenge
+    /// 检查是否触发 blindChallenge（仅基于聚合计数）。
     ///
     /// - Parameters:
     ///   - capabilityAnomalyCount: 能力探针异常数（来自 CapabilityScore.basicAnomalyCount）
     ///   - tamperedCount: 被篡改的信号数量
     ///   - existingRules: 服务端配置的 blindChallenge 规则
-    /// - Returns: 触发结果
+    /// - Returns: 触发结果；无规则或未命中时返回 `.noTrigger`。
+    ///
+    /// 说明：此重载只接收计数，无法评估规则中的 signal ID / 跨层一致性条件；
+    /// 需要这些条件时请使用基于信号列表的重载。
     public static func shouldTriggerBlindChallenge(
         capabilityAnomalyCount: Int,
         tamperedCount: Int,
@@ -119,6 +134,7 @@ public struct ChallengeTrigger: Sendable {
             tamperedCount: tamperedCount,
             rules: existingRules
         )
+        // 状态编号仅需互不相同；可读状态经 CFFStateCodec 编码后才进入局部变量。
         let entryState: UInt32 = 0x51
         let emptyRulesState: UInt32 = 0x52
         let iterateState: UInt32 = 0x53
@@ -131,16 +147,19 @@ public struct ChallengeTrigger: Sendable {
         let cffKey = CFFStateCodec.deriveSeed(function: "ChallengeTrigger.shouldTriggerBlindChallenge", config: cffConfig)
         let effectiveSalt = cffConfig.enableRuntimeSalt ? salt : salt ^ 0x13579BDF
 
+        /// 把可读状态编码为运行期不可读的 CFF 状态。
         func encodeState(_ rawState: UInt32) -> UInt32 {
             CFFStateCodec.encode(state: rawState, key: cffKey, salt: effectiveSalt, style: cffConfig.codecStyle)
         }
 
+        /// 解码 CFF 状态；仅状态机内部使用。
         func decodeState(_ encoded: UInt32) -> UInt32 {
             CFFStateCodec.decode(state: encoded, key: cffKey, salt: effectiveSalt, style: cffConfig.codecStyle)
         }
 
         var sink = CFFReturnSink<TriggerResult>()
         var encodedState = encodeState(entryState)
+        // 状态机护栏：每条规则约 5 个状态，预算随规则数增长；耗尽则按“不触发”收尾，避免死循环。
         var loopBudget = max(24, existingRules.count * 5 + 10)
         var ruleIndex = 0
         var currentRule: ServerRiskPolicy.BlindRule?
@@ -162,6 +181,8 @@ public struct ChallengeTrigger: Sendable {
                     let nextState = existingRules.isEmpty ? emptyRulesState : iterateState
                     encodedState = encodeState(nextState)
                 } else if decodedState == emptyRulesState {
+                    // 无服务端规则时的兜底：仅 DEBUG 允许本地自动触发，生产环境必须由服务端规则驱动，
+                    // 否则被 patch 的客户端可以随意触发挑战或借触发行为做指纹。
                     #if DEBUG
                     if capabilityAnomalyCount >= defaultCapabilityAnomalyThreshold && tamperedCount > 0 {
                         let defaultRule = ServerRiskPolicy.BlindRule(
@@ -194,12 +215,10 @@ public struct ChallengeTrigger: Sendable {
                         continue
                     }
 
-                    // NOTE: rule.allOfSignalIDs, anyOfSignalIDs, requireCrossLayerInconsistency, and
-                    // minDistinctRiskLayers are NOT evaluated here because this overload only receives
-                    // aggregated counts, not the full signal list. Rules that rely solely on count-based
-                    // conditions (the common case) are fully evaluated. Rules that also include signal-ID
-                    // or cross-layer conditions will over-trigger (match on counts alone). Use the signals-
-                    // based overload when those conditions need to be enforced.
+                    // 注意：rule 的 allOfSignalIDs、anyOfSignalIDs、requireCrossLayerInconsistency 与
+                    // minDistinctRiskLayers 在此不参与评估，因为本重载只拿到聚合计数，没有完整信号列表。
+                    // 仅依赖计数条件的规则（最常见）会被完整评估；同时包含 signal ID 或跨层条件的规则
+                    // 会因只按计数匹配而过度触发。需要强制执行这些条件时，请使用基于信号列表的重载。
                     let capabilityMatches = capabilityAnomalyCount >= rule.minCapabilityAnomalyCount
                     let tamperedMatches = tamperedCount >= rule.minTamperedCount
                     if capabilityMatches && tamperedMatches {
@@ -312,7 +331,8 @@ public struct ChallengeTrigger: Sendable {
         return sink.resolve(or: .noTrigger)
     }
 
-    /// 检查是否触发 blindChallenge（基于 CapabilityScore）
+    /// 检查是否触发 blindChallenge（基于 CapabilityScore）。
+    /// 直接取 `basicAnomalyCount` 作为能力异常数，质量可疑度不参与规则匹配（由服务端另行加权）。
     ///
     /// - Parameters:
     ///   - capabilityScore: 能力探针得分
@@ -333,6 +353,8 @@ public struct ChallengeTrigger: Sendable {
 
     // MARK: - 私有方法
 
+    /// 构造触发原因字符串，只包含本重载真正验证过的计数条件。
+    /// 刻意不写入 signal ID / 跨层条件：未验证的条件若写进 reason，会给服务端错误归因。
     private static func buildReason(
         capabilityAnomalyCount: Int,
         tamperedCount: Int,
@@ -348,12 +370,10 @@ public struct ChallengeTrigger: Sendable {
             reasons.append("tamperedCount(\(tamperedCount)) >= \(rule.minTamperedCount)")
         }
 
-        // NOTE: rule.requireCrossLayerInconsistency, allOfSignalIDs, anyOfSignalIDs, and
-        // minDistinctRiskLayers are BlindRule fields that require the full signal list to
-        // evaluate. shouldTriggerBlindChallenge only receives count parameters and cannot
-        // check these conditions. Do NOT include them in the reason string to avoid sending
-        // the server false attribution (e.g. claiming "crossLayerInconsistency" was detected
-        // when it was never verified).
+        // 注意：rule.requireCrossLayerInconsistency、allOfSignalIDs、anyOfSignalIDs 与
+        // minDistinctRiskLayers 都需要完整信号列表才能评估，而 shouldTriggerBlindChallenge
+        // 只接收计数参数，无法检查这些条件。不要把未验证的条件写进 reason，避免给服务端
+        // 错误归因（例如声称检测到 crossLayerInconsistency，实际从未验证）。
 
         return "Rule[\(rule.id)]: \(reasons.joined(separator: " && "))"
     }
@@ -361,12 +381,15 @@ public struct ChallengeTrigger: Sendable {
 
 // MARK: - 服务端验证辅助
 
+/// 服务端验证辅助：时间戳、载荷构造、签名与规则复核。
 extension ChallengeTrigger {
 
+    /// 当前 Unix 毫秒时间戳，与 challenge.expiresAt 单位保持一致。
     public static func nowMillis() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
+    /// 生成键排序后的稳定 JSON 串；签名必须基于确定性字节序列，否则客户端/服务端计算结果不一致。
     private static func canonicalJSONString(_ object: [String: Any]) -> String? {
         guard JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
@@ -470,7 +493,8 @@ extension ChallengeTrigger {
         timestamp < challenge.expiresAt
     }
 
-    /// 客户端生成 challenge 绑定签名
+    /// 客户端生成 challenge 绑定签名（HMAC）。
+    /// 签名前先规范化 JSON；密钥用后立即清零，减少内存残留窗口。
     public static func signChallengePayload(payload: [String: Any], signingKey: String) -> String? {
         guard let canonical = canonicalJSONString(payload),
               let messageData = canonical.data(using: .utf8) else {
@@ -484,6 +508,7 @@ extension ChallengeTrigger {
     }
 
     /// challenge 绑定签名校验
+    /// 使用常量时间比较，避免通过响应时间侧信道逐字节猜测签名。
     public static func verifyChallengePayloadSignature(
         payload: [String: Any],
         signature: String,

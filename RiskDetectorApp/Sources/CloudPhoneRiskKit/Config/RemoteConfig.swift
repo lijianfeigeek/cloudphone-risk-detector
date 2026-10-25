@@ -1,3 +1,10 @@
+// CloudPhoneRiskKit 远程配置数据模型：定义服务端下发的完整配置结构（策略、检测器、
+// 白名单、实验、安全加固等）及其本地校验/安全地板钳制逻辑。
+// 该模型是评分链路的输入：远端权重与阈值先经 ConfigSignatureVerifier 验签，
+// 再由 RemoteConfigProvider 校验并钳制后才可影响本地判决。
+// 安全敏感字段：policy 阈值/权重、detector 开关与阈值、whitelist、securityHardening、
+// textSegmentHashReference、payloadFieldMapping 与 realtimeTelemetryAdaptive 权重倍率。
+
 import Foundation
 #if canImport(Darwin)
 import Darwin
@@ -35,6 +42,13 @@ import Glibc
 /// - 客户端通过比较版本号判断是否需要更新
 /// - 支持配置回滚（服务端下发旧版本号）
 ///
+/// ## 安全边界
+///
+/// 本类型字段会直接影响评分与处置，属于安全敏感配置：`policy` 的阈值与权重、
+/// `detector` 的检测开关/阈值、`whitelist` 的放行名单、`securityHardening` 的加固开关、
+/// `textSegmentHashReference` 的完整性锚点，以及 `payloadFieldMapping` 的上报混淆规则。
+/// 远端实例必须验签并通过安全地板钳制后才能参与决策；本地 `validate()` 只做格式/范围
+/// 自检，不能替代签名验证。
 public struct RemoteConfig: Codable, Sendable {
 
     // MARK: - 基础信息
@@ -112,6 +126,7 @@ public struct RemoteConfig: Codable, Sendable {
     /// 服务端追加的可疑端口（合并到 DynamicFeatureList）
     public let additionalSuspiciousPorts: [Int]?
 
+    // 线协议使用短键压缩配置体积；键名同时是服务端契约的一部分。
     private enum CodingKeys: String, CodingKey {
         case version = "v"
         case timestamp = "ts"
@@ -212,7 +227,10 @@ public struct RemoteConfig: Codable, Sendable {
 
     // MARK: - 验证
 
-    /// 验证配置是否有效
+    /// 本地格式与范围自检。
+    /// - Note: 这是“配置是否像配置”的基础检查，不包含签名验证与安全地板钳制；
+    ///   远端配置必须由 `RemoteConfigProvider` 另行验签/钳制后才能信任。
+    /// - Returns: `isValid` 为 false 时 `errors` 给出拒绝原因，`warnings` 仅提示风险。
     public func validate() -> ValidationResult {
         var errors: [String] = []
         var warnings: [String] = []
@@ -266,7 +284,7 @@ public struct RemoteConfig: Codable, Sendable {
         )
     }
 
-    /// 检查配置是否过期
+    /// 检查配置相对生成时间是否已超过给定有效期（秒）。
     public func isExpired(duration: TimeInterval) -> Bool {
         let now = Date().timeIntervalSince1970
         return (now - timestamp) > duration
@@ -275,6 +293,7 @@ public struct RemoteConfig: Codable, Sendable {
 
 // MARK: - 验证结果
 
+/// 配置校验结果：`errors` 非空表示不可用，`warnings` 表示可用但需关注。
 public struct ValidationResult: Sendable {
     public let isValid: Bool
     public let errors: [String]
@@ -283,6 +302,7 @@ public struct ValidationResult: Sendable {
 
 // MARK: - 配置环境
 
+/// 配置下发环境标识。
 public enum ConfigEnvironment: String, Codable, Sendable {
     case development
     case staging
@@ -299,6 +319,8 @@ public enum ConfigEnvironment: String, Codable, Sendable {
 
 // MARK: - 策略配置
 
+/// 风险决策策略：阈值、时间窗口、信号权重与处置动作。
+/// 其中阈值和权重会直接改变最终风险分与处置结果，属于安全敏感配置。
 public struct Policy: Codable, Sendable {
 
     // MARK: - 阈值配置
@@ -419,22 +441,25 @@ public struct Policy: Codable, Sendable {
 
 // MARK: - 权重配置
 
+/// 各信号在总分中的权重（参与加权求和）。
+/// 权重整体放大/缩小会改变评分分布，远程下发值需经过安全地板约束。
 public struct Weights: Codable, Sendable {
-    /// 越狱检测权重
+    /// 越狱检测权重（默认 0.6，是主导信号）。
     public let jailbreak: Double
 
-    /// 网络检测权重
+    /// 网络检测权重（默认 0.15）。
     public let network: Double
 
-    /// 行为检测权重
+    /// 行为检测权重（默认 0.15）。
     public let behavior: Double
 
-    /// 云手机检测权重
+    /// 云手机检测权重（默认 0.05）。
     public let cloudPhone: Double
 
-    /// 时序模式权重
+    /// 时序模式权重（默认 0.05）。
     public let timePattern: Double
 
+    // 短键为线协议字段名。
     private enum CodingKeys: String, CodingKey {
         case jailbreak = "j"
         case network = "n"
@@ -495,21 +520,37 @@ public enum RemoteRiskAction: String, Codable, Sendable {
 
 // MARK: - 行为阈值配置
 
+/// 行为检测阈值集合：触摸/滑动/运动特征的判定边界与行为分上限。
+/// 阈值被恶意调低或调高都会导致误报或漏报，因此远程值需经范围与下限校验。
 public struct BehaviorThresholds: Codable, Sendable {
+    /// 触摸点分布下限。
     public let touchSpreadLow: Double
+    /// 触摸点分布上限。
     public let touchSpreadHigh: Double
+    /// 触摸间隔变异系数下限。
     public let touchIntervalCVLow: Double
+    /// 触摸间隔变异系数上限。
     public let touchIntervalCVHigh: Double
+    /// 滑动线性度上限（越接近 1 越像机器直线滑动）。
     public let swipeLinearityHigh: Double
+    /// 滑动线性度下限。
     public let swipeLinearityLow: Double
+    /// 运动静止度阈值。
     public let motionStillness: Double
+    /// 触摸与运动相关性阈值。
     public let touchMotionCorrelation: Double
+    /// 计算相关性所需的最小静止度。
     public let minStillnessForCorrelation: Double
+    /// 按压力度方差阈值。
     public let forceVariance: Double
+    /// 触摸半径方差阈值。
     public let radiusVariance: Double
+    /// 滑动速度变异系数阈值。
     public let swipeSpeedCV: Double
+    /// 行为信号可贡献的分数上限（防止行为检测主导总分）。
     public let maxBehaviorScore: Double
 
+    // 短键为线协议字段名。
     private enum CodingKeys: String, CodingKey {
         case touchSpreadLow = "tsl"
         case touchSpreadHigh = "tsh"
@@ -602,6 +643,8 @@ public struct BehaviorThresholds: Codable, Sendable {
 
 // MARK: - 检测器配置
 
+/// 各检测器的开关、阈值、采样窗口与性能预算。
+/// Release 下核心检测开关会被安全地板强制打开，采样/时长参数会被钳制到合法区间。
 public struct RemoteDetectorConfig: Codable, Sendable {
 
     // MARK: - 越狱检测配置
@@ -624,7 +667,7 @@ public struct RemoteDetectorConfig: Codable, Sendable {
     /// 是否启用越狱 URL Scheme 检测
     public let jailbreakEnableSchemeDetect: Bool
 
-    /// ���否启用越狱 Hook 检测
+    /// 是否启用越狱 Hook 检测
     public let jailbreakEnableHookDetect: Bool
 
     // MARK: - 行为检测配置
@@ -673,6 +716,7 @@ public struct RemoteDetectorConfig: Codable, Sendable {
     /// 按设备型号分组的行为阈值覆盖（key 为设备型号标识符，如 "iPhone15,2"）
     public let deviceModelBehaviorOverrides: [String: BehaviorThresholds]?
 
+    // 短键为线协议字段名。
     private enum CodingKeys: String, CodingKey {
         case jailbreakThreshold = "jt"
         case jailbreakEnableFileDetect = "jf"
@@ -753,6 +797,8 @@ public struct RemoteDetectorConfig: Codable, Sendable {
 
 // MARK: - 白名单规则
 
+/// 设备/版本/IP 白名单与设备黑名单。
+/// 白名单会直接放行设备，属于安全敏感配置：远程下发前必须验签，规模也受上限约束。
 public struct WhitelistRules: Codable, Sendable {
 
     // MARK: - 设备白名单
@@ -822,6 +868,7 @@ public struct WhitelistRules: Codable, Sendable {
         }
 
         // 前缀匹配
+        // 前缀放行范围较宽，属于安全敏感规则；远程配置必须验签，避免被用来批量放行设备。
         for prefix in deviceIDPrefixes {
             if deviceID.hasPrefix(prefix) {
                 return true
@@ -894,10 +941,12 @@ private func compareVersions(_ a: String, _ b: String) -> Int {
     return 0
 }
 
+/// 解析后的 IP 地址（IPv4 数值或 IPv6 字节序列）。
 private enum ParsedIPAddress {
     case v4(UInt32)
     case v6([UInt8])
 
+    /// 解析 IPv4/IPv6 字面量；非法输入返回 `nil`。
     static func parse(_ raw: String) -> ParsedIPAddress? {
         var addr4 = in_addr()
         if raw.withCString({ inet_pton(AF_INET, $0, &addr4) }) == 1 {
@@ -949,8 +998,10 @@ private enum ParsedIPAddress {
 
 private struct ParsedCIDR {
     let network: ParsedIPAddress
+    /// 前缀长度：IPv4 0…32，IPv6 0…128。
     let prefix: Int
 
+    /// 解析 `地址/前缀` 形式；前缀越界或地址非法时返回 `nil`。
     static func parse(_ raw: String) -> ParsedCIDR? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false)
@@ -973,6 +1024,7 @@ private struct ParsedCIDR {
         return ParsedCIDR(network: network, prefix: prefix)
     }
 
+    /// 判断候选地址是否落在该 CIDR 网段内。
     func contains(_ candidate: ParsedIPAddress) -> Bool {
         switch (network, candidate) {
         case let (.v4(networkV4), .v4(candidateV4)):
@@ -995,6 +1047,7 @@ private struct ParsedCIDR {
         }
     }
 
+    /// IPv4 前缀匹配：按位掩码比较网络号。
     private static func v4Contains(_ network: UInt32, _ candidate: UInt32, prefix: Int) -> Bool {
         if prefix == 0 { return true }
         let shift = UInt32(32 - prefix)
@@ -1002,6 +1055,7 @@ private struct ParsedCIDR {
         return (network & mask) == (candidate & mask)
     }
 
+    /// IPv6 前缀匹配：先比较整字节，再比较剩余位掩码。
     private static func v6Contains(_ network: [UInt8], _ candidate: [UInt8], prefix: Int) -> Bool {
         if prefix == 0 { return true }
 
@@ -1022,6 +1076,7 @@ private struct ParsedCIDR {
 
 // MARK: - 实验配置
 
+/// AB 实验配置：活跃实验、分桶算法与过期时间。
 public struct ExperimentConfig: Codable, Sendable {
 
     // MARK: - 活跃实验
@@ -1062,6 +1117,10 @@ public struct ExperimentConfig: Codable, Sendable {
     // MARK: - 查询方法
 
     /// 获取指定实验的配置
+    /// - Parameters:
+    ///   - experimentKey: 实验唯一键。
+    ///   - deviceID: 用于稳定分桶的设备标识。
+    /// - Returns: 命中的实验变体；实验不存在、已过期或无匹配分桶时返回 `nil`。
     public func config(for experimentKey: String, deviceID: String) -> ExperimentVariant? {
         guard let experiment = active.first(where: { $0.key == experimentKey }) else {
             return nil
@@ -1094,18 +1153,20 @@ public struct ExperimentConfig: Codable, Sendable {
         }
     }
 
-    /// 一致性哈希分桶
+    /// 一致性哈希分桶：同一 deviceID+experimentKey 始终落在同一侧。
     private func consistentHashBucket(deviceID: String, experimentKey: String, traffic: Double) -> Int {
         let input = "\(deviceID):\(experimentKey)"
         let hash = input.data(using: .utf8)?.reduce(Int(0)) { ($0 << 8) + Int($1) } ?? 0
+        // 归一化到 10000 个桶，与 traffic 的 0…1 比例直接比较。
         let normalized = Double(hash % 10000) / 10000.0
         return normalized <= traffic ? 1 : 0
     }
 
-    /// 模运算分桶
+    /// 模运算分桶：实现简单，但设备分布可能不均。
     private func modularBucket(deviceID: String, traffic: Double) -> Int {
         let hash = deviceID.data(using: .utf8)?.reduce(0) { partial, byte in partial + Int(byte) } ?? 0
         let bucket = hash % 100
+        // bucket ∈ 0…99，traffic×100 为阈值；<= 使 0 流量仍可能命中 0 号桶。
         return Double(bucket) <= (traffic * 100) ? 1 : 0
     }
 
@@ -1123,16 +1184,22 @@ public struct ExperimentConfig: Codable, Sendable {
 
 // MARK: - 实验
 
+/// 单个 AB 实验定义。
 public struct Experiment: Codable, Sendable, Identifiable {
     public let id: String
+    /// 实验唯一键，客户端按此查询。
     public let key: String
     public let name: String
     public let description: String?
+    /// 实验流量比例（0…1），参与实验的设备占比。
     public let traffic: Double // 0-1
+    /// 各分桶对应的变体配置。
     public let variants: [ExperimentVariant]
+    /// 实验创建/更新时间（Unix 秒），用于过期判断。
     public let createdAt: TimeInterval
     public let updatedAt: TimeInterval
 
+    // 短键为线协议字段名。
     private enum CodingKeys: String, CodingKey {
         case id = "i"
         case key = "k"
@@ -1167,13 +1234,17 @@ public struct Experiment: Codable, Sendable, Identifiable {
 
 // MARK: - 实验变体
 
+/// 实验组/对照组的参数集合。
 public struct ExperimentVariant: Codable, Sendable, Identifiable {
     public let id: String
+    /// 分桶编号：0=对照组，1=实验组。
     public let bucket: Int // 0=对照组, 1=实验组
     public let name: String
     public let description: String?
+    /// 实验参数键值对，供业务方读取。
     public let parameters: [String: String]
 
+    // 短键为线协议字段名。
     private enum CodingKeys: String, CodingKey {
         case id = "i"
         case bucket = "b"
@@ -1207,8 +1278,9 @@ public struct ExperimentVariant: Codable, Sendable, Identifiable {
     }
 }
 
-// MARK: - 分流算法
+// MARK: - 分桶算法
 
+/// 实验分桶算法；生产推荐一致性哈希以保证设备分流稳定。
 public enum BucketingAlgorithm: String, Codable, Sendable {
     /// 一致性哈希（推荐，设备分桶稳定）
     case consistentHash
@@ -1222,6 +1294,7 @@ public enum BucketingAlgorithm: String, Codable, Sendable {
 
 // MARK: - 高级配置
 
+/// 性能、调试与上报相关的可选配置。
 public struct AdvancedConfig: Codable, Sendable {
 
     // MARK: - 性能配置
@@ -1336,6 +1409,8 @@ public struct RealtimeTelemetryAdaptiveConfig: Codable, Sendable {
 
     public static let `default` = RealtimeTelemetryAdaptiveConfig()
 
+    /// 校验自适应配置的取值合法性。
+    /// 仅做格式/范围检查；实际生效前还会经过 `enforcingReleaseSecurityFloor()` 钳制。
     public func validate() -> ValidationResult {
         var errors: [String] = []
         var warnings: [String] = []
@@ -1362,9 +1437,14 @@ public struct RealtimeTelemetryAdaptiveConfig: Codable, Sendable {
         return ValidationResult(isValid: errors.isEmpty, errors: errors, warnings: warnings)
     }
 
+    /// Release 安全地板：限制节流间隔、权重倍率与反馈 TTL 的最坏影响。
+    /// - 评估间隔最多 60s，避免远程把检测频率压到几乎不评估；
+    /// - 权重倍率限制在 0.1x…2x（1000…20000 bps），且 default 必须落在区间内；
+    /// - 反馈 TTL 最多 1 小时，过期后自动回到默认权重。
     func enforcingReleaseSecurityFloor() -> RealtimeTelemetryAdaptiveConfig {
         let safeBase = max(0, min(baseMinEvaluationIntervalMillis, 60_000))
         let safeHigh = max(0, min(highPressureMinEvaluationIntervalMillis, safeBase))
+        // bps：10000 = 1.0x；下限 1000 防止远程把信号权重调到接近失效。
         let safeMinBps = max(1_000, min(minWeightScaleBps, 20_000))
         let safeMaxBps = max(safeMinBps, min(maxWeightScaleBps, 20_000))
         let safeDefaultBps = min(max(defaultWeightScaleBps, safeMinBps), safeMaxBps)
@@ -1436,6 +1516,11 @@ public struct ProbeConfigItem: Codable, Sendable {
 
 // MARK: - 安全加固配置（beta.4）
 
+/// 远端安全加固开关。
+///
+/// 属于安全敏感配置：可关闭上报签名绑定、强制字段混淆或触发 kill switch。
+/// Release 下 `enableEnvelopeSignatureV2` 与 `enableChallengeBinding` 会被强制为 true，
+/// `killSwitchEnabled` 保留远端语义但由上层决定是否降级。
 public struct SecurityHardeningConfig: Codable, Sendable {
     /// 是否启用 v2 上报签名
     public let enableEnvelopeSignatureV2: Bool
@@ -1478,6 +1563,8 @@ public struct SecurityHardeningConfig: Codable, Sendable {
 }
 
 extension SecurityHardeningConfig {
+    /// 自定义解码：字段缺失时采用安全默认值（签名/绑定默认开启），
+    /// 避免旧服务端漏发字段导致客户端静默降级。
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enableEnvelopeSignatureV2 = try c.decodeIfPresent(Bool.self, forKey: .enableEnvelopeSignatureV2) ?? true
@@ -1500,6 +1587,8 @@ extension SecurityHardeningConfig {
 // MARK: - RemoteConfig 扩展
 
 extension RemoteConfig {
+    /// 返回施加了 Release 安全地板的配置副本。
+    /// 仅钳制会削弱检测能力的字段；白名单、实验与上报配置原样保留。
     func enforcingReleaseSecurityFloor() -> RemoteConfig {
         RemoteConfig(
             version: version,
@@ -1542,7 +1631,7 @@ extension RemoteConfig {
         )
     }
 
-    /// 导出为 JSON 字符串
+    /// 导出为 JSON 字符串（用于调试、日志或与服务端对照）。
     public func toJSONString(prettyPrinted: Bool = false) -> String? {
         let encoder = JSONEncoder()
         encoder.outputFormatting = prettyPrinted ? [.prettyPrinted, .sortedKeys] : []
@@ -1550,7 +1639,8 @@ extension RemoteConfig {
         return String(data: data, encoding: .utf8)
     }
 
-    /// 从 JSON 字符串创建
+    /// 从 JSON 字符串创建配置。
+    /// - Note: 仅做解码，不做验签与安全校验；该入口适合可信来源（本地测试/已验签载荷）。
     public static func from(jsonString: String) -> RemoteConfig? {
         guard let data = jsonString.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(RemoteConfig.self, from: data)
@@ -1558,11 +1648,14 @@ extension RemoteConfig {
 }
 
 extension RemoteDetectorConfig {
+    /// 返回施加了 Release 安全地板的检测器配置。
+    /// 核心检测开关强制为 true，阈值/采样/时长参数钳制到安全区间。
     func enforcingReleaseSecurityFloor() -> RemoteDetectorConfig {
         // 最小检测集合：远程不得关闭核心检测开关；采样/时长参数钳制到
         // 合法范围（远程把它抬到天文数字会让行为检测永远不触发）。
         // 13 项行为阈值与各机型覆盖统一过服务端范围钳制。
         RemoteDetectorConfig(
+            // 越狱阈值上限 50：远程抬高阈值会让已知越狱特征不足以触发告警。
             jailbreakThreshold: min(jailbreakThreshold, 50),
             jailbreakEnableFileDetect: true,
             jailbreakEnableDyldDetect: true,
@@ -1571,6 +1664,7 @@ extension RemoteDetectorConfig {
             jailbreakEnableSchemeDetect: true,
             jailbreakEnableHookDetect: true,
             enableBehaviorDetect: true,
+            // 采样窗口限制 10…1000、最小样本 1…100，避免远程把采样门槛调到永不触发。
             behaviorSampleWindow: min(max(behaviorSampleWindow, 10), 1000),
             touchMinSampleCount: min(max(touchMinSampleCount, 1), 100),
             motionMinSampleCount: min(max(motionMinSampleCount, 1), 100),
@@ -1578,6 +1672,7 @@ extension RemoteDetectorConfig {
             detectVPN: detectVPN,
             detectProxy: detectProxy,
             enableCloudPhoneDetect: enableCloudPhoneDetect,
+            // 单次检测预算限制 0.5s…30s，既防止远程造成卡顿，也防止预算过小导致检测被跳过。
             maxDetectionDuration: min(max(maxDetectionDuration, 500), 30_000),
             enableAsyncDetection: enableAsyncDetection,
             behaviorThresholds: behaviorThresholds?.clampedToServerRanges(),
@@ -1587,6 +1682,7 @@ extension RemoteDetectorConfig {
 }
 
 extension SecurityHardeningConfig {
+    /// Release 安全地板：强制开启 v2 上报签名与 challenge 绑定，忽略远端关闭请求。
     func enforcingReleaseSecurityFloor() -> SecurityHardeningConfig {
         SecurityHardeningConfig(
             enableEnvelopeSignatureV2: true,

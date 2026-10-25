@@ -1,9 +1,16 @@
+// DyldInterposeDetector：检测 dyld 的 interpose 机制滥用与镜像数量异常。
+// interpose 可在不改目标二进制的情况下替换符号绑定，常见于 tweak/注入框架。
+// 三个维度：__DATA.__interpose section、危险 dyld 环境变量、加载镜像数异常。
 import Darwin
 import Foundation
 import MachO
 
+/// dyld interpose 检测器。
+/// - 线程模型：同步只读遍历 dyld 镜像与 load command。
+/// - 误报控制：跳过系统路径；环境变量需非空；镜像数阈值留有余量。
 struct DyldInterposeDetector: Detector {
 
+    /// 执行三类检测并汇总。
     func detect() throws -> DetectorResult {
         #if targetEnvironment(simulator)
         return DetectorResult(score: 0, methods: ["unavailable_simulator"])
@@ -11,16 +18,19 @@ struct DyldInterposeDetector: Detector {
         var score: Double = 0
         var methods: [String] = []
 
+        // 1. 扫描非系统镜像的 __DATA/__DATA_CONST.__interpose section。
         // 1. Check for __DATA.__interpose sections in loaded images
         let interpose = detectInterposeSection()
         score += interpose.score
         methods.append(contentsOf: interpose.methods)
 
+        // 2. 检查危险 dyld 环境变量。
         // 2. Check for suspicious dyld environment variables
         let dyldEnv = detectDyldEnvAbuse()
         score += dyldEnv.score
         methods.append(contentsOf: dyldEnv.methods)
 
+        // 3. 检查加载镜像数量是否异常。
         // 3. Check dyld image count anomaly
         let imageCount = detectImageCountAnomaly()
         score += imageCount.score
@@ -31,6 +41,7 @@ struct DyldInterposeDetector: Detector {
     }
 
     /// Scan all loaded Mach-O images for __DATA.__interpose section
+    /// 扫描所有已加载的 Mach-O，查找 __interpose section。
     private func detectInterposeSection() -> (score: Double, methods: [String]) {
         var score: Double = 0
         var methods: [String] = []
@@ -41,9 +52,11 @@ struct DyldInterposeDetector: Detector {
             let name = _dyld_get_image_name(i).map { String(cString: $0) } ?? "unknown"
 
             // Skip system frameworks
+            // 跳过系统库：系统库本身可能包含 interpose，不属于攻击行为。
             if name.hasPrefix("/usr/lib/") || name.hasPrefix("/System/") { continue }
 
             let ptr = UnsafeRawPointer(header)
+            // 仅处理 64 位 Mach-O。
             guard header.pointee.magic == MH_MAGIC_64 || header.pointee.magic == MH_CIGAM_64 else { continue }
 
             let header64 = ptr.assumingMemoryBound(to: mach_header_64.self)
@@ -60,6 +73,7 @@ struct DyldInterposeDetector: Detector {
                     let segName = withUnsafePointer(to: seg.segname) { ptr in
                         ptr.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
                     }
+                    // 只检查 __DATA / __DATA_CONST 段。
                     if segName == "__DATA" || segName == "__DATA_CONST" {
                         var sect = cmd.advanced(by: MemoryLayout<segment_command_64>.size)
                             .assumingMemoryBound(to: section_64.self)
@@ -67,6 +81,7 @@ struct DyldInterposeDetector: Detector {
                             let sectName = withUnsafePointer(to: sect.pointee.sectname) { ptr in
                                 ptr.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
                             }
+                            // __interpose section 表示该镜像会替换其他镜像的符号绑定。
                             if sectName == "__interpose" {
                                 score += 25
                                 let shortName = (name as NSString).lastPathComponent
@@ -84,10 +99,12 @@ struct DyldInterposeDetector: Detector {
     }
 
     /// Check dangerous dyld environment variables beyond DYLD_INSERT_LIBRARIES
+    /// 检查危险的 dyld 环境变量。
     private func detectDyldEnvAbuse() -> (score: Double, methods: [String]) {
         var score: Double = 0
         var methods: [String] = []
 
+        // 除 INSERT_LIBRARIES 外，路径类/打印类变量也可能被滥用。
         let dangerousVars = [
             "DYLD_INSERT_LIBRARIES",
             "DYLD_FORCE_FLAT_NAMESPACE",
@@ -100,6 +117,7 @@ struct DyldInterposeDetector: Detector {
 
         let env = ProcessInfo.processInfo.environment
         for varName in dangerousVars {
+            // 变量存在且非空即命中。
             if let value = env[varName], !value.isEmpty {
                 score += 15
                 methods.append("dyld_env:\(varName)")
@@ -110,9 +128,12 @@ struct DyldInterposeDetector: Detector {
     }
 
     /// Anomalous image count (too many loaded dylibs)
+    /// 加载镜像数量异常检测。
     private func detectImageCountAnomaly() -> (score: Double, methods: [String]) {
         let count = _dyld_image_count()
+        // 正常 iOS 应用约加载 300–400 个 dylib；注入会额外增加。
         // Normal iOS app loads ~300-400 dylibs. Injection adds more.
+        // >500 强可疑，>450 弱可疑。
         if count > 500 {
             return (12, ["dyld_image_count:\(count)"])
         } else if count > 450 {
@@ -121,12 +142,14 @@ struct DyldInterposeDetector: Detector {
         return (0, [])
     }
 
+    /// 信号转换：interpose、环境变量与镜像过载分别成信号。
     func asSignals() throws -> [RiskSignal] {
         let result = try detect()
         guard result.score > 0 else { return [] }
 
         var signals: [RiskSignal] = []
 
+        // interpose 信号：tampered，每条 20 分。
         let interposeMethods = result.methods.filter { $0.hasPrefix("dyld_interpose") }
         if !interposeMethods.isEmpty {
             signals.append(RiskSignal(
@@ -140,6 +163,7 @@ struct DyldInterposeDetector: Detector {
             ))
         }
 
+        // dyld 环境变量信号：tampered。
         let envMethods = result.methods.filter { $0.hasPrefix("dyld_env") }
         if !envMethods.isEmpty {
             signals.append(RiskSignal(
@@ -153,6 +177,7 @@ struct DyldInterposeDetector: Detector {
             ))
         }
 
+        // 镜像过载信号：soft，置信 0.5。
         let countMethods = result.methods.filter { $0.hasPrefix("dyld_image_count") }
         if !countMethods.isEmpty {
             signals.append(RiskSignal(

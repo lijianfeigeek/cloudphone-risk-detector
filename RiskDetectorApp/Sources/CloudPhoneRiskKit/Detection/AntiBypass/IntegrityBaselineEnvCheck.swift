@@ -1,3 +1,8 @@
+// 完整性基线建立前的环境可信度检查：首启/升级窗口内，如果已经存在注入或调试特征，
+// 就不能把“可能已被篡改的状态”写成可信基线，否则后续所有完整性校验都会以毒为锚。
+// 检查维度包括 DYLD_INSERT_LIBRARIES、可疑镜像、P_TRACED、可疑父进程，任一命中即 fail-closed。
+// 本文件只判定“是否适合建基线”，不直接产出信号；结果由各完整性检查器转换为 RiskSignal。
+
 import CRiskCore
 import Darwin
 import Foundation
@@ -16,14 +21,17 @@ enum IntegrityBaselineEnvCheck {
     /// 可疑环境检测结果
     struct Result {
         let isSuspicious: Bool
+        /// 命中的具体检查项，用于上报与排障；干净时为 nil。
         let reason: String?
     }
 
+    /// 可疑镜像特征来自混淆常量表，避免明文字符串被静态定位后 patch。
     private static var suspiciousImagePatterns: [String] { ObfuscatedConstants.suspiciousImagePatternsBaseline }
 
     /// 检查当前环境是否适合建立完整性基线
     /// - Returns: 若 isSuspicious 为 true，则不应建基线
     static func check() -> Result {
+        // 环境变量注入是最直接的 dylib 注入方式，命中即拒绝，不再继续后续检查。
         if getenv("DYLD_INSERT_LIBRARIES") != nil {
             return Result(isSuspicious: true, reason: "DYLD_INSERT_LIBRARIES")
         }
@@ -39,6 +47,7 @@ enum IntegrityBaselineEnvCheck {
         return Result(isSuspicious: false, reason: nil)
     }
 
+    /// 遍历已加载镜像，返回第一个命中可疑特征的镜像短名；无命中返回 nil。
     private static func firstSuspiciousImage() -> String? {
         let count = _dyld_image_count()
         for index in 0..<count {

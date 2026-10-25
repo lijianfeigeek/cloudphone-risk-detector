@@ -1,11 +1,17 @@
+// 上报链路·本地安全信封校验：版本白名单、attestation 成对校验、签名/HMAC 与 nonce 防重放。
+// `LocalEnvelopeReplayStore` 仅用于 SDK 自测/联调；生产网关必须使用服务端一致性存储。
+// Release 下存储损坏、解密/HMAC 失败或持久化失败都会进入 fail-closed，拒绝消费 nonce。
+
 import Foundation
 
+/// 本地信封校验错误；`reasonCode` 提供稳定的机器可读原因。
 public enum SecureEnvelopeValidationError: Error, LocalizedError, Sendable {
     case invalidEnvelopeJSON
     case unsupportedSignatureVersion(actual: String, allowed: [String])
     case unknownKeyId(String)
     case reportEnvelope(ReportEnvelope.ReportEnvelopeError)
 
+    /// 人类可读错误描述；仅含版本/状态码等非敏感信息。
     public var errorDescription: String? {
         switch self {
         case .invalidEnvelopeJSON:
@@ -22,9 +28,12 @@ public enum SecureEnvelopeValidationError: Error, LocalizedError, Sendable {
 
 /// 默认本地重放保护存储（仅用于 SDK 自测与联调）。
 /// 生产网关应使用服务端一致性存储。
+/// 安全不变量：状态加密 + HMAC 校验 + freshness 锚点；任一完整性校验失败即 fail-closed。
 public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked Sendable {
+    /// 进程级单例，供本地校验路径共享同一份已消费 nonce 集合。
     public static let shared = LocalEnvelopeReplayStore()
 
+    /// 持久化结构；使用短键减小 UserDefaults 体积。
     private struct StoredEnvelope: Codable {
         var schemaVersion: Int
         var entries: [String: Int64]
@@ -41,19 +50,24 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
 
     private let defaults = UserDefaults.standard
     private let lock = UnfairLock()
+    // 存储键与 HMAC 键分离，便于整体校验/清理；版本后缀 v2 表示当前存储格式。
     private let key = "cloudphone_envelope_replay_v2"
     private let hmacKey = "cloudphone_envelope_replay_v2_hmac"
     private let hmacPurpose = "envelope_replay"
+    // freshness 锚点独立保存：用于检测回滚（sequence/时间戳倒退视为存储被替换）。
     private let freshnessAnchor = FreshnessAnchor(account: "envelope_replay_v2_freshness")
+    // 2048 条上限：控制内存与持久化体积，超出后优先淘汰最早过期项。
     private let maxEntries = 2048
     private var storage: [String: Int64] = [:]
     private var freshness: FreshnessState = .zero
     private var failClosed = false
 
+    /// 初始化时同步加载并校验持久化状态；失败会在 Release 下置 fail-closed。
     private init() {
         lock.withLock { loadLocked() }
     }
 
+    /// 尝试消费 nonce；首次出现返回 true，已存在或存储不可信返回 false。
     public func consumeIfNew(sessionToken: String, nonce: String, expiresAtMillis: Int64) -> Bool {
         lock.withLock {
             guard !failClosed else {
@@ -78,6 +92,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         }
     }
 
+    /// 加载持久化状态：先验 HMAC，再解密/解码，并检查 freshness 不得回退。
     private func loadLocked() {
         let anchor = freshnessAnchor.read() ?? .zero
         guard let stored = defaults.data(forKey: key) else {
@@ -116,6 +131,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
             latestTimestamp: Double(envelope.latestExpiryMillis),
             sequence: envelope.sequence
         )
+        // 磁盘状态的时间戳/序列号必须不落后于锚点；倒退说明状态被回滚或替换。
         if diskFreshness.sequence < anchor.sequence || diskFreshness.latestTimestamp < anchor.latestTimestamp {
             handleCorruptedStateLocked(reason: "freshness rollback detected", anchor: anchor)
             return
@@ -134,6 +150,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         }
     }
 
+    /// 加密、签名并持久化当前状态；任一步失败都返回 false 并触发 fail-closed。
     private func persistLocked() -> Bool {
         let anchor = freshnessAnchor.read() ?? .zero
         let latestExpiry = storage.values.max() ?? Int64(anchor.latestTimestamp)
@@ -174,6 +191,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         return true
     }
 
+    /// 处理损坏状态：清理持久化数据；DEBUG 允许继续（便于联调），Release 置 fail-closed。
     private func handleCorruptedStateLocked(reason: String, anchor: FreshnessState) {
         Logger.log("LocalEnvelopeReplayStore: \(reason)")
         clearPersistedStateLocked(resetAnchor: false)
@@ -186,6 +204,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         #endif
     }
 
+    /// 主动进入 fail-closed：Release 下后续所有 nonce 消费都会被拒绝。
     private func activateFailClosedLocked(reason: String) {
         Logger.log("LocalEnvelopeReplayStore: \(reason)")
         #if DEBUG
@@ -198,6 +217,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         }
     }
 
+    /// 清理持久化状态；`resetAnchor` 为 true 时连 freshness 锚点一起删除（仅用于显式重置）。
     private func clearPersistedStateLocked(resetAnchor: Bool) {
         defaults.removeObject(forKey: key)
         defaults.removeObject(forKey: hmacKey)
@@ -206,10 +226,12 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         }
     }
 
+    /// 惰性清理已过期条目，限制状态规模。
     private func pruneExpiredLocked(nowMillis: Int64) {
         storage = storage.filter { $0.value > nowMillis }
     }
 
+    /// 超出容量上限时按过期时间从早到晚淘汰，保留更长时间防重放能力。
     private func trimToLimitLocked() {
         guard storage.count > maxEntries else { return }
         let sorted = storage.sorted { $0.value < $1.value }
@@ -218,6 +240,7 @@ public final class LocalEnvelopeReplayStore: NonceReplayProtecting, @unchecked S
         }
     }
 
+    /// 重放键由 sessionToken 与 nonce 共同构成，避免不同会话的 nonce 相互影响。
     private func replayKey(sessionToken: String, nonce: String) -> String {
         "\(sessionToken):\(nonce)"
     }
@@ -287,6 +310,7 @@ extension CPRiskKit {
     }
 
     /// 通过 keyId 动态解析签名密钥进行本地校验。
+    /// - Parameter keyResolver: 根据 `envelope.keyId` 返回密钥；返回 nil 视为未知 keyId 并拒绝。
     public func validateSecureReportEnvelope(
         _ envelope: ReportEnvelope,
         keyResolver: (String) -> String?,
@@ -312,6 +336,7 @@ extension CPRiskKit {
     }
 
     /// 解析 JSON 并完成本地校验，成功时返回解析后的信封。
+    /// 解析失败统一返回 `.invalidEnvelopeJSON`，不把底层解码错误暴露给调用方。
     public func validateSecureReportEnvelopeJSON(
         _ json: String,
         signingKey: String,
@@ -344,6 +369,7 @@ extension CPRiskKit {
 }
 
 public extension SecureEnvelopeValidationError {
+    /// 稳定的机器可读原因码，供日志/指标聚合；底层信封错误会带上其 reasonCode。
     var reasonCode: String {
         switch self {
         case .invalidEnvelopeJSON:

@@ -1,3 +1,7 @@
+// 上报链路·完整性链印章信号源：设备不变量 → GF(2) 仿射变换 → SE 签名 → 跨 session 比对。
+// 输出 `integrity_chain_seal` / `invariant_seal_drift` 信号；证据随报告上报，SE 私钥始终留在设备内。
+// 计算放到后台任务并带 TTL，避免 Keychain/SE 同步 I/O 阻塞评分主链路。
+
 import CryptoKit
 import Foundation
 
@@ -30,13 +34,17 @@ import Foundation
 ///   首次 emit drift 后从缓存清零 driftFromLast，避免 TTL 内重复触发。
 final class IntegrityChainSealProvider: RiskSignalProvider {
 
+    /// 进程级单例，复用同一次启动内的 seal 缓存。
     static let shared = IntegrityChainSealProvider()
+    /// 信号源稳定标识。
     let id = "integrity_chain_seal"
 
+    // 300 秒 TTL：兼顾及时发现环境变化与避免频繁 Keychain/SE 调用拖慢评估。
     private static let sealTTL: TimeInterval = 300
     private static let keychainKeyLastSeal = "invariant_seal_v1"
     private static let keychainKeyLastSealAt = "invariant_seal_v1_at"
 
+    /// 一次印章计算的结果，包含签名、错误与跨 session 漂移信息。
     private struct SealResult {
         let sealHex: String
         let sig: Data?
@@ -45,6 +53,7 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
         let computedAt: Date
     }
 
+    /// 计算状态机：未计算 → 计算中 → 已计算（结果 + 时间）。
     private enum State {
         case notSealed
         case sealing
@@ -56,6 +65,8 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
 
     private init() {}
 
+    /// 读取/触发印章信号。
+    /// 首次调用触发后台计算并返回空；TTL 到期时返回旧缓存同时后台复算；计算中直接返回空。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         let action = lock.withLock { () -> Action in
             switch state {
@@ -89,6 +100,7 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
         }
     }
 
+    /// 状态机输出的下一步动作，避免在持锁期间执行耗时计算。
     private enum Action {
         case startSeal(returnCached: SealResult?)
         case returnEmpty
@@ -109,8 +121,10 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
         }
     }
 
-    // MARK: - Signal Construction
+    // MARK: - 信号构造
 
+    /// 把一次计算结果转换为风险信号。
+    /// 良性时分数为 0（仅作遥测）；矩阵被改或 SE 可用却签名失败才提分。
     private func signals(forResult result: SealResult) -> [RiskSignal] {
         var signals: [RiskSignal] = []
 
@@ -176,7 +190,7 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
         return signals
     }
 
-    // MARK: - Canonical Build
+    // MARK: - Canonical 字符串构建
 
     /// 把 snapshot 里"对同一设备应当稳定不变"的字段拼成一个 canonical 字符串。
     ///
@@ -201,8 +215,9 @@ final class IntegrityChainSealProvider: RiskSignalProvider {
         return fields.sorted().joined(separator: "|")
     }
 
-    // MARK: - Async Seal
+    // MARK: - 异步印章计算
 
+    /// 启动后台印章计算；若已有计算在进行则直接返回。
     private func kickOffSeal(canonical: String) {
         let shouldRun = lock.withLock { () -> Bool in
             if case .sealing = state { return false }

@@ -1,3 +1,7 @@
+// FridaModuleDetector：从已加载模块的静态特征识别 Frida/Gum/Gadget。
+// 维度包括 dyld 镜像名、可疑 Mach-O section 名、__cstring/__const 中的特征串，
+// 以及关键系统函数 prologue 的跳板分支。与端口/线程/内存布局检测互补：
+// 模块痕迹在 attach 后长期存在，难以仅靠关闭端口清除。
 import Darwin
 import Foundation
 import MachO
@@ -8,8 +12,13 @@ import MachO
 /// - dyld image names
 /// - suspicious Mach-O section names
 /// - string fragments found in loaded `__cstring` / `__const` sections
+/// 已加载模块特征检测器。
+/// - 优先使用稳定的名称/段/字符串启发式，而非易变的字节签名。
+/// - 线程模型：同步只读遍历 dyld 镜像与 Mach-O load command。
 struct FridaModuleDetector: Detector {
+    // 跳板命中的方法前缀。
     private static let trampolineMethodPrefix = "frida_module:trampoline:"
+    // 常被 hook 的高价值系统符号；检查其前两条指令是否为跳板。
     private let suspiciousTrampolineSymbols: [String] = [
         "objc_msgSend",
         "dlopen",
@@ -20,21 +29,28 @@ struct FridaModuleDetector: Detector {
         "open",
     ]
 
+    /// 单个符号 prologue 的观察值（前两条 32 位指令）。
     struct PrologueObservation: Sendable, Equatable {
         let symbol: String
         let firstInstruction: UInt32
         let secondInstruction: UInt32?
     }
 
+    // 镜像名中的 frida/gum/gadget 等标记（混淆常量）。
     let moduleMarkers: [String] = ObfuscatedConstants.fridaModuleMarkers
 
+    // 可疑 section 名标记。
     let suspiciousSectionMarkers: [String] = ObfuscatedConstants.fridaSectionMarkers
 
+    // 可疑字符串标记（在 __cstring/__const 中搜索）。
     let suspiciousStringMarkers: [String] = ObfuscatedConstants.fridaStringMarkers
 
+    // 只扫描这两个段，控制读取量；其他段与字符串特征无关。
     private let scannedSectionNames: Set<String> = ["__cstring", "__const"]
+    // 每个 section 最多读取 64KB，避免大型二进制拖慢检测。
     private let maxStringScanBytes = 64 * 1024
 
+    /// 执行镜像、段、字符串与跳板四类检测并汇总。
     func detect() throws -> DetectorResult {
 #if targetEnvironment(simulator)
         return DetectorResult(score: 0, methods: [ObfuscatedConstants.methodFridaModuleUnavailableSimulator])
@@ -42,8 +58,10 @@ struct FridaModuleDetector: Detector {
         var imageHits: [String] = []
         var sectionHits: [String] = []
         var stringHits: [String] = []
+        // 先检查关键符号跳板：命中说明运行时被 inline hook。
         let trampolineHits = detectTrampolineMarkers(in: capturePrologueObservations())
 
+        // 遍历所有 dyld 镜像，检查名称与来源异常。
         let imageCount = _dyld_image_count()
         for index in 0..<imageCount {
             let imageName = _dyld_get_image_name(index).map { String(cString: $0) } ?? ""
@@ -51,6 +69,7 @@ struct FridaModuleDetector: Detector {
             imageHits.append(contentsOf: detectImageOriginAnomalies(in: [imageName]))
 
             guard let header = _dyld_get_image_header(index) else { continue }
+            // 系统库不解析 Mach-O 布局：既省开销，也避免系统库噪声。
             let shouldInspectLayout = !imageName.hasPrefix("/usr/lib/") && !imageName.hasPrefix("/System/")
             guard shouldInspectLayout else { continue }
 
@@ -58,6 +77,7 @@ struct FridaModuleDetector: Detector {
             let isMainExecutable = isMainExecutableImage(index: index, imageName: imageName)
             sectionHits.append(contentsOf: detectSectionMarkers(in: layout.sectionNames))
             stringHits.append(contentsOf: detectStringMarkers(in: layout.stringBlobs))
+            // 主可执行文件额外加权：对主二进制的修改置信更高。
             if isMainExecutable {
                 sectionHits.append(contentsOf: detectSectionMarkers(in: layout.sectionNames, mainBinary: true))
                 stringHits.append(contentsOf: detectStringMarkers(in: layout.stringBlobs, mainBinary: true))
@@ -73,6 +93,7 @@ struct FridaModuleDetector: Detector {
 #endif
     }
 
+    /// 在镜像名中匹配 Frida/Gum 模块标记。
     func detectImageMarkers(in imageNames: [String]) -> [String] {
         var hits = Set<String>()
 
@@ -86,6 +107,7 @@ struct FridaModuleDetector: Detector {
         return hits.sorted()
     }
 
+    /// 检测异常加载来源：/tmp、Documents、Caches、沙盒 Data 等。
     func detectImageOriginAnomalies(in imageNames: [String]) -> [String] {
         var hits = Set<String>()
 
@@ -94,6 +116,7 @@ struct FridaModuleDetector: Detector {
             guard !normalized.isEmpty else { continue }
             guard !normalized.hasPrefix("/usr/lib/"), !normalized.hasPrefix("/system/") else { continue }
 
+            // 这些目录中的 dylib/framework 是重打包或注入的典型落点。
             if normalized.contains("/tmp/") {
                 hits.insert("\(ObfuscatedConstants.methodPrefixFridaModuleImage)tmp_origin")
             }
@@ -112,6 +135,7 @@ struct FridaModuleDetector: Detector {
         return hits.sorted()
     }
 
+    /// 在 section 名中匹配可疑标记；mainBinary 时加 main_binary 前缀以便加权。
     func detectSectionMarkers(in sectionNames: [String], mainBinary: Bool = false) -> [String] {
         var hits = Set<String>()
         let prefix = mainBinary
@@ -128,6 +152,7 @@ struct FridaModuleDetector: Detector {
         return hits.sorted()
     }
 
+    /// 在字符串 blob 中匹配可疑标记；mainBinary 时加前缀。
     func detectStringMarkers(in blobs: [String], mainBinary: Bool = false) -> [String] {
         var hits = Set<String>()
         let prefix = mainBinary
@@ -144,6 +169,7 @@ struct FridaModuleDetector: Detector {
         return hits.sorted()
     }
 
+    /// 检查关键符号 prologue 是否呈现跳板分支。
     func detectTrampolineMarkers(in observations: [PrologueObservation]) -> [String] {
         let branchDetector = PrologueBranchDetector()
         var hits = Set<String>()
@@ -157,6 +183,7 @@ struct FridaModuleDetector: Detector {
             }
 
             let detail: String
+            // 区分 literal load + register branch、直接 register branch 与普通 branch。
             if branchDetector.isLiteralLoad(observation.firstInstruction),
                let second = observation.secondInstruction,
                branchDetector.isRegisterBranch(second) {
@@ -172,6 +199,7 @@ struct FridaModuleDetector: Detector {
         return hits.sorted()
     }
 
+    /// 把四类命中合并为 DetectorResult（去重、排序、计分）。
     static func buildResult(
         imageHits: [String],
         sectionHits: [String],
@@ -185,23 +213,30 @@ struct FridaModuleDetector: Detector {
         let mainBinarySectionHits = uniqueSectionHits.filter { $0.contains(":main_binary:") }
         let mainBinaryStringHits = uniqueStringHits.filter { $0.contains(":main_binary:") }
 
+        // 镜像命中基础 14 分，每多一条 +3，封顶 20。
         let imageScore = uniqueImageHits.isEmpty ? 0.0 : min(14.0 + Double(max(0, uniqueImageHits.count - 1)) * 3.0, 20.0)
+        // section 命中基础 8 分，每多一条 +2，封顶 12。
         let sectionScore = uniqueSectionHits.isEmpty ? 0.0 : min(8.0 + Double(max(0, uniqueSectionHits.count - 1)) * 2.0, 12.0)
+        // 字符串命中基础 12 分，每多一条 +3，封顶 18。
         let stringScore = uniqueStringHits.isEmpty ? 0.0 : min(12.0 + Double(max(0, uniqueStringHits.count - 1)) * 3.0, 18.0)
+        // 跳板命中基础 14 分，每多一条 +4，封顶 18。
         let trampolineScore = uniqueTrampolineHits.isEmpty
             ? 0.0
             : min(14.0 + Double(max(0, uniqueTrampolineHits.count - 1)) * 4.0, 18.0)
+        // 主二进制命中额外加分：section 3 分/条、string 4 分/条，封顶 12。
         let mainBinaryBoost = min(
             Double(mainBinarySectionHits.count) * 3.0 + Double(mainBinaryStringHits.count) * 4.0,
             12.0
         )
 
         return DetectorResult(
+            // 总分封顶 44：模块特征可能来自合法调试工具/第三方 SDK。
             score: min(imageScore + sectionScore + stringScore + trampolineScore + mainBinaryBoost, 44),
             methods: uniqueImageHits + uniqueSectionHits + uniqueStringHits + uniqueTrampolineHits
         )
     }
 
+    /// 信号转换：按类别产出聚合信号与细分信号。
     static func asSignals(result: DetectorResult) -> [RiskSignal] {
         guard result.score > 0 else { return [] }
 
@@ -211,6 +246,7 @@ struct FridaModuleDetector: Detector {
         let stringMethods = result.methods.filter { $0.hasPrefix(ObfuscatedConstants.methodPrefixFridaModuleString) }
         let trampolineMethods = result.methods.filter { $0.hasPrefix(Self.trampolineMethodPrefix) }
 
+        // 聚合信号：总分封顶 28，state=tampered。
         signals.append(RiskSignal(
             id: SignalID.fridaModuleDetected,
             category: ObfuscatedConstants.categoryAntiTamper,
@@ -224,6 +260,7 @@ struct FridaModuleDetector: Detector {
             weightHint: 82
         ))
 
+        // 镜像名细分信号：每条 8 分，封顶 16。
         if !imageMethods.isEmpty {
             signals.append(RiskSignal(
                 id: SignalID.fridaModuleImage,
@@ -236,6 +273,7 @@ struct FridaModuleDetector: Detector {
             ))
         }
 
+        // section 细分信号：每条 6 分，封顶 12。
         if !sectionMethods.isEmpty {
             signals.append(RiskSignal(
                 id: SignalID.fridaModuleSection,
@@ -248,6 +286,7 @@ struct FridaModuleDetector: Detector {
             ))
         }
 
+        // 字符串细分信号：每条 8 分，封顶 16。
         if !stringMethods.isEmpty {
             signals.append(RiskSignal(
                 id: SignalID.fridaModuleString,
@@ -260,6 +299,7 @@ struct FridaModuleDetector: Detector {
             ))
         }
 
+        // 跳板细分信号：每条 10 分，封顶 18，置信最高。
         if !trampolineMethods.isEmpty {
             signals.append(RiskSignal(
                 id: SignalID.fridaModuleTrampoline,
@@ -275,8 +315,10 @@ struct FridaModuleDetector: Detector {
         return signals
     }
 
+    /// 读取关键符号前两条指令。
     private func capturePrologueObservations() -> [PrologueObservation] {
         let branchDetector = PrologueBranchDetector()
+        // RTLD_DEFAULT（-2）表示在当前进程全局符号表中查找。
         let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
 
         return suspiciousTrampolineSymbols.compactMap { symbol in
@@ -308,10 +350,12 @@ struct FridaModuleDetector: Detector {
         return false
     }
 
+    /// 解析单个 Mach-O 的 section 名与目标段字符串。
     private func inspectModuleLayout(
         header: UnsafePointer<mach_header>,
         imageIndex: UInt32
     ) -> (sectionNames: [String], stringBlobs: [String]) {
+        // 仅处理 64 位 Mach-O；32 位/畸形头直接跳过。
         guard header.pointee.magic == MH_MAGIC_64 || header.pointee.magic == MH_CIGAM_64 else {
             return ([], [])
         }
@@ -329,6 +373,7 @@ struct FridaModuleDetector: Detector {
             guard loadCommand.cmdsize >= MemoryLayout<load_command>.size else { break }
             defer { command = command.advanced(by: Int(loadCommand.cmdsize)) }
 
+            // 只遍历 LC_SEGMENT_64，其他 load command 与 section/字符串无关。
             guard loadCommand.cmd == LC_SEGMENT_64 else { continue }
 
             let segment = command.assumingMemoryBound(to: segment_command_64.self).pointee
@@ -352,9 +397,11 @@ struct FridaModuleDetector: Detector {
         return (sectionNames, stringBlobs)
     }
 
+    /// 读取 section 内容并规范化为可匹配文本。
     private func readBlob(section: section_64, slide: Int64) -> String? {
         guard section.addr != 0, section.size > 0 else { return nil }
 
+        // 限制读取长度为 maxStringScanBytes，避免超大 __const 拖慢扫描。
         let byteCount = Int(min(section.size, UInt64(maxStringScanBytes)))
         let runtimeAddress = Int64(section.addr) + slide
         guard byteCount > 0,
@@ -367,6 +414,7 @@ struct FridaModuleDetector: Detector {
         var normalized = [UInt8]()
         normalized.reserveCapacity(data.count)
 
+        // 非可打印字节替换为空格，避免二进制数据干扰子串匹配。
         for byte in data {
             if (32...126).contains(byte) {
                 normalized.append(byte)
@@ -378,6 +426,7 @@ struct FridaModuleDetector: Detector {
         return String(decoding: normalized, as: UTF8.self)
     }
 
+    /// 从固定长度 C 字符元组中读取以 NUL 结尾的字符串。
     private func cString<T>(from tuple: T) -> String {
         withUnsafeBytes(of: tuple) { rawBuffer in
             let bytes = rawBuffer.prefix { $0 != 0 }
@@ -387,6 +436,7 @@ struct FridaModuleDetector: Detector {
 }
 
 extension FridaModuleDetector {
+    /// Detector 协议入口：执行检测并转换信号。
     func asSignals() throws -> [RiskSignal] {
         Self.asSignals(result: try detect())
     }

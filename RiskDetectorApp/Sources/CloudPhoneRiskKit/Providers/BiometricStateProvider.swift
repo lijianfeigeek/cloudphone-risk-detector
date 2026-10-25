@@ -19,6 +19,7 @@ final class BiometricStateProvider: RiskSignalProvider {
 
     let id = "biometric_state"
 
+    /// 模拟器直接返回空；真机调用 `probeBiometricState` 只读探测，不弹窗。
     func signals(snapshot: RiskSnapshot) -> [RiskSignal] {
         #if targetEnvironment(simulator)
         return []
@@ -27,6 +28,10 @@ final class BiometricStateProvider: RiskSignalProvider {
         #endif
     }
 
+    /// 调用 `canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)` 探测。
+    /// - 可用且已录入：返回空；
+    /// - 未录入 / 硬件不可用 / 锁定：分别输出不同 id 的 soft 信号；
+    /// - 探测不弹窗、不留副作用，但需要 Info.plist 的 Face ID 用途说明。
     private func probeBiometricState() -> [RiskSignal] {
         let context = LAContext()
         var error: NSError?

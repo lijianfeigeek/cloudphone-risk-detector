@@ -1,3 +1,8 @@
+// 上报链路·gRPC/HTTP JSON 载荷：把安全信封映射为 UploadRiskReportRequest 结构，并在编码前校验绑定摘要。
+// 出设备字段：payload_json（base64）、signature、nonce/ts/reportId、attestation 证明与绑定诊断；
+// 签名密钥、DeviceKey、HKDF 材料等只保留在本地，不进入该结构。
+// 校验失败即拒绝序列化（fail-closed），避免把不一致的绑定摘要发给服务端。
+
 import CRiskCore
 import CryptoKit
 import Foundation
@@ -22,10 +27,13 @@ import Foundation
 ///
 /// 签名语义：`sigVer|nonce|ts|sessionToken|reportId|keyId|fieldMappingVersion|attestationKeyId|canonicalPayloadJSON`
 public struct GrpcReportPayload: Sendable {
+    // 以下三个字段构成 App Attest 证明对：keyId + assertion；v3 中它们被纳入签名域。
     public let attestationKeyId: String?
     public let attestationAssertion: Data?
     public let trustLevel: TrustLevel?
+    // 服务端下发的新鲜度挑战的二次证明（可选）。
     public let reAttestationAssertion: Data?
+    // 材料绑定模式与签名输入摘要，仅用于观测，不含密钥材料。
     public let bindingMode: String?
     public let bindingDigest: String?
     public let requireHardwareAttestation: Bool
@@ -40,13 +48,16 @@ public struct GrpcReportPayload: Sendable {
     public let fieldMappingVersion: String?
     public let deviceId: String
     public let scene: String
+    // 规范化后的报告正文；JSON 中以 base64 传输，签名覆盖其原始字节。
     public let payloadJson: Data
     public let signature: String
+    // 上下文绑定摘要：SHA-256(nonce|ts|reportId|payload)，防止跨请求嫁接。
     public let payloadSha256: Data
     /// 输出链路完整性信号：用于观测 JSONSerialization/SHA256 关键 API 路径的一致性。
     /// 仅作为上报证据，不参与信封签名语义。
     public let outputPathIntegrity: [String: String]?
 
+    /// 按 proto 字段顺序组装载荷；所有 optional 字段缺省为 nil。
     public init(
         appId: String,
         sdkVersion: String,
@@ -101,6 +112,8 @@ public struct GrpcReportPayload: Sendable {
         generatedWireDictionary()
     }
 
+    /// 编码前校验并返回 wire 字典：要求硬件证明时检查证明对完整，并重算绑定摘要。
+    /// - Throws: 证明缺失或摘要不一致时拒绝（fail-closed），不继续序列化/上报。
     internal func validatedJSONDictionary() throws -> [String: Any] {
         if requireHardwareAttestation && (attestationKeyId?.isEmpty != false || attestationAssertion?.isEmpty != false) {
             throw ReportEnvelope.ReportEnvelopeError.attestationIncomplete
@@ -118,6 +131,8 @@ public struct GrpcReportPayload: Sendable {
         return toJSONDictionary()
     }
 
+    /// 计算上下文绑定摘要：`SHA256(nonce|ts|reportId|payload)`。
+    /// 字段带长度前缀，避免字段值本身包含 `|` 时产生拼接歧义。
     internal static func computePayloadSha256(
         nonce: String,
         ts: Int64,
@@ -125,7 +140,7 @@ public struct GrpcReportPayload: Sendable {
         payload: Data
     ) -> Data {
         var hasher = SHA256()
-        // Length-prefix each field to prevent delimiter collision when fields contain '|'
+        // 对每个可变长字段做长度前缀，防止分隔符碰撞。
         let nonceBytes = Data(nonce.utf8)
         let reportIdBytes = Data(reportId.utf8)
         hasher.update(data: Data("\(nonceBytes.count):\(nonce)|\(ts)|\(reportIdBytes.count):\(reportId)|".utf8))
@@ -136,8 +151,11 @@ public struct GrpcReportPayload: Sendable {
 
 /// 构建 gRPC 兼容 payload 时的可选上下文（app_id、device_id、scene 等索引字段）。
 public struct GrpcReportContext: Sendable {
+    /// 调用方 App 标识，用于服务端分租户。
     public let appId: String
+    /// 设备稳定标识（与服务端索引一致）。
     public let deviceId: String
+    /// 业务场景标识；空字符串表示调用方未设置。
     public let scene: String
 
     public init(appId: String = "", deviceId: String = "", scene: String = "") {
@@ -147,7 +165,7 @@ public struct GrpcReportContext: Sendable {
     }
 }
 
-// MARK: - ReportEnvelope Extension
+// MARK: - ReportEnvelope 扩展
 
 extension ReportEnvelope {
     /// 将信封转为与 `UploadRiskReportRequest` proto 兼容的 payload 结构体。
@@ -155,6 +173,7 @@ extension ReportEnvelope {
     /// - Returns: 与 proto 字段一一对应的 `GrpcReportPayload`
     public func toGrpcCompatiblePayload(context: GrpcReportContext? = nil) -> GrpcReportPayload {
         let ctx = context ?? GrpcReportContext()
+        // 优先使用规范化 JSON 作为签名/摘要输入；规范化失败时退回原始 payload（签名仍覆盖原始字节）。
         let wirePayload = (try? canonicalPayloadString()).map { Data($0.utf8) } ?? payload
         let payloadSha256 = GrpcReportPayload.computePayloadSha256(
             nonce: nonce,
@@ -219,20 +238,17 @@ extension ReportEnvelope {
         return try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
     }
 
-    // MARK: - Compressed Upload
+    // MARK: - 压缩上传
 
-    /// Returns the serialised request body compressed with zlib deflate (RFC 1950).
+    /// 返回使用 zlib deflate（RFC 1950）压缩后的请求体。
     ///
-    /// The **signature covers the uncompressed canonical payload** so the server
-    /// must decompress the body before verifying.  Set the HTTP header
-    /// `Content-Encoding: zlib` when transmitting the compressed bytes.
+    /// **签名覆盖未压缩的 canonical payload**，服务端必须先解压再验签。
+    /// 传输压缩字节时应设置 HTTP 头 `Content-Encoding: zlib`。
     ///
-    /// If zlib compression would *increase* the payload size (e.g. very small
-    /// or already-compressed payloads) the raw uncompressed bytes are returned
-    /// instead and `isCompressed` is `false`.
+    /// 若压缩反而增大体积（例如极小或已压缩的 payload），返回原始未压缩字节，
+    /// 并令 `isCompressed` 为 `false`。
     ///
-    /// - Returns: `(data, isCompressed)` — `isCompressed` indicates whether
-    ///   `data` is zlib-compressed (`true`) or plain JSON (`false`).
+    /// - Returns: `(data, isCompressed)`；`isCompressed` 表示 `data` 是否为 zlib 压缩结果。
     public func toCompressedGrpcRequestBytes(
         context: GrpcReportContext? = nil
     ) throws -> (data: Data, isCompressed: Bool) {
@@ -244,6 +260,8 @@ extension ReportEnvelope {
         return (raw, false)
     }
 
+    /// 构建输出链路完整性观测行：核对 payload 摘要与规范化状态，并附签名身份/绑定上下文。
+    /// 这些字段仅用于诊断与灰度，不参与信封签名。
     private func buildOutputPathIntegritySignal(payloadSha256: Data, wirePayload: Data) -> [String: String] {
         let recomputed = GrpcReportPayload.computePayloadSha256(
             nonce: nonce,
@@ -313,6 +331,7 @@ extension ReportEnvelope {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// 把签名版本映射为可观测的绑定模式；未知版本按基础密钥绑定处理。
     private static func signatureBindingMode(for signatureVersion: String) -> String {
         switch signatureVersion {
         case "v2h":
@@ -326,6 +345,7 @@ extension ReportEnvelope {
         }
     }
 
+    /// 描述 attestationKeyId 与 assertion 的配对状态：只有 `paired` 才构成完整硬件信任根。
     private static func attestationPairState(
         attestationKeyId: String?,
         attestationAssertion: Data?
