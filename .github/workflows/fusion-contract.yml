@@ -1,7 +1,8 @@
 # CI runs NO tests: there is no unit/integration test step in this workflow.
-# A green run means “it builds and the generated contracts are current” —
-# it does NOT mean the armor transforms, runtime decryption, or VM paths
-# are functionally correct. Do not treat green CI as functional verification.
+# A green run means “it builds, the generated contracts are current, and the
+# static invariant checks pass” — it does NOT mean the armor transforms,
+# runtime decryption, or VM paths are functionally correct. Do not treat
+# green CI as functional verification.
 name: Build and contract generation
 on:
   pull_request:
@@ -39,5 +40,7 @@ jobs:
         run: python3 contracts/check_adapter_configuration_source.py
       - name: Architecture invariant checks
         run: python3 contracts/architecture_invariants.py
+      - name: Obfuscated constants decode check
+        run: python3 contracts/check_obfuscated_constants.py
       - name: Generated threaded runtime is current
         run: python3 experiments/vm-cpsv-v2/generate_runtime.py --check

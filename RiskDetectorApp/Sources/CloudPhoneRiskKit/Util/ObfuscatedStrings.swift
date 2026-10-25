@@ -91,12 +91,12 @@ enum ObfuscatedConstants {
 
     /// 云手机厂商的虚拟化主机/域名特征（"vresearch"），XOR 编码。
     static var vresearchPattern: String {
-        StringDeobfuscator.xorDecode([0x41, 0x55, 0x52, 0x44, 0x52, 0x56, 0x55, 0x42, 0x5f], key: 0x37)
+        StringDeobfuscator.xorDecode([0x41, 0x45, 0x52, 0x44, 0x52, 0x56, 0x45, 0x54, 0x5f], key: 0x37)
     }
 
     /// 半虚拟化标识（"paravirtual"），字节逆序存储。
     static var paravirtualPattern: String {
-        StringDeobfuscator.reverseBytes([0x6c, 0x61, 0x75, 0x74, 0x69, 0x72, 0x76, 0x61, 0x72, 0x61, 0x70])
+        StringDeobfuscator.reverseBytes([0x6c, 0x61, 0x75, 0x74, 0x72, 0x69, 0x76, 0x61, 0x72, 0x61, 0x70])
     }
 
     // MARK: - Frida / 注入相关路径与标记
@@ -107,7 +107,7 @@ enum ObfuscatedConstants {
         [
             StringDeobfuscator.base64Decode("L3Vzci9zYmluL2ZyaWRhLXNlcnZlcg=="),
             StringDeobfuscator.base64Decode("L3Vzci9iaW4vZnJpZGEtc2VydmVy"),
-            StringDeobfuscator.xorDecode([0x16, 0x16, 0x15, 0x01, 0x17, 0x17, 0x06, 0x00, 0x17, 0x14, 0x15, 0x06, 0x00, 0x17, 0x14, 0x15, 0x06, 0x15, 0x15, 0x14, 0x01, 0x15], key: 0x65),
+            StringDeobfuscator.xorDecode([0x4a, 0x10, 0x16, 0x17, 0x4a, 0x9, 0xa, 0x6, 0x4, 0x9, 0x4a, 0x7, 0xc, 0xb, 0x4a, 0x3, 0x17, 0xc, 0x1, 0x4, 0x48, 0x16, 0x0, 0x17, 0x13, 0x0, 0x17], key: 0x65),
             StringDeobfuscator.base64Decode("L3Zhci9qYi91c3Ivc2Jpbi9mcmlkYS1zZXJ2ZXI="),
             StringDeobfuscator.base64Decode("L3Zhci9qYi91c3IvYmluL2ZyaWRhLXNlcnZlcg=="),
         ]
@@ -123,19 +123,22 @@ enum ObfuscatedConstants {
         StringDeobfuscator.base64Decode("L0xpYnJhcnkvTW9iaWxlU3Vic3RyYXRl")
     }
 
-    /// 敏感 libc 符号名（Caesar 编码），供 dlsym / 栈完整性检查使用。
+    /// 敏感 libc 符号名 "sysctlbyname"（Caesar 编码），供 dlsym / 栈完整性检查使用。
+    /// 编码规则：编码字节 = 明文字母 + shift；解码时反向减 shift。
     static var sysctlbyname: String {
-        StringDeobfuscator.caesarShift([0x78, 0x64, 0x79, 0x68, 0x79, 0x71, 0x67, 0x64, 0x66, 0x73, 0x72, 0x6a], shift: 21)
+        StringDeobfuscator.caesarShift([0x6e, 0x74, 0x6e, 0x78, 0x6f, 0x67, 0x77, 0x74, 0x69, 0x76, 0x68, 0x7a], shift: 21)
     }
 
-    /// 动态加载入口符号名，避免字符串扫描直接定位注入点。
+    /// 动态加载入口符号名 "dlopen"，避免字符串扫描直接定位注入点。
+    /// 编码规则同上：编码字节 = 明文字母 + shift。
     static var dlopen: String {
-        StringDeobfuscator.caesarShift([0x67, 0x6f, 0x72, 0x73, 0x68, 0x71], shift: 23)
+        StringDeobfuscator.caesarShift([0x61, 0x69, 0x6c, 0x6d, 0x62, 0x6b], shift: 23)
     }
 
-    /// 反调试 / deny-attach 相关令牌（Caesar 编码），用于调试器与父进程相关性检查。
+    /// 反调试 / deny-attach 相关令牌 "ptrace"（Caesar 编码），用于调试器与父进程相关性检查。
+    /// 编码规则同上：编码字节 = 明文字母 + shift。
     static var denyAttachToken: String {
-        StringDeobfuscator.caesarShift([0x61, 0x65, 0x63, 0x6c, 0x6e, 0x70], shift: 15)
+        StringDeobfuscator.caesarShift([0x65, 0x69, 0x67, 0x70, 0x72, 0x74], shift: 15)
     }
 
     /// Frida 运行期标记（线程名、模块名、gadget 名等）。
@@ -144,11 +147,11 @@ enum ObfuscatedConstants {
         [
             StringDeobfuscator.xorDecode([0x43, 0x57, 0x6c, 0x61, 0x44], key: 0x25),
             StringDeobfuscator.rot13("sevqn-ntrag"),
-            StringDeobfuscator.reverseBytes([0x72, 0x65, 0x76, 0x72, 0x65, 0x73, 0x2d, 0x61, 0x74, 0x69, 0x72, 0x64, 0x66]),
+            StringDeobfuscator.reverseBytes([0x72, 0x65, 0x76, 0x72, 0x65, 0x73, 0x2d, 0x61, 0x64, 0x69, 0x72, 0x66]),
             StringDeobfuscator.caesarShift([0x6e, 0x68, 0x6b, 0x6e, 0x6c, 0x61], shift: 7),
-            StringDeobfuscator.xorDecode([0x43, 0x55, 0x4d], key: 0x24),
+            StringDeobfuscator.xorDecode([0x43, 0x51, 0x49], key: 0x24),
             StringDeobfuscator.multiStage([
-                { StringDeobfuscator.xorDecode([0x43, 0x55, 0x4d], key: 0x24) },
+                { StringDeobfuscator.xorDecode([0x43, 0x51, 0x49], key: 0x24) },
                 { StringDeobfuscator.rot13("-wf-ybbc") },
             ], separator: ""),
         ]
@@ -158,9 +161,9 @@ enum ObfuscatedConstants {
     static var hookFrameworkPatterns: [String] {
         [
             StringDeobfuscator.reverseBytes([0x65, 0x74, 0x61, 0x72, 0x74, 0x73, 0x62, 0x75, 0x73]),
-            StringDeobfuscator.xorDecode([0x29, 0x2c, 0x27, 0x3d, 0x2a, 0x2a, 0x2e, 0x20, 0x37], key: 0x45),
+            StringDeobfuscator.xorDecode([0x29, 0x2c, 0x27, 0x2d, 0x2a, 0x2a, 0x2e, 0x20, 0x37], key: 0x45),
             StringDeobfuscator.caesarShift([0x6c, 0x73, 0x73, 0x6c, 0x72, 0x70, 0x61], shift: 7),
-            StringDeobfuscator.rot13("fhogfvghr"),
+            StringDeobfuscator.rot13("fhofgvghgr"),
         ]
     }
 
@@ -225,7 +228,7 @@ enum ObfuscatedConstants {
 
     /// `fish` + `hook` stack needle for `CapabilityProbeEngine` (not a literal `fish` prefix in source).
     static var hookFrameworkFishhookToken: String {
-        StringDeobfuscator.xorDecode([0x36, 0x3d, 0x3a, 0x27], key: 0x55)
+        StringDeobfuscator.xorDecode([0x33, 0x3c, 0x26, 0x3d], key: 0x55)
     }
 
     /// Honeypot 填充行：无意义随机字节（运行时生成），永不代表真实凭据。
