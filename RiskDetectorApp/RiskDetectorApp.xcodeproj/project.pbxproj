@@ -1526,7 +1526,6 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)",
 				"$(DERIVED_FILE_DIR)/inject_vm_self_expect.stamp",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1548,7 +1547,6 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)",
 				"$(DERIVED_FILE_DIR)/apply_cprisk_armor.stamp",
 				"$(DERIVED_FILE_DIR)/cprisk_armor_build_seed",
 			);

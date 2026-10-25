@@ -3,7 +3,7 @@ set -euo pipefail
 
 tool_root="${SRCROOT}/../cprisk-armor"
 executable="${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}"
-stamp_path="${SCRIPT_OUTPUT_FILE_1}"
+stamp_path="${SCRIPT_OUTPUT_FILE_0}"
 seed_file="${DERIVED_FILE_DIR}/cprisk_armor_build_seed"
 
 write_stamp() {
