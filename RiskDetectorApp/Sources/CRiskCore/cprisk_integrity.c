@@ -1,11 +1,9 @@
-/*
- * CRiskCore - Multi-path integrity verification for cprisk-armor ABI v2.
- * Three independent paths compute the __TEXT.__text hash; path C reconstructs
- * the digest from the four split anchor sections. The CPRisk-MAC anchor tag is
- * verified against the reconstructed hash using the root key.
- * The combined result feeds key derivation, so tampering silently corrupts
- * the derived key.
- */
+// CRiskCore 多路径完整性校验（cprisk-armor ABI v3）。
+// 三条独立路径计算 __TEXT.__text 摘要：A=vm_read_overwrite、B=直接指针、C=从 4 个 split anchor lane 重建。
+// 合并摘要与 anchor 摘要会进入 CPRisk-MAC 校验和密钥派生，因此任何篡改都会污染派生密钥。
+// 线程模型：init/cleanup 由 Swift start() 在并发 evaluate() 之前单线程调用；就绪位为原子发布，运行期读取接受弱一致。
+// 失败语义：所有校验与初始化路径 fail-closed——失败时输出 0xFF 占位或就绪位清零，调用方得到欺骗材料或明确错误码。
+// 平台/架构：Mach VM 路径仅 Apple 平台；MTE 代码由 CPRISK_MTE_COMPILE_SUPPORT 编译开关控制。
 
 #include "include/CRiskCore.h"
 
@@ -26,6 +24,8 @@
 #include "include/cprisk_secure_zero.h"
 #include "include/cprisk_instruction_cache.h"
 
+// ABI 约束：内联 SHA-256 输出长度必须与 armor 的 32 字节摘要槽一致，
+// 否则三路拼接、MAC 校验与 anchor lane 布局都会错位。
 _Static_assert(CPRISK_SHA256_DIGEST_LENGTH == CPRISK_ARMOR_HASH_SIZE,
                "inline SHA256 digest size must match armor ABI");
 
@@ -36,6 +36,9 @@ _Static_assert(CPRISK_SHA256_DIGEST_LENGTH == CPRISK_ARMOR_HASH_SIZE,
  * Init/cleanup are single-threaded by contract (Swift start() runs
  * before any concurrent evaluate()); the ready flags below are _Atomic
  * so concurrent readers observe publication safely (issue 37). */
+// 运行时材料：init 成功后由密钥派生链生成，供 cprisk_get_runtime_material 读取。
+// ready 为 _Atomic：init 单线程写入，evaluate/并发读线程通过它观察“发布完成”，
+// 避免读到半初始化字节（issue 37）。
 static uint8_t s_runtime_material[CPRISK_ARMOR_HASH_SIZE];
 static _Atomic int s_runtime_material_ready;
 
@@ -48,31 +51,56 @@ static _Atomic int s_runtime_material_ready;
  * root_key for all subsequent derivations (white-box domain evaluation,
  * loader key, runtime material).  This binds the entire key chain to
  * both the physical device and the current session. */
+// 三层 Hybrid KDF 状态（由 cprisk_init_hybrid_kdf 单线程填充）：
+//   Layer 1 rootKey       = 调用方提供的 32 字节全熵密钥；
+//   Layer 2 deviceKey     = CPRisk-MAC(rootKey, deviceSalt)，绑定物理设备；
+//   Layer 3 effectiveRoot = CPRisk-MAC(deviceKey, sessionKey)，再绑定当前会话。
+// effectiveRoot 取代 rootKey 供动态 white-box 域与后续派生使用。
 static uint8_t s_device_key[CPRISK_ARMOR_KEY_SIZE];
 static int s_device_key_ready;
+// 对外的最终根密钥：任一上游密钥或 __TEXT 完整性被篡改都会让派生值改变，
+// 依赖它的解密/签名路径随之失败（fail-closed）。设备绑定失败时保持未就绪。
 static uint8_t s_effective_root[CPRISK_ARMOR_KEY_SIZE];
 static int s_effective_root_ready;
 
 /* Non-static so cprisk_anti_dump_probe.c can set it when dump/injection is detected. */
+// 欺骗模式开关：由反 dump 探针等跨模块置位。置位后所有诊断 getter 返回 0，
+// runtime material 输出欺骗值而非真实材料，避免给攻击者提供可验证的 oracle。
 volatile int s_integrity_deception_active;
+// 欺骗材料缓存：首次需要时派生并以原子 ready 发布；投毒/被调试时作为对外输出。
+// 后续 lane 投毒可就地扰动其字节（tweak_deception），使不同攻击路径得到不同假值。
 static uint8_t s_deception_material[CPRISK_ARMOR_HASH_SIZE];
 static _Atomic int s_deception_material_ready;
 
+// init 时保存的完整性基线，供 cprisk_recheck_integrity 周期性比对。
+// saved 标志必须先于并发 recheck 发布；poisoned 是全局“输出不可信”锁存位，
+// 一旦置 1 只能由 init/cleanup/测试钩子清除，运行期不会自行恢复。
 static uint8_t s_saved_integrity_hash[CPRISK_ARMOR_HASH_SIZE];
 static int s_integrity_hash_saved;
 static int s_integrity_poisoned;
 
 /* Distinct semantic bookkeeping per poison entry point (anti batch-NOP / single-hook). */
+// 投毒语义记账：每条 lane 独立计数，用于诊断“哪条域触发了几次”，
+// 也让批量 NOP 掉单一函数或单一 hook 无法同时抹掉所有 lane 的痕迹。
+// 这些是弱一致的 volatile/普通读写，不是同步原语；欺骗模式下 getter 统一返回 0。
 static volatile uint32_t s_poison_lane_seq[CPRISK_POISON_LANE_COUNT];
 static volatile uint32_t s_poison_semantic_breadcrumb;
+// rolling 是两字 XOR 折叠累加器，为 deception tweak 提供随 lane 与触发顺序变化的盐；
+// breadcrumb 低位记录“哪些 lane 触发过”（lane < 32），高位是每 lane 不同旋转量的折叠。
 static uint32_t s_poison_semantic_rolling[2];
 /* Poison-wave / ordering state: downstream material mix depends on more than s_integrity_poisoned alone. */
+// epoch 每次投毒副作用批 +1；cause_mix 以“lane + 发生顺序”混合。
+// 二者会进入 runtime material 输出混合与 high-signal lane 选择，
+// 因此下游材料不只取决于 s_integrity_poisoned 一个布尔值。
 static volatile uint32_t s_poison_epoch;
 static volatile uint64_t s_poison_cause_mix;
 
 /* Staged / deferred poison: weak-signal lanes accumulate opaque hits before full commit.
  * Thresholds are compile-time tunable; partial hits mix into cause/rolling state without
  * incrementing per-lane seq (avoids a linear “distance-to-poison” oracle). */
+// staged 阈值（编译期可覆盖）：watchdog/anti-dump 属弱信号，需累计多次才完整投毒。
+// watchdog 默认 5：吸收后台拉取/低电量调度抖动；真实攻击信号连续出现仍会在预算内提交。
+// anti-dump 默认 4：该探针调用更密集，留余量避免低端机 GC/内存压力造成单迭代误报。
 #ifndef CPRISK_POISON_STAGED_WATCHDOG_THRESHOLD
 /* Raised 3→5: absorbs transient BG-fetch / low-battery scheduling noise;
  * real attacker signals are consecutive and still commit well within budget. */
@@ -84,6 +112,8 @@ static volatile uint64_t s_poison_cause_mix;
 #define CPRISK_POISON_STAGED_ANTI_DUMP_THRESHOLD 4u
 #endif
 
+// staged 命中计数与不透明 tick（原子：探针可能从不同线程累加）。
+// 未达阈值时只做 staged_note、不递增 lane seq，避免攻击者通过“还差几次”做线性推断。
 static atomic_uint_fast32_t s_staged_watchdog_hits;
 static atomic_uint_fast32_t s_staged_anti_dump_hits;
 static atomic_uint_fast64_t s_staged_opacity_tick;
@@ -93,25 +123,38 @@ static atomic_uint_fast64_t s_staged_opacity_tick;
  * stays 0). A second threshold completion commits full lane poison. Observability: \c
  * cprisk_get_integrity_watchdog_slow_poison_phase().
  */
+// slow wave 阶段：第一个阈值完成后进入非终态“慢波”，加重降级但不置 s_integrity_poisoned；
+// 第二个阈值完成才完整提交。对外由 cprisk_get_integrity_watchdog_slow_poison_phase 观测。
 static atomic_uint_fast32_t s_staged_watchdog_slow_wave;
 
 #if defined(CPRISK_MTE_COMPILE_SUPPORT)
+// MTE 可用时给 runtime material / 保存的完整性基线加 canary。
+// recheck 时 -1 表示基线不符（篡改），-2 表示平台不支持/未安装（合法状态，不投毒）。
 static cprisk_mte_canary_state_t s_runtime_material_canary;
 static cprisk_mte_canary_state_t s_saved_integrity_canary;
 #endif
 
+// 最近一次 init 的单调时钟耗时，用于启动时序反调试阈值判断；
+// 异常偏慢可能意味着被调试/插桩。非原子，弱一致，仅作诊断。
 static uint64_t s_init_elapsed_ns;
 
 /* SDK-configurable anti-debug tier (production vs dev/QA relaxed). */
+// SDK 配置的加固档位：生产 / 开发联调 / App Store 安全。
+// 档位影响弱信号是否计分以及 init 时序阈值；默认生产档。
 static int s_runtime_hardening_mode = CPRISK_RUNTIME_HARDENING_PRODUCTION;
+// 测试钩子覆盖的 init 时序阈值（纳秒）；0 表示按机型与档位实时计算。
+// 仅 DEBUG 构建可写，Release 下保持 0。
 static uint64_t s_init_timing_threshold_override_ns;
 
+// init 时序基线 5s，再按机型代际增加 slack；RELAXED_DEV_QA / APP_STORE_SAFE
+// 额外放宽 10s，避免 CI 冷启动或商店审核环境被误判为调试器。
 #define CPRISK_INIT_TIMING_BASE_NS 5000000000ULL
 #define CPRISK_INIT_TIMING_RELAXED_EXTRA_NS 10000000000ULL
 
 static const struct mach_header_64 *cprisk_own_hdr_i(void);
 static uint64_t cprisk_monotonic_ns(void);
 
+// 前向声明：Hybrid KDF 实际实现在独立模块，本文件只负责编排与状态发布。
 /* Forward declarations for Hybrid KDF (implemented in separate modules). */
 int cprisk_derive_device_key(
     const uint8_t *root_key,
@@ -119,6 +162,7 @@ int cprisk_derive_device_key(
 );
 int cprisk_get_session_key(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]);
 
+// 前向声明：欺骗材料派生/发布（定义见下方），供反调试策略与投毒路径提前调用。
 static void cprisk_prepare_deception_material_i(
     const uint8_t *root_material,
     const uint8_t *full_anchor_hash,
@@ -127,12 +171,16 @@ static void cprisk_prepare_deception_material_i(
 
 extern void cprisk_watchdog_note_guard_page_fault(void);
 
+// 极简字节码：仅支持 HALT 与 XOR_IMM，把 loader key / runtime material
+// 从明显常量形态改成“运行时解释执行”的形态；未知 opcode 或截断立即数立即停止。
 /* Minimal bytecode bootstrap (loader key): single HALT = identity; extend with new opcodes if needed. */
 enum {
     CPRISK_MV_OP_HALT = 0,
     CPRISK_MV_OP_XOR_IMM = 1,
 };
 
+// 就地解释执行 mini VM：输入 code/len 由调用方拥有，输出写入 32 字节 buf。
+// 无内存分配、无错误码、可重入；HALT/未知 opcode/截断都只是提前返回（保留当前值）。
 static void cprisk_mini_vm_exec_buf(uint8_t buf[32], const uint8_t *code, size_t len) {
     size_t pc = 0;
     while (pc < len) {
@@ -150,6 +198,8 @@ static void cprisk_mini_vm_exec_buf(uint8_t buf[32], const uint8_t *code, size_t
 }
 
 /* Deterministic non-identity bootstrap: XOR_IMM then HALT (was pure HALT). */
+// 固定 bootstrap 程序：XOR_IMM(0xA5) 后 HALT，确保变换不是恒等映射，
+// 与 producer 端约定一致；改动会破坏数据段解密。
 static void cprisk_mini_vm_bootstrap_material32(uint8_t buf[32]) {
     const uint8_t prog[] = {
         CPRISK_MV_OP_XOR_IMM,
@@ -159,10 +209,13 @@ static void cprisk_mini_vm_bootstrap_material32(uint8_t buf[32]) {
     cprisk_mini_vm_exec_buf(buf, prog, sizeof(prog));
 }
 
+// loader key 的 bootstrap 包装；与 cprisk_mini_vm_bootstrap_material32 共用同一程序。
 static void cprisk_loader_key_mini_vm_bootstrap(uint8_t key[32]) {
     cprisk_mini_vm_bootstrap_material32(key);
 }
 
+// 仅 DEBUG 或显式编译开关下允许用环境变量 CPRISK_DISABLE_MINI_VM_BOOTSTRAP 关闭 bootstrap；
+// Release 构建忽略环境，避免攻击者通过环境变量绕过运行时材料变换。
 #if (defined(DEBUG) && DEBUG) || defined(CPRISK_ALLOW_MINI_VM_BOOTSTRAP_ENV_BYPASS)
 static int cprisk_mini_vm_bootstrap_disabled(void) {
     static int s_cached = -1;
@@ -179,11 +232,15 @@ static int cprisk_mini_vm_bootstrap_disabled(void) {
 }
 #endif
 
+// 硬崩溃默认关闭：确认调试器时优先“记录 + 投毒 + 欺骗”，
+// 避免误报杀掉可能合法的会话；只有显式编译开关才允许 __builtin_trap。
 #ifndef CPRISK_ANTI_DEBUG_HARD_CRASH_ON_DEBUGGER
 #define CPRISK_ANTI_DEBUG_HARD_CRASH_ON_DEBUGGER 0
 #endif
 
 enum {
+    // 反调试计划解析结果：写入 plan/snapshot；任何非 OK 都表示该 section 不可用，
+    // 但计划缺失在未加固构建中是合法状态，因此解析失败本身不投毒。
     CPRISK_ADBG_PARSE_OK_I = 0u,
     CPRISK_ADBG_PARSE_TRUNCATED_I = 1u,
     CPRISK_ADBG_PARSE_MAGIC_I = 2u,
@@ -194,11 +251,14 @@ enum {
 };
 
 enum {
+    // 策略应用触发位：区分 init 成功路径、init 失败、运行期完整性篡改。
     CPRISK_ADBG_TRIGGER_INIT_I = 1u << 0,
     CPRISK_ADBG_TRIGGER_INIT_FAILURE_I = 1u << 1,
     CPRISK_ADBG_TRIGGER_INTEGRITY_TAMPER_I = 1u << 2
 };
 
+// 运行期反调试计划（从 __DATA.__objc_data2 解析）：init 单线程填充，运行期只读。
+// probe_immediate/seed 参与决定哪些 patch 条目生效，policy_union_bits 是条目策略的并集。
 typedef struct cprisk_adbg_runtime_plan_i {
     uint32_t loaded;
     uint32_t section_present;
@@ -211,6 +271,8 @@ typedef struct cprisk_adbg_runtime_plan_i {
     uint32_t probe_immediate;
 } cprisk_adbg_runtime_plan_t;
 
+// 单个 patch site 条目：vm_offset 相对 __text，运行时加 slide 得到真实地址；
+// policy_bits 决定该站点响应类型，entry_flags 控制是否允许 inline patch / runtime gate。
 typedef struct cprisk_adbg_runtime_entry_i {
     uint64_t identifier_hash;
     uint64_t patch_site_vm_offset;
@@ -220,17 +282,25 @@ typedef struct cprisk_adbg_runtime_entry_i {
     uint32_t scatter_slot;
 } cprisk_adbg_runtime_entry_t;
 
+// 计划解析缓存与快照：plan 供运行期只读；snapshot 汇总计数/最近策略，供 Swift 查询。
+// reset 只在 init/cleanup/测试单线程路径调用；运行期读取为弱一致。
 static cprisk_adbg_runtime_plan_t s_adbg_plan_i;
 static cprisk_antidebug_plan_snapshot_t s_adbg_snapshot_i;
 static cprisk_adbg_runtime_entry_t s_adbg_entries_i[CPRISK_MAX_ENTRY_COUNT];
 static uint32_t s_adbg_entry_count_i = 0u;
+// 已写入 BRK 的 gate 站点与原子状态：armed 表示 gate 已生效，tamper 锁存异常；
+// 二者用原子存储发布，异常处理线程可并发读取。
 static uintptr_t s_adbg_inline_patch_sites_i[CPRISK_MAX_ENTRY_COUNT];
 static uint32_t s_adbg_inline_patch_count_i = 0u;
 static atomic_uint_fast32_t s_adbg_inline_patch_armed_i = 0u;
 static atomic_uint_fast32_t s_adbg_inline_patch_tamper_i = 0u;
+// 仅 DEBUG 使用的测试计划注入区；替换/清理时先 secure_zero 再 free，
+// 新缓冲区由本模块拥有。非 DEBUG 构建的测试入口直接返回。
 static uint8_t *s_test_adbg_plan_i = NULL;
 static size_t s_test_adbg_plan_len_i = 0u;
 
+// 手写 32 位 popcount，避免依赖编译器内建或引入额外符号；
+// 用于统计强/弱探针的命中数量。
 static uint32_t cprisk_popcount32_i(uint32_t value) {
     uint32_t count = 0u;
     while (value != 0u) {
@@ -240,6 +310,8 @@ static uint32_t cprisk_popcount32_i(uint32_t value) {
     return count;
 }
 
+// 乘法溢出检查：失败返回 -1 且不写 *out，
+// 防止 entry_count * entry_size 回绕后导致越界解析。
 static int cprisk_mul_size_checked_i(size_t lhs, size_t rhs, size_t *out) {
     if (out == NULL)
         return -1;
@@ -249,6 +321,7 @@ static int cprisk_mul_size_checked_i(size_t lhs, size_t rhs, size_t *out) {
     return 0;
 }
 
+// 清空计划解析状态（含原子 armed/tamper）；仅在 init/cleanup/测试单线程路径调用。
 static void cprisk_antidebug_reset_plan_state_i(void) {
     memset(&s_adbg_plan_i, 0, sizeof(s_adbg_plan_i));
     memset(&s_adbg_snapshot_i, 0, sizeof(s_adbg_snapshot_i));
@@ -260,6 +333,8 @@ static void cprisk_antidebug_reset_plan_state_i(void) {
     atomic_store(&s_adbg_inline_patch_tamper_i, 0u);
 }
 
+// 优先返回测试注入的计划字节；否则从自身 Mach-O 的 __DATA 段查找反调试 section。
+// 返回 0 且 *out_* 为 NULL/0 表示 section 不存在（合法）；返回 -1 表示入参或 header 不可用。
 static int cprisk_antidebug_section_bytes_i(const uint8_t **out_bytes, size_t *out_len) {
     if (!out_bytes || !out_len)
         return -1;
@@ -291,6 +366,9 @@ static int cprisk_antidebug_section_bytes_i(const uint8_t **out_bytes, size_t *o
     return 0;
 }
 
+// 惰性加载并解析反调试计划：loaded 标志保证只解析一次。
+// 所有边界（截断/魔数/版本/布局/条目数/乘法溢出）先校验再 memcpy；
+// 失败只记录 parse_error，不投毒——计划缺失在未加固构建中合法。
 static void cprisk_antidebug_load_plan_i(void) {
     if (s_adbg_plan_i.loaded != 0u)
         return;
@@ -383,9 +461,13 @@ static void cprisk_antidebug_load_plan_i(void) {
     s_adbg_snapshot_i.policy_union_bits = policy_union;
 }
 
+// BRK #imm 编码：0xD4200000 | (imm << 5)，imm 取 CPRISK_BRK_IMM_RUNTIME_GATE。
+// 该立即数由运行时写入 __text，异常处理器据此区分“自己的 gate”与外部断点。
 #define CPRISK_ADBG_RUNTIME_GATE_BRK_INSTR \
     (0xD4200000u | ((uint32_t)CPRISK_BRK_IMM_RUNTIME_GATE << 5u))
 
+// 判断 addr 及 4 字节指令是否完整落在 __text 内；
+// start+size 发生回绕时返回 0（失败即拒绝），防止对段外地址打补丁。
 static int cprisk_antidebug_addr_in_text_i(
     uintptr_t addr,
     const uint8_t *text_base,
@@ -402,6 +484,10 @@ static int cprisk_antidebug_addr_in_text_i(
     return (addr >= start && (addr + sizeof(uint32_t)) <= end) ? 1 : 0;
 }
 
+// 在 patch_addr 写入 runtime-gate BRK：
+// 4 字节对齐 → 已是目标指令则幂等返回 → 发现其它 BRK 视为篡改 →
+// 查询原页保护 → 临时 RW → 写入并刷指令缓存 → 恢复保护。
+// 任一步失败返回 -1；out_tamper 仅表示“发现他人 BRK”，不表示本次写入失败。
 static int cprisk_antidebug_patch_site_i(uintptr_t patch_addr, int *out_tamper) {
     if (out_tamper != NULL) {
         *out_tamper = 0;
@@ -460,6 +546,9 @@ static int cprisk_antidebug_patch_site_i(uintptr_t patch_addr, int *out_tamper) 
     return 0;
 }
 
+// 应用 inline patch gate：只处理同时声明 INLINE_PATCH 与 RUNTIME_GATE 的条目。
+// 返回 1=至少打了一个补丁，0=无 section/已 armed/无需处理，
+// -1=有失败并已投毒 anti-debug lane。地址越界或页保护失败都会累加 failure 并 fail-closed。
 static int cprisk_antidebug_apply_inline_patch_gate_i(void) {
     cprisk_antidebug_load_plan_i();
     if (s_adbg_plan_i.section_valid == 0u) {
@@ -550,11 +639,15 @@ static int cprisk_antidebug_apply_inline_patch_gate_i(void) {
 }
 
 enum {
+    // inline gate 健康检查位：BRK 丢失（被还原）、页可写（保护被改）、站点跑出 __text；
+    // 任一位置位都锁存 tamper 并投毒 anti-debug lane。
     CPRISK_ADBG_INLINE_GATE_HEALTH_BRK_MISSING_I = 1u << 0,
     CPRISK_ADBG_INLINE_GATE_HEALTH_PAGE_WRITABLE_I = 1u << 1,
     CPRISK_ADBG_INLINE_GATE_HEALTH_SITE_OUTSIDE_TEXT_I = 1u << 2,
 };
 
+// 通过 vm_region_64 查询地址所在区域保护：成功返回 0，*out_prot 为 PROT_* 子集；
+// 失败返回 -1。会 deallocate 返回的 object_name，避免 Mach 端口泄漏。
 static int cprisk_antidebug_query_page_prot_i(uintptr_t addr, int *out_prot) {
     if (!out_prot) {
         return -1;
@@ -583,6 +676,9 @@ static int cprisk_antidebug_query_page_prot_i(uintptr_t addr, int *out_prot) {
     return 0;
 }
 
+// 校验已 armed 的 gate 是否仍然完好；未 armed 时直接返回 0（无 gate 可查）。
+// 返回健康位掩码；非 0 时同时锁存 tamper、累加失败计数并投毒 anti-debug lane。
+// 线程安全：只读取 patch 站点数组与页保护，可与投毒并发；结果弱一致。
 uint32_t cprisk_antidebug_inline_gate_health_mask(void) {
     cprisk_antidebug_load_plan_i();
     if (atomic_load(&s_adbg_inline_patch_armed_i) == 0u || s_adbg_inline_patch_count_i == 0u) {
@@ -631,6 +727,8 @@ uint32_t cprisk_antidebug_inline_gate_health_mask(void) {
     return mask;
 }
 
+// 判断 brk_pc 是否属于本进程写入的 runtime gate 站点；
+// 用于异常处理器区分合法 BRK 与外部调试断点。
 static int cprisk_antidebug_is_runtime_gate_site_i(uintptr_t brk_pc) {
     if (brk_pc == 0u || s_adbg_inline_patch_count_i == 0u) {
         return 0;
@@ -643,6 +741,10 @@ static int cprisk_antidebug_is_runtime_gate_site_i(uintptr_t brk_pc) {
     return 0;
 }
 
+// 异常处理器入口：只处理 RUNTIME_GATE 立即数。
+// 返回 0=不是本模块的 BRK（交回系统），1=已消费并继续执行，
+// -1=站点未 armed/不在白名单，或检测到跟踪/交叉校验不一致——
+// 此时投毒 anti-debug lane，由调用方决定终止或降级（fail-closed）。
 int cprisk_exception_handler_handle_runtime_gate_brk(uint16_t brk_imm, uintptr_t brk_pc) {
     if (brk_imm != (uint16_t)CPRISK_BRK_IMM_RUNTIME_GATE) {
         return 0;
@@ -666,6 +768,9 @@ int cprisk_exception_handler_handle_runtime_gate_brk(uint16_t brk_imm, uintptr_t
     return 1;
 }
 
+// 按 probe_bits、风险等级与计划 seed 选择本次生效的 policy 位。
+// 选择是确定性伪随机门控：RUNTIME_GATE 条目始终启用；高风险约 3/4、低风险约 1/8 条目启用，
+// 防止攻击者通过固定 pattern 推断并批量 patch。无匹配时回退到 policy_union_bits。
 static uint32_t cprisk_antidebug_select_policy_bits_i(
     uint32_t probe_bits,
     int high_risk,
@@ -729,6 +834,8 @@ static uint32_t cprisk_antidebug_select_policy_bits_i(
     return selected_bits;
 }
 
+// 反调试延迟响应：基础 0.5–2ms；高风险再叠加 20–50ms。
+// 用 nanosleep 主动拖慢探测循环，增加动态分析成本；返回值供快照记录实际延迟。
 static uint64_t cprisk_antidebug_delay_response_i(uint64_t seed, uint32_t probe_immediate, int high_risk) {
     uint64_t mix = seed ^ ((uint64_t)probe_immediate << 17u) ^ 0x9E3779B97F4A7C15ULL;
     uint64_t delay_ns = 500000ull + (mix % 1500000ull); /* 0.5ms .. 2.0ms */
@@ -742,6 +849,8 @@ static uint64_t cprisk_antidebug_delay_response_i(uint64_t seed, uint32_t probe_
     return delay_ns;
 }
 
+// 从 hw.machine（如 iPhone15,2 / iPad13,4）解析主代际数字。
+// 未知前缀或非数字返回 -1 且 *out_major 置 -1，后续按“最宽松”处理。
 static int cprisk_parse_apple_hw_major_generation_i(const char *machine, int *out_major) {
     if (!machine || !out_major)
         return -1;
@@ -774,6 +883,7 @@ static int cprisk_parse_apple_hw_major_generation_i(const char *machine, int *ou
     return 0;
 }
 
+// 机型代际越新启动越快，允许的时序 slack 越小；未知机型给 10s、iPhone16+ 给 0。
 static uint64_t cprisk_generation_slack_ns_i(int major_gen) {
     if (major_gen < 0)
         return 8000000000ULL;
@@ -786,6 +896,8 @@ static uint64_t cprisk_generation_slack_ns_i(int major_gen) {
     return 10000000000ULL;
 }
 
+// 计算 init 时序阈值：基线 5s + 代际 slack；
+// RELAXED_DEV_QA / APP_STORE_SAFE 档位额外 +10s。
 static uint64_t cprisk_compute_init_timing_threshold_ns_for_machine_i(
     const char *machine,
     cprisk_runtime_hardening_mode_t mode
@@ -800,11 +912,18 @@ static uint64_t cprisk_compute_init_timing_threshold_ns_for_machine_i(
     return t;
 }
 
+// 是否处于放宽档位：这些模式下 TTY/开发者磁盘/时序等弱信号不计分，
+// 降低开发联调与商店审核环境的误报。
 static int cprisk_runtime_relaxed_dev_qa_i(void) {
     return s_runtime_hardening_mode == CPRISK_RUNTIME_HARDENING_RELAXED_DEV_QA ||
         s_runtime_hardening_mode == CPRISK_RUNTIME_HARDENING_APP_STORE_SAFE;
 }
 
+// 应用反调试计划策略（init 与 recheck 共用）。
+// 采集探针位并计算 strong/weak 命中，形成 debugger_likely/confirmed 判断；
+// 再按选中的 policy 执行 RUNTIME_GATE / DELAY_RESPONSE / ESCALATE_INTEGRITY /
+// TRAP_ON_TAMPER / CRASH_ON_DEBUGGER。确认风险时统一走“投毒 + 欺骗”（fail-closed），
+// 默认不崩溃（issue 42）。写全局 snapshot 与投毒状态；init 单线程调用，运行期调用弱一致。
 static void cprisk_antidebug_apply_policies_i(uint32_t trigger_flags, int init_rc_hint, int integrity_rc_hint) {
     cprisk_antidebug_load_plan_i();
     if (s_adbg_plan_i.section_valid == 0u || s_adbg_plan_i.policy_union_bits == 0u)
@@ -813,6 +932,7 @@ static void cprisk_antidebug_apply_policies_i(uint32_t trigger_flags, int init_r
         (void)cprisk_antidebug_apply_inline_patch_gate_i();
     }
 
+    // 强信号=单次即可高置信（trap/硬件断点/DBI/异常端口等）；弱信号需要组合或放宽门控。
     const uint32_t strong_probe_mask =
         CPRISK_PROBE_SIGNAL_TRAP |
         CPRISK_PROBE_THREAD_EXCEPTION_PORT |
@@ -843,6 +963,7 @@ static void cprisk_antidebug_apply_policies_i(uint32_t trigger_flags, int init_r
                                          CPRISK_PROBE_TIMING_ANOMALY);
     }
     const uint32_t weak_hits = cprisk_popcount32_i(probe_bits & weak_scoring_mask);
+    // 跟踪状态权重 3，强命中 ×2，弱命中 ×1；>=3 视为可能，>=5 或 2 个强命中视为确认。
     const int debug_strength = (traced ? 3 : 0) + (int)(strong_hits * 2u + weak_hits);
     const int debugger_likely = traced != 0 || debug_strength >= 3;
     const int debugger_confirmed = traced != 0 || debug_strength >= 5 || strong_hits >= 2u;
@@ -926,6 +1047,8 @@ static void cprisk_antidebug_apply_policies_i(uint32_t trigger_flags, int init_r
     s_adbg_snapshot_i.last_applied_policy_bits = applied;
 }
 
+// 导出计划快照：先把原子 armed/tamper 同步进 snapshot，再整体拷贝。
+// 返回 -1 表示 out_snapshot 为 NULL；快照弱一致，不保证与并发投毒严格同步。
 int cprisk_get_antidebug_plan_snapshot(cprisk_antidebug_plan_snapshot_t *out_snapshot) {
     if (!out_snapshot)
         return -1;
@@ -938,6 +1061,8 @@ int cprisk_get_antidebug_plan_snapshot(cprisk_antidebug_plan_snapshot_t *out_sna
     return 0;
 }
 
+// 测试钩子：复制注入计划并清空解析状态；非 DEBUG 构建直接返回 -1。
+// 旧注入缓冲区先 secure_zero 再 free；新缓冲区由本模块拥有。
 int cprisk_test_set_antidebug_plan(const uint8_t *plan, size_t plan_len) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -961,6 +1086,7 @@ int cprisk_test_set_antidebug_plan(const uint8_t *plan, size_t plan_len) {
     return 0;
 }
 
+// 测试钩子：清零并释放注入计划，重置解析状态；非 DEBUG 构建为空操作。
 void cprisk_test_clear_antidebug_plan(void) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -975,6 +1101,8 @@ void cprisk_test_clear_antidebug_plan(void) {
     cprisk_antidebug_reset_plan_state_i();
 }
 
+// 通过本函数的代码地址反查自身 Mach-O header，
+// 避免依赖可能被 hook 的 dyld/NSBundle API。
 static const struct mach_header_64 *cprisk_own_hdr_i(void) {
     return cprisk_find_own_header((const void *)cprisk_own_hdr_i);
 }
@@ -989,6 +1117,9 @@ static const struct mach_header_64 *cprisk_own_hdr_i(void) {
  * Callers holding a password must stretch it with a platform KDF
  * (or HKDF over a high-entropy secret) before calling here; feeding a
  * weak password directly would make the "32-byte key" low-entropy. */
+// 填充 32 字节根材料。严格要求长度 == 32：短密钥不补零、长密钥不截断，
+// 二者都返回 -1 并清零输出。补零会降低熵，截断会静默丢弃密钥位。
+// 本层不做 PBKDF2/Argon2，输入必须是全熵密钥，绝不能是人工口令。
 static int cprisk_fill_root_material_i(const uint8_t *root_key,
                                         size_t root_key_len,
                                         uint8_t out[CPRISK_ARMOR_KEY_SIZE]) {
@@ -999,6 +1130,7 @@ static int cprisk_fill_root_material_i(const uint8_t *root_key,
     return 0;
 }
 
+// 显式小端序列化：派生输入的字节序必须与 producer 端一致，不能依赖主机端序。
 static void cprisk_u64_to_le_i(uint64_t value, uint8_t out[8]) {
     out[0] = (uint8_t)(value);
     out[1] = (uint8_t)(value >> 8);
@@ -1010,6 +1142,7 @@ static void cprisk_u64_to_le_i(uint64_t value, uint8_t out[8]) {
     out[7] = (uint8_t)(value >> 56);
 }
 
+// 从 8 字节小端还原 u64；用于把 accumulator 摘要转成数值。
 static uint64_t cprisk_u64_from_le_i(const uint8_t in[8]) {
     return ((uint64_t)in[0]) |
            ((uint64_t)in[1] << 8) |
@@ -1021,6 +1154,7 @@ static uint64_t cprisk_u64_from_le_i(const uint8_t in[8]) {
            ((uint64_t)in[7] << 56);
 }
 
+// 64 位循环左移；shift 自动取模 64，shift==0 时直接返回以避免未定义行为。
 static uint64_t cprisk_rotl64_i(uint64_t value, unsigned int shift) {
     shift &= 63U;
     if (shift == 0U)
@@ -1028,6 +1162,8 @@ static uint64_t cprisk_rotl64_i(uint64_t value, unsigned int shift) {
     return (value << shift) | (value >> (64U - shift));
 }
 
+// 由 seed 折叠出 PAC discriminator：常数 "CPRISKPA" + 最多 16 字节 seed，逐字节 XOR/旋转。
+// 该值仅用于 PAC/CFI 自检判别，不参与密钥派生。
 static uintptr_t cprisk_pac_discriminator_i(const uint8_t *seed, size_t seed_len) {
     uint64_t acc = 0x43505249534B5041ULL; /* "CPRISKPA" */
     if (seed && seed_len > 0) {
@@ -1040,6 +1176,8 @@ static uintptr_t cprisk_pac_discriminator_i(const uint8_t *seed, size_t seed_len
     return (uintptr_t)acc;
 }
 
+// PAC/CFI 自检：先验证 discriminator 能通过 pac_self_test，再验证核心回调指针有效。
+// 返回 -1 表示平台保护被破坏；调用方应视为篡改（init 失败）。
 static int cprisk_validate_pac_cfi_i(const uint8_t *seed, size_t seed_len) {
     const uintptr_t discriminator = cprisk_pac_discriminator_i(seed, seed_len);
     if (cprisk_pac_self_test(discriminator) != 0)
@@ -1050,6 +1188,8 @@ static int cprisk_validate_pac_cfi_i(const uint8_t *seed, size_t seed_len) {
 }
 
 enum {
+    // white-box 域 ID：1=anchor tag，2=pass1 字符串密钥，3=anchor accumulator seed，
+    // 4=loader key，5=runtime material。域 ID 是 ABI 契约，改动需同步 producer。
     CPRISK_WHITEBOX_DOMAIN_ANCHOR_TAG_I = 1u,
     CPRISK_WHITEBOX_DOMAIN_PASS1_STRING_KEY_I = 2u,
     CPRISK_WHITEBOX_DOMAIN_ANCHOR_ACCUMULATOR_SEED_I = 3u,
@@ -1057,12 +1197,15 @@ enum {
     CPRISK_WHITEBOX_DOMAIN_RUNTIME_MATERIAL_I = 5u
 };
 
+// 前向声明：white-box 域求值实现在独立模块；返回 0 成功，非 0 表示域不可用/校验失败。
 int cprisk_whitebox_evaluate_domain(
     uint32_t domain_id,
     const uint8_t input[32],
     uint8_t out[32]
 );
 
+// 派生字符串解密密钥：SHA256(label || root_material)，取前 32 字节。
+// label 固定为 "cprisk.pass1.key.v1"，必须与构建期加密端一致。
 static int cprisk_derive_pass1_string_key_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]
@@ -1081,6 +1224,8 @@ static int cprisk_derive_pass1_string_key_i(
     return 0;
 }
 
+// 计算 anchor 绑定累加器：SHA256(label || root || full_anchor_hash || integrity_hash)，
+// 取小端首 8 字节再 rotl 7。它把代码摘要与 anchor 摘要耦合进后续 loader/runtime 派生。
 static uint64_t cprisk_anchor_bound_accumulator_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     const uint8_t full_anchor_hash[CPRISK_ARMOR_HASH_SIZE],
@@ -1102,6 +1247,8 @@ static uint64_t cprisk_anchor_bound_accumulator_i(
     return cprisk_rotl64_i(acc, 7U);
 }
 
+// 混合“稳定上下文”：自身 header 地址、函数地址、pid、init 耗时。
+// 这些值在进程内稳定，使欺骗材料可复现，同时随进程/设备不同而变化。
 static void cprisk_mix_stable_deception_context_i(cprisk_sha256_ctx *ctx) {
     const struct mach_header_64 *hdr = cprisk_own_hdr_i();
     uint8_t hdr_le[8];
@@ -1125,6 +1272,9 @@ static void cprisk_mix_stable_deception_context_i(cprisk_sha256_ctx *ctx) {
     cprisk_secure_zero(elapsed_le, sizeof(elapsed_le));
 }
 
+// 派生欺骗材料（decoy）：label + 可选 root/anchor/integrity + 稳定上下文。
+// 缺失输入用固定占位串代替；integrity 占位以 XOR 0x5A 编码，避免明文出现在二进制中。
+// 输出 32 字节，临时明文在返回前清零。
 static void cprisk_derive_decoy_material_i(
     const uint8_t *root_material,
     const uint8_t *full_anchor_hash,
@@ -1167,6 +1317,8 @@ static void cprisk_derive_decoy_material_i(
     cprisk_secure_zero(missing_integrity_dec, sizeof(missing_integrity_dec));
 }
 
+// 首次需要时派生并以原子 store 发布欺骗材料；ready 已置位则直接返回（幂等）。
+// 多线程可能同时进入并重复计算，但读侧只会看到完整发布的结果。
 static void cprisk_prepare_deception_material_i(
     const uint8_t *root_material,
     const uint8_t *full_anchor_hash,
@@ -1179,6 +1331,8 @@ static void cprisk_prepare_deception_material_i(
     atomic_store(&s_deception_material_ready, 1);
 }
 
+// 是否启用欺骗：被跟踪 / mprotect 被篡改 / init 时序异常。
+// 这是“是否把假材料给调用方”的策略判断，本身不修改投毒状态。
 static int cprisk_should_activate_deception_i(void) {
     if (cprisk_is_being_traced_redundant())
         return 1;
@@ -1189,6 +1343,8 @@ static int cprisk_should_activate_deception_i(void) {
     return 0;
 }
 
+// 重置全部投毒语义状态；仅 init/cleanup/测试单线程调用，
+// 确保新一轮保护从零开始，不残留上一轮 lane 计数/指纹。
 static void cprisk_integrity_poison_semantic_reset_i(void) {
     memset((void *)&s_poison_lane_seq[0], 0, sizeof(s_poison_lane_seq));
     s_poison_semantic_breadcrumb = 0u;
@@ -1198,6 +1354,11 @@ static void cprisk_integrity_poison_semantic_reset_i(void) {
     s_poison_cause_mix = 0u;
 }
 
+// lane 投毒副作用（不置全局 poisoned 位）：递增该 lane 序号与 epoch，
+// 以顺序敏感方式折叠 cause_mix / rolling / breadcrumb。
+// 每条 lane 使用不同常量与不同旋转方向，避免一份通用 patch 抹平所有 lane 语义；
+// 末尾把 lane 位 OR 入低 32 位，使“哪些 lane 触发过”仍可观测。
+// 越界 lane 归一到 FORCE；函数不做同步，读侧按弱一致处理。
 static void cprisk_integrity_poison_lane_sidefx_i(uint32_t lane) {
     if (lane >= (uint32_t)CPRISK_POISON_LANE_COUNT)
         lane = CPRISK_POISON_LANE_FORCE;
@@ -1270,6 +1431,10 @@ static void cprisk_integrity_poison_lane_sidefx_i(uint32_t lane) {
         s_poison_semantic_breadcrumb |= (1u << lane);
 }
 
+// 按 lane 就地扰动欺骗材料，使不同攻击路径得到不同假材料。
+// 仅在 deception material 已发布时生效；各 lane 使用互不重叠的字节窗口
+// （前段/尾段/中段/特定 u32 槽），避免一个 lane 掩盖另一个。
+// salt 来自 rolling 与 lane seq，随触发顺序变化。
 static void cprisk_integrity_poison_lane_tweak_deception_i(uint32_t lane) {
     if (lane >= (uint32_t)CPRISK_POISON_LANE_COUNT || atomic_load(&s_deception_material_ready) == 0)
         return;
@@ -1341,6 +1506,9 @@ static void cprisk_integrity_poison_lane_tweak_deception_i(uint32_t lane) {
     }
 }
 
+// 完整投毒提交：置全局 poisoned，记录 lane 副作用；满足条件时启用欺骗并扰动材料。
+// anti-dump lane 始终启用欺骗（与旧探针行为对齐），其余 lane 仅在
+// 跟踪/mprotect/时序启发式触发时启用。可并发调用，读侧接受弱一致。
 static void cprisk_integrity_poison_lane_full_i(uint32_t lane) {
     if (lane >= (uint32_t)CPRISK_POISON_LANE_COUNT)
         lane = CPRISK_POISON_LANE_FORCE;
@@ -1356,6 +1524,9 @@ static void cprisk_integrity_poison_lane_full_i(uint32_t lane) {
     }
 }
 
+// staged 不透明记录：未达阈值时不递增 lane seq，只把 tick 折叠进 cause_mix/rolling；
+// 若欺骗材料已发布，再混入 tick 噪声，使“仅 staged”响应也随 tick 变化、无法做位级比对。
+// tick 为原子自增，可并发调用；这不是完整投毒，s_integrity_poisoned 保持 0。
 static void cprisk_integrity_poison_staged_note_i(uint32_t lane) {
     if (lane >= (uint32_t)CPRISK_POISON_LANE_COUNT)
         lane = CPRISK_POISON_LANE_FORCE;
@@ -1390,10 +1561,14 @@ static void cprisk_integrity_poison_staged_note_i(uint32_t lane) {
     }
 }
 
+// watchdog 第一个阈值完成后先经历 2 个慢波才完整提交；
+// 慢波逐步加重输出降级，但保持“尚未 poison”的可否认性。
 #ifndef CPRISK_POISON_STAGED_WATCHDOG_SLOW_WAVES_BEFORE_FULL
 #define CPRISK_POISON_STAGED_WATCHDOG_SLOW_WAVES_BEFORE_FULL 2u
 #endif
 
+// watchdog 慢波：连续三次 staged_note 叠加额外 cause_mix/rolling 熵，
+// 使签名/whitebox 链路先出现差异，但全局 poisoned 仍为 0。
 static void cprisk_integrity_poison_watchdog_slow_wave_i(void) {
     /*
      * Progressive degradation without flipping global poison: multiple staged_note folds +
@@ -1414,6 +1589,8 @@ static void cprisk_integrity_poison_watchdog_slow_wave_i(void) {
     s_poison_semantic_rolling[1] ^= (uint32_t)z ^ 0x57445631u;
 }
 
+// watchdog staged 入口：每次命中自增；达阈值后清零计数并推进慢波。
+// 慢波未满 2 次只做渐进降级；满 2 次完整提交 watchdog lane。原子计数，可并发。
 static void cprisk_integrity_poison_watchdog_lane_staged_i(void) {
     const uint32_t n = atomic_fetch_add(&s_staged_watchdog_hits, 1) + 1u;
     if (n >= CPRISK_POISON_STAGED_WATCHDOG_THRESHOLD) {
@@ -1430,6 +1607,7 @@ static void cprisk_integrity_poison_watchdog_lane_staged_i(void) {
     }
 }
 
+// anti-dump staged 入口：达到阈值才完整提交 anti-dump lane，否则只做不透明 staged_note。
 static void cprisk_integrity_poison_anti_dump_lane_staged_i(void) {
     const uint32_t n = atomic_fetch_add(&s_staged_anti_dump_hits, 1) + 1u;
     if (n >= CPRISK_POISON_STAGED_ANTI_DUMP_THRESHOLD) {
@@ -1440,6 +1618,8 @@ static void cprisk_integrity_poison_anti_dump_lane_staged_i(void) {
     }
 }
 
+// 派生数据段 loader key：SHA256(label || root || anchor || integrity || string_acc_le)。
+// label 以 XOR 常量编码存储、运行时解码，避免明文标签直接出现在二进制；输出 32 字节密钥。
 static void cprisk_derive_loader_key_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     const uint8_t full_anchor_hash[CPRISK_ARMOR_HASH_SIZE],
@@ -1479,6 +1659,8 @@ static void cprisk_derive_loader_key_i(
     cprisk_secure_zero(acc_le, sizeof(acc_le));
 }
 
+// 派生 runtime material：SHA256(label || root || anchor || integrity || string_acc || data_acc)。
+// data_acc 来自受保护数据加载器，因此数据段内容也绑定进最终运行时材料。
 static void cprisk_derive_runtime_material_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     const uint8_t full_anchor_hash[CPRISK_ARMOR_HASH_SIZE],
@@ -1525,6 +1707,7 @@ static void cprisk_derive_runtime_material_i(
     cprisk_secure_zero(data_le, sizeof(data_le));
 }
 
+// SHA256(a || b) 的便捷封装；把多个摘要/累加器无歧义串接（长度由调用方保证）。
 static void cprisk_sha256_concat2_i(
     const uint8_t *a,
     size_t a_len,
@@ -1539,6 +1722,7 @@ static void cprisk_sha256_concat2_i(
     cprisk_sha256_final(&ctx, out_hash);
 }
 
+// SHA256(a || b || c) 的便捷封装；用于 anchor/accumulator 组合派生。
 static void cprisk_sha256_concat3_i(
     const uint8_t *a,
     size_t a_len,
@@ -1556,6 +1740,7 @@ static void cprisk_sha256_concat3_i(
     cprisk_sha256_final(&ctx, out_hash);
 }
 
+// SHA256(a || b || c || d) 的便捷封装；用于 runtime material 的完整输入串接。
 static void cprisk_sha256_concat4_i(
     const uint8_t *a,
     size_t a_len,
@@ -1576,6 +1761,9 @@ static void cprisk_sha256_concat4_i(
     cprisk_sha256_final(&ctx, out_hash);
 }
 
+// 用 white-box 域 1 校验 anchor tag：读取 __DATA 中 32 字节 tag 区，
+// 以 full_hash 为输入求值得到 tag，再做常量时间 MAC 比较。
+// 返回 -1 表示 section 缺失/长度不符/求值失败/MAC 不匹配；调用方应投毒并 fail-closed。
 static int cprisk_verify_anchor_whitebox_i(
     const uint8_t full_hash[CPRISK_ARMOR_HASH_SIZE]
 ) {
@@ -1602,6 +1790,11 @@ static int cprisk_verify_anchor_whitebox_i(
     return rc;
 }
 
+// legacy 初始化路径（white-box 不可用时）：
+// 校验 anchor MAC → 派生 pass1/string key → 初始化解密器 → 派生 loader key →
+// 加载受保护数据 → 派生 runtime material 并原子发布。
+// 返回 0 成功；-4 anchor MAC 失败；-5 字符串解密器失败；-6 loader key/数据加载器失败；
+// -7 受保护数据加载失败。任一失败都不发布 runtime material，调用方必须 cleanup。
 static int cprisk_init_protection_legacy_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     const uint8_t full_anchor_hash[CPRISK_ARMOR_HASH_SIZE],
@@ -1672,6 +1865,11 @@ cleanup:
     return rc;
 }
 
+// white-box 初始化路径：先校验 anchor tag，再逐域求值 pass1 key / anchor accumulator /
+// loader key / runtime material；各中间摘要用 SHA256 串接，保证域输入不可混淆。
+// 失败码：-4 anchor 校验；-5 pass1 或字符串解密器；-6 accumulator/loader key/数据加载器；
+// -7 受保护数据或 runtime material。white-box 求值失败会立即投毒 whitebox lane。
+// 所有栈上密钥/摘要最后统一 secure_zero；全部成功后才原子发布 runtime material。
 static int cprisk_init_protection_whitebox_i(
     const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     const uint8_t full_anchor_hash[CPRISK_ARMOR_HASH_SIZE],
@@ -1809,8 +2007,13 @@ cleanup:
 /* ── Path A: Mach VM read ──────────────────────────────────────────── */
 
 /* vm_size_t is 32-bit on Darwin; avoid truncation when sz > UINT32_MAX */
+// Darwin 的 vm_size_t 是 32 位；单次 vm_read_overwrite 不超过 UINT32_MAX，
+// 超出部分分块读取，避免长度截断。
 #define CPRISK_VM_READ_CHUNK_MAX ((size_t)0xFFFFFFFFUL)
 
+// Path A：用 vm_read_overwrite 把 __text 读入堆缓冲区再计算 SHA256，
+// 观察的是内核 VM 暴露的内存视图。读取失败/短读即返回 -1；
+// 缓冲区在释放前清零，避免残留代码字节。
 static int path_a(const struct mach_header_64 *hdr, uint8_t *out) {
     unsigned long sz = 0;
     const uint8_t *text = cprisk_find_section(hdr, "__TEXT", "__text", &sz);
@@ -1867,6 +2070,8 @@ static int path_a(const struct mach_header_64 *hdr, uint8_t *out) {
 
 /* ── Path B: direct pointer read ───────────────────────────────────── */
 
+// Path B：直接按指针读取 __TEXT.__text 计算 SHA256，绕过 VM 读取 API，
+// 与 Path A 构成两套独立观察面。分块仅限制单次 update 大小；失败返回 -1。
 static int path_b(const struct mach_header_64 *hdr, uint8_t *out) {
     unsigned long sz = 0;
     const uint8_t *text = cprisk_find_section(hdr, "__TEXT", "__text", &sz);
@@ -1890,7 +2095,12 @@ static int path_b(const struct mach_header_64 *hdr, uint8_t *out) {
 
 /* ── Path C: reassemble from split anchor sections ─────────────────── */
 
+// Path C：不从代码段读取，而是从 __DATA 的 4 个 anchor lane 重建构建期 __text 摘要。
+// 任一 lane 缺失或长度不足即返回 -1；
+// 该路径用于检测 anchor 区被裁剪/重排/替换，与 A/B 的运行时内存观察互补。
 static int path_c(const struct mach_header_64 *hdr, uint8_t *out) {
+    // ABI v3 split anchor：4 条 lane 顺序固定（A/B/C/D），每条 8 字节，拼回 32 字节完整摘要。
+    // 顺序是 producer/runtime 契约，重排会改变重建结果。
     static const char *names[CPRISK_ARMOR_ANCHOR_LANE_COUNT] = {
         CPRISK_ARMOR_SECTION_ANCHOR_A,
         CPRISK_ARMOR_SECTION_ANCHOR_B,
@@ -1910,10 +2120,14 @@ static int path_c(const struct mach_header_64 *hdr, uint8_t *out) {
     return 0;
 }
 
+// 无符号绝对差，避免有符号相减溢出导致的未定义行为。
 static uint64_t cprisk_abs_u64_i(uint64_t lhs, uint64_t rhs) {
     return lhs >= rhs ? (lhs - rhs) : (rhs - lhs);
 }
 
+// 路径耗时 canary：A/B 都成功且样本足够大时，若较慢路径比较快路径慢 48 倍以上
+// 且绝对差 >=15ms，说明某一路径可能被 hook/单步拖慢，完整投毒 RECHECK lane。
+// 失败路径或样本过小直接返回，避免噪声误报。
 static void cprisk_integrity_timing_canary_i(
     int path_a_rc,
     int path_b_rc,
@@ -1939,6 +2153,14 @@ static void cprisk_integrity_timing_canary_i(
 
 /* ── public API ────────────────────────────────────────────────────── */
 
+// 计算最终完整性摘要：
+//   ha = Path A（VM 读取）、hb = Path B（直接读）、hc = Path C（anchor 重建）；
+//   三段各 32 字节拼接后整体 SHA256，输出 32 字节。
+// 多路径的意义：三条路径观测面不同（内核 VM / 原始内存 / 静态 anchor），
+// 单点 hook 或局部 patch 很难同时欺骗三者。任一路径失败时用 32 字节 0xFF 占位，
+// 使结果仍确定但不可伪造（fail-closed）。
+// 返回 -1 仅表示 out_hash 为 NULL 或找不到自身 header。
+// 线程安全：只读自身 Mach-O 与全局只读状态，可并发调用（路径内缓冲区独立）。
 int cprisk_compute_integrity_hash(uint8_t *out_hash) {
     if (!out_hash)
         return -1;
@@ -1996,6 +2218,8 @@ int cprisk_compute_integrity_hash(uint8_t *out_hash) {
     return 0;
 }
 
+// 读取构建期完整 anchor 摘要：ABI v3 由 4 个 split lane 拼回 32 字节。
+// 返回 -1 表示 out_hash 为 NULL 或任一 lane 缺失；调用方应把失败当作 init 失败（-3）。
 int cprisk_read_full_anchor_hash(uint8_t *out_hash) {
     if (!out_hash)
         return -1;
@@ -2008,6 +2232,9 @@ int cprisk_read_full_anchor_hash(uint8_t *out_hash) {
     return path_c(hdr, out_hash);
 }
 
+// 用 root_material 对 full_hash 计算 CPRisk-MAC，并与 __DATA 中的 32 字节 tag
+// 做常量时间比较。返回 -1 表示 header/section 缺失或长度不足；
+// 0 表示 MAC 匹配；非 0 表示不匹配。注意：这里只验证 root 与 anchor 的绑定。
 int cprisk_verify_anchor_mac(const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
                               const uint8_t full_hash[CPRISK_ARMOR_HASH_SIZE]) {
     const struct mach_header_64 *hdr = cprisk_own_hdr_i();
@@ -2030,12 +2257,15 @@ int cprisk_verify_anchor_mac(const uint8_t root_material[CPRISK_ARMOR_KEY_SIZE],
     return result;
 }
 
+// mach_absolute_time 转纳秒的换算表：pthread_once 保证只初始化一次，可并发读取。
 static mach_timebase_info_data_t s_integrity_tb;
 static pthread_once_t s_integrity_tb_once = PTHREAD_ONCE_INIT;
+// 初始化 timebase；denom 异常时后续 monotonic 返回 0，调用方按“样本无效”处理。
 static void cprisk_integrity_tb_init(void) {
     mach_timebase_info(&s_integrity_tb);
 }
 
+// 单调纳秒时钟：拆分乘除避免 abs_time * numer 溢出；返回无符号值，失败时可能为 0。
 static uint64_t cprisk_monotonic_ns(void) {
     pthread_once(&s_integrity_tb_once, cprisk_integrity_tb_init);
     mach_timebase_info_data_t tb = s_integrity_tb;
@@ -2053,7 +2283,18 @@ static uint64_t cprisk_monotonic_ns(void) {
  * returns 0, and must call cprisk_cleanup_protection() on failure so no
  * half-initialised material stays live. Keep this function short and
  * single-threaded: concurrent evaluate() calls must wait for it. */
+// 启动保护（单线程，必须在并发 evaluate() 之前调用）：
+// 严格校验 root key → 计算并保存完整性基线 → PAC/CFI 自检 → 应用初始反调试策略 →
+// 重建 anchor 摘要 → white-box/legacy 初始化 → 初始化三层 Hybrid KDF →
+// 启动 anti-dump 探针。全部完成后才发布 runtime material（ready=1）。
+// 返回：0 成功；-1 root 长度错误或全零；-2 完整性摘要计算失败；-3 anchor 读取失败；
+//      -4 anchor MAC/tag 校验失败；-5 字符串解密器/pass1 失败；-6 PAC/CFI/loader key 失败；
+//      -7 受保护数据或 runtime material 失败；-8 MTE 自检/canary 失败。
+// 失败语义（fail-closed）：清零并撤销 runtime material；调用方必须 cprisk_cleanup_protection()。
+// Hybrid KDF 失败不改变返回码，但 effectiveRoot 保持未就绪，依赖路径自行 fail-closed。
+// start→seal 窗口：本函数返回 0 之前进程应视为未密封。
 int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
+    // 每次 init 前彻底清空上一次的保护/投毒状态，避免跨 init 残留导致误判或残留密钥。
     uint64_t t_start = cprisk_monotonic_ns();
 
     uint8_t root_material[CPRISK_ARMOR_KEY_SIZE];
@@ -2080,6 +2321,7 @@ int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
 #endif
     cprisk_antidebug_reset_plan_state_i();
 
+    // 根材料必须严格 32 字节且非全零；长度错误/全零都在这里拒绝，不补零、不截断。
     if (cprisk_fill_root_material_i(root_key, root_key_len, root_material) != 0) {
         /* Wrong-length root key: hard fail (no zero-pad / no truncation). */
         rc = -1;
@@ -2098,6 +2340,7 @@ int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
         }
     }
 
+    // 计算并保存完整性基线；失败则无法进入任何派生路径（fail-closed）。
     if (cprisk_compute_integrity_hash(integrity) != 0) {
         rc = -2;
         goto cleanup;
@@ -2117,6 +2360,7 @@ int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
 
     cprisk_antidebug_apply_policies_i(CPRISK_ADBG_TRIGGER_INIT_I, 0, 0);
 
+    // 保存基线供后续 recheck 比对；必须在任何并发读开始前写入。
     memcpy(s_saved_integrity_hash, integrity, CPRISK_ARMOR_HASH_SIZE);
     s_integrity_hash_saved = 1;
 
@@ -2144,15 +2388,20 @@ int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
     /* Hybrid KDF failure (e.g. device binding unavailable) leaves the
      * effective root unready; dependent paths fail closed. Return value
      * is intentionally not fatal to init_protection itself. */
+    // 三层 KDF 初始化：成功时填充 effectiveRoot；失败（设备绑定不可用）时保持未就绪，
+    // 绝不把原始 rootKey 冒充为绑定密钥——依赖 effectiveRoot 的路径会 fail-closed。
     (void)cprisk_init_hybrid_kdf(root_key);
 
     if (rc == 0) {
         /* Keep anti-dump probe lifecycle tied to protection lifecycle,
          * while remaining idempotent when watchdog already started it. */
+        // 反 dump 探针与保护生命周期绑定；重复启动必须幂等（watchdog 可能已先启动）。
         (void)cprisk_start_anti_dump_probe(5);
         cprisk_apply_deferred_early_injection_policy();
 #if defined(CPRISK_MTE_COMPILE_SUPPORT)
         if (cprisk_mte_available() != 0) {
+            // MTE 自检或 canary 安装失败：撤销已发布的材料与解密器，
+            // 投毒 RECHECK lane，返回 -8（fail-closed）。
             if (cprisk_mte_self_test() != 0) {
                 cprisk_secure_zero(s_runtime_material, sizeof(s_runtime_material));
                 atomic_store(&s_runtime_material_ready, 0);
@@ -2181,6 +2430,8 @@ int cprisk_init_protection(const uint8_t *root_key, size_t root_key_len) {
 #endif
     }
 
+// 失败收尾：通知反调试策略“init 失败”，并清零未发布的 runtime material；
+// 调用方仍需在返回非 0 时调用 cprisk_cleanup_protection()。
 cleanup:
     if (rc != 0) {
         cprisk_antidebug_apply_policies_i(
@@ -2199,14 +2450,20 @@ cleanup:
      * Swift-side material, and in derived values — so zeroing here is
      * hygiene, not a guarantee. The long-lived copies (s_runtime_material
      * etc.) are zeroed by cprisk_cleanup_protection(). */
+    // 尽早清零栈上密钥副本（issue 52）。这只是卫生措施，
+    // 无法清除寄存器、调用方缓冲区或 Swift 侧副本。
     cprisk_secure_zero(root_material, sizeof(root_material));
     cprisk_secure_zero(integrity, sizeof(integrity));
     cprisk_secure_zero(full_anchor_hash, sizeof(full_anchor_hash));
 
+    // 无论成功失败都记录耗时，供启动时序反调试与诊断使用。
     s_init_elapsed_ns = cprisk_monotonic_ns() - t_start;
     return rc;
 }
 
+// 释放保护状态（单线程/生命周期末尾）：移除 MTE canary，清零 runtime/deception/anchor
+// 与 Hybrid KDF 密钥，重置投毒记账与加固配置，停止探针并卸载受保护数据。
+// 清理后 cprisk_runtime_material_ready() 返回 0，get_runtime_material 返回欺骗材料。
 void cprisk_cleanup_protection(void) {
 #if defined(CPRISK_MTE_COMPILE_SUPPORT)
     cprisk_mte_canary_remove(&s_runtime_material_canary);
@@ -2239,6 +2496,9 @@ void cprisk_cleanup_protection(void) {
     s_init_timing_threshold_override_ns = 0;
 }
 
+// 投毒输出混合：把 breadcrumb/rolling/epoch/cause_mix 与 32 字节缓冲逐字节混合，
+// 使欺骗输出随“哪条 lane、以什么顺序触发”变化；h 耗尽时用黄金比例常数重新播种。
+// 仅用于欺骗材料，不是密钥派生。
 static void cprisk_poison_runtime_material_output_mix_i(uint8_t buf[32]) {
     uint64_t h = 0xD6E8FEB86655FD96ULL ^ (uint64_t)s_poison_semantic_breadcrumb;
     h ^= (uint64_t)s_poison_semantic_rolling[0] << 32;
@@ -2259,6 +2519,10 @@ static void cprisk_poison_runtime_material_output_mix_i(uint8_t buf[32]) {
     }
 }
 
+// 读取运行时材料（复制到调用方 32 字节缓冲区）。
+// 正常路径返回 init 派生的材料；若未就绪/已投毒/欺骗激活，返回经混合的欺骗材料。
+// 返回 0 表示已写出 32 字节；-1 表示 out 为 NULL。
+// 线程安全：原子 ready + 普通拷贝；调用方必须把结果视为不可信材料，不得用于安全判定。
 int cprisk_get_runtime_material(uint8_t out_material[32]) {
     if (!out_material)
         return -1;
@@ -2274,17 +2538,21 @@ int cprisk_get_runtime_material(uint8_t out_material[32]) {
     return 0;
 }
 
+// 原子发布查询：1=init 已完整发布 runtime material；0=未就绪/已清理/init 失败。
 int cprisk_runtime_material_ready(void) {
     return atomic_load(&s_runtime_material_ready) != 0 ? 1 : 0;
 }
 
 enum {
+    // 完整性复查失败原因（折入 cause_mix 高位）：PAC、MTE、摘要计算、基线差异。
     CPRISK_POISON_RECHECK_SUB_PAC = 0xA01u,
     CPRISK_POISON_RECHECK_SUB_MTE = 0xA02u,
     CPRISK_POISON_RECHECK_SUB_COMPUTE = 0xA03u,
     CPRISK_POISON_RECHECK_SUB_DIFF = 0xA04u,
 };
 
+// 复查失败的统一投毒入口：置全局 poisoned，把 subreason 折入 cause_mix，
+// 记录 RECHECK lane 副作用；满足条件时启用欺骗并扰动材料。
 static void cprisk_integrity_poison_from_recheck_i(uint32_t subreason) {
     s_integrity_poisoned = 1;
     s_poison_cause_mix ^= (uint64_t)subreason << 40;
@@ -2296,6 +2564,11 @@ static void cprisk_integrity_poison_from_recheck_i(uint32_t subreason) {
     }
 }
 
+// 周期性完整性复查：
+// 未保存基线返回 -1；调试器下返回 0 但静默启用欺骗（不上报，避免暴露检测点）。
+// 依次校验 PAC/CFI、MTE canary（-1 才算失败，-2=不支持）、重新计算摘要并与基线逐字节比较。
+// 返回 0=一致；1=篡改（PAC/MTE/摘要差异）；-2=无法计算摘要。
+// 任何确认篡改的路径都会投毒 RECHECK lane 并通知反调试策略（fail-closed）。
 int cprisk_recheck_integrity(void) {
     if (!s_integrity_hash_saved)
         return -1;
@@ -2365,18 +2638,21 @@ int cprisk_recheck_integrity(void) {
     return 0;
 }
 
+// 返回全局投毒锁存位；欺骗模式激活时恒返回 0（隐藏检测结果，避免 oracle）。
 int cprisk_is_integrity_poisoned(void) {
     if (s_integrity_deception_active)
         return 0;
     return s_integrity_poisoned;
 }
 
+// 返回 lane 折叠指纹；欺骗模式下返回 0，避免暴露哪些 lane 触发。
 uint32_t cprisk_get_integrity_poison_semantic_breadcrumb(void) {
     if (s_integrity_deception_active)
         return 0u;
     return s_poison_semantic_breadcrumb;
 }
 
+// 返回指定 lane 的累计事件数；越界或欺骗模式返回 0。
 uint32_t cprisk_get_integrity_poison_lane_event_count(unsigned lane) {
     if (lane >= (unsigned)CPRISK_POISON_LANE_COUNT)
         return 0u;
@@ -2385,42 +2661,51 @@ uint32_t cprisk_get_integrity_poison_lane_event_count(unsigned lane) {
     return s_poison_lane_seq[lane];
 }
 
+// 返回投毒波次计数；欺骗模式下返回 0。
 uint32_t cprisk_get_integrity_poison_epoch(void) {
     if (s_integrity_deception_active)
         return 0u;
     return s_poison_epoch;
 }
 
+// 返回 watchdog 慢波阶段（0=空闲，1=已过一个阈值但未完整投毒）；欺骗模式下返回 0。
 uint32_t cprisk_get_integrity_watchdog_slow_poison_phase(void) {
     if (s_integrity_deception_active)
         return 0u;
     return atomic_load(&s_staged_watchdog_slow_wave);
 }
 
+// 返回 (lane, 触发顺序) 折叠指纹；欺骗模式下返回 0。
 uint64_t cprisk_get_integrity_poison_cause_mix(void) {
     if (s_integrity_deception_active)
         return 0u;
     return s_poison_cause_mix;
 }
 
+// EVT_A lane 完整投毒入口（通用事件 A）。
 void cprisk_integrity_poison_evt_a(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_EVT_A);
 }
 
+// EVT_B lane 完整投毒入口（通用事件 B）。
 void cprisk_integrity_poison_evt_b(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_EVT_B);
 }
 
+// watchdog lane 分级入口：未达阈值只做 staged，达阈值进入慢波/完整提交。
 void cprisk_integrity_poison_watchdog_lane(void) {
     cprisk_integrity_poison_watchdog_lane_staged_i();
 }
 
+// 立即完整提交 watchdog lane，并清零 staged/慢波计数（高置信信号走这里）。
 void cprisk_integrity_poison_watchdog_lane_now(void) {
     atomic_store(&s_staged_watchdog_hits, 0u);
     atomic_store(&s_staged_watchdog_slow_wave, 0u);
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_WATCHDOG);
 }
 
+// 高置信混合投毒：按 path_tag/epoch/cause_mix 轮转选择一条完整投毒 lane，
+// 避免所有高置信响应落在同一 lane id 上被单点 patch；欺骗激活后直接返回。
 void cprisk_integrity_poison_high_signal_mixed(uint32_t path_tag) {
     if (s_integrity_deception_active)
         return;
@@ -2446,6 +2731,8 @@ void cprisk_integrity_poison_high_signal_mixed(uint32_t path_tag) {
     }
 }
 
+// 延迟应用“早期注入环境变量”策略：仅生产档位且确实检测到注入环境变量时，
+// 触发一次高置信混合投毒 + watchdog staged 入口。
 void cprisk_apply_deferred_early_injection_policy(void) {
     if (cprisk_get_early_injection_env_mask() == 0u) {
         return;
@@ -2457,47 +2744,59 @@ void cprisk_apply_deferred_early_injection_policy(void) {
     cprisk_integrity_poison_watchdog_lane();
 }
 
+// CODE_SIGNING lane 完整投毒：签名/Team ID/身份校验失败。
 void cprisk_integrity_poison_code_signing_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_CODE_SIGNING);
 }
 
+// SVC_IFACE lane 完整投毒：PAC/SVC/签名间接调用接口失败。
 void cprisk_integrity_poison_svc_iface_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_SVC_IFACE);
 }
 
+// ANTIDEBUG lane 完整投毒：反调试计划、跟踪交叉校验、运行期 gate 失败。
 void cprisk_integrity_poison_antidebug_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_ANTIDEBUG);
 }
 
+// EXCEPTION lane 完整投毒：异常端口指纹漂移/劫持竞态。
 void cprisk_integrity_poison_exception_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_EXCEPTION);
 }
 
+// ANTI_DUMP lane 分级入口：未达阈值走 staged，达阈值完整提交。
 void cprisk_integrity_poison_anti_dump_lane(void) {
     cprisk_integrity_poison_anti_dump_lane_staged_i();
 }
 
+// 立即完整提交 ANTI_DUMP lane，并清零 staged 计数。
 void cprisk_integrity_poison_anti_dump_lane_now(void) {
     atomic_store(&s_staged_anti_dump_hits, 0u);
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_ANTI_DUMP);
 }
 
+// DATA_LOADER lane 完整投毒：数据段加载器/JIT 解密保护路径失败。
 void cprisk_integrity_poison_data_loader_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_DATA_LOADER);
 }
 
+// TEXT_ENCRYPT lane 完整投毒：text 段页加密/重加密/状态迁移域失败。
 void cprisk_integrity_poison_text_encrypt_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_TEXT_ENCRYPT);
 }
 
+// WHITEBOX lane 完整投毒：white-box PRF 求值/校验失败。
 void cprisk_integrity_poison_whitebox_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_WHITEBOX);
 }
 
+// CFF lane 完整投毒：控制流平坦化默认投毒路径。
 void cprisk_integrity_poison_cff_lane(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_CFF);
 }
 
+// 聚合强制投毒：分别提交 EVT_A/EVT_B/FORCE 三条 lane，
+// 避免语义退化为单次 store / 单批副作用而被一次 hook 抹掉。
 void cprisk_force_integrity_poison(void) {
     /* Aggregate: three independent lane commits so semantics are not a single store / single side-effect batch. */
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_EVT_A);
@@ -2505,6 +2804,8 @@ void cprisk_force_integrity_poison(void) {
     cprisk_integrity_poison_lane_full_i(CPRISK_POISON_LANE_FORCE);
 }
 
+// guard page 被访问：置 poisoned、记录 GUARD lane、强制启用欺骗并扰动材料，
+// 同时通知 watchdog。调用即视为攻击行为（fail-closed）。
 void cprisk_guard_page_fault_notify(void) {
     s_integrity_poisoned = 1;
     cprisk_integrity_poison_lane_sidefx_i(CPRISK_POISON_LANE_GUARD);
@@ -2514,10 +2815,12 @@ void cprisk_guard_page_fault_notify(void) {
     cprisk_watchdog_note_guard_page_fault();
 }
 
+// 返回最近一次 init 的耗时（纳秒）；非原子、弱一致，仅用于诊断/时序判断。
 uint64_t cprisk_get_init_elapsed_ns(void) {
     return s_init_elapsed_ns;
 }
 
+// 设置加固档位；非法值回退到生产档。应在 init 前设置，运行期修改为弱一致。
 void cprisk_set_runtime_hardening_mode(cprisk_runtime_hardening_mode_t mode) {
     if (mode != CPRISK_RUNTIME_HARDENING_PRODUCTION && mode != CPRISK_RUNTIME_HARDENING_RELAXED_DEV_QA &&
         mode != CPRISK_RUNTIME_HARDENING_APP_STORE_SAFE)
@@ -2525,10 +2828,13 @@ void cprisk_set_runtime_hardening_mode(cprisk_runtime_hardening_mode_t mode) {
     s_runtime_hardening_mode = mode;
 }
 
+// 返回当前加固档位；未设置时为生产档。
 cprisk_runtime_hardening_mode_t cprisk_get_runtime_hardening_mode(void) {
     return (cprisk_runtime_hardening_mode_t)s_runtime_hardening_mode;
 }
 
+// 返回当前 init 时序阈值：测试覆盖优先；否则读 hw.machine 并按机型代际 + 档位计算。
+// sysctl 失败或机型未知时按最宽松机型处理。
 uint64_t cprisk_get_init_timing_threshold_ns(void) {
     if (s_init_timing_threshold_override_ns != 0)
         return s_init_timing_threshold_override_ns;
@@ -2548,6 +2854,7 @@ uint64_t cprisk_get_init_timing_threshold_ns(void) {
         cprisk_get_runtime_hardening_mode());
 }
 
+// 测试钩子：覆盖 init 时序阈值；非 DEBUG 构建为空操作。
 void cprisk_test_set_init_timing_threshold_ns_override(uint64_t threshold_ns) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -2557,8 +2864,11 @@ void cprisk_test_set_init_timing_threshold_ns_override(uint64_t threshold_ns) {
 }
 
 /* Last signing-path mix tier + fingerprint (server-visible via GrpcReportPayload output_path_integrity). */
+// 最近一次签名中间混合的层级标记（高 4 位）与指纹（低 28 位），
+// 供上报/诊断（server-visible output_path_integrity）使用。
 static uint32_t s_signing_mix_last_fp;
 
+// 测试钩子：重置 staged 计数、投毒/欺骗状态与签名指纹；非 DEBUG 构建为空操作。
 void cprisk_test_reset_staged_poison_for_tests(void) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -2576,6 +2886,8 @@ void cprisk_test_reset_staged_poison_for_tests(void) {
 
 /* Passive/cached environment binding for signing/whitebox hot paths: no cprisk_run_all_signal_probes(). */
 enum {
+    // 被动绑定信号位：只读缓存/轻量探测，不触发完整 cprisk_run_all_signal_probes()，
+    // 供签名/whitebox 热路径使用；位定义是内部契约。
     CPRISK_PASSIVE_BINDING_TRACE = 1u << 0,
     CPRISK_PASSIVE_BINDING_DBI = 1u << 1,
     CPRISK_PASSIVE_BINDING_TIMING = 1u << 2,
@@ -2584,6 +2896,8 @@ enum {
     CPRISK_PASSIVE_BINDING_DEVELOPER_DISK = 1u << 5,
 };
 
+// 汇总被动绑定位（跟踪/DBI/时序/libc 回退/TTY/开发者磁盘）。
+// 只读取已有探针状态，不产生新探测；可并发调用。
 uint32_t cprisk_collect_passive_signal_binding_bits(void) {
     uint32_t bits = 0u;
     if (cprisk_trace_crosscheck_inconsistent() != 0 || cprisk_is_being_traced_sysctl_only() != 0)
@@ -2601,12 +2915,18 @@ uint32_t cprisk_collect_passive_signal_binding_bits(void) {
     return bits;
 }
 
+// 记录本次签名混合层级与 28 位指纹；层级写入高 4 位，低 28 位为 seed 折叠值。
 static void cprisk_signing_mix_set_fp_i(uint32_t tier_tag28, uint64_t seed) {
     uint32_t h = (uint32_t)(seed ^ (seed >> 32));
     h ^= tier_tag28 * 0x13579BDFu;
     s_signing_mix_last_fp = (tier_tag28 << 28) | (h & 0x0FFFFFFFu);
 }
 
+// 签名中间材料分层混合：未就绪/已投毒/欺骗时直接返回；否则按 staged、弱被动信号、
+// degraded trace/DBI、ambient hook-surface 的优先级选择一层，
+// 用 SHA256(label || seed || buf) 生成掩码并只扰动部分字节（层级越高扰动越多），
+// 同时记录指纹。该函数只改签名中间缓冲，不修改原始 runtime bytes。
+// 线程安全：可并发调用；竞态仅影响指纹/掩码，不影响内存安全。
 void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
     if (!buf)
         return;
@@ -2693,6 +3013,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
     cprisk_sha256_ctx ctx;
 
     if (strong_staged) {
+        // 完整 staged（多个弱信号累积）：全 32 字节混合，层级 3。
         static const uint8_t k_lab[] = "cprisk.sign.intermediate.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab, sizeof(k_lab) - 1u);
@@ -2706,6 +3027,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(3u, seed);
     } else if (medium_staged) {
+        // 单个 staged 命中：仅中间 16 字节混合，层级 2。
         static const uint8_t k_lab_m[] = "cprisk.sign.intermediate.medium.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_m, sizeof(k_lab_m) - 1u);
@@ -2719,6 +3041,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(2u, seed);
     } else if (weak_only) {
+        // 仅弱被动信号：仅尾部 8 字节混合，层级 1。
         static const uint8_t k_lab_p[] = "cprisk.sign.intermediate.partial.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_p, sizeof(k_lab_p) - 1u);
@@ -2732,6 +3055,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(1u, seed);
     } else if (degraded_tier == 6) {
+        // 跟踪 + DBI 同时命中：全 32 字节混合，层级 6。
         static const uint8_t k_lab_td[] = "cprisk.sign.intermediate.degraded.trace_dbi.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_td, sizeof(k_lab_td) - 1u);
@@ -2745,6 +3069,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(6u, seed);
     } else if (degraded_tier == 4) {
+        // 仅跟踪命中：中间 16 字节混合，层级 4。
         static const uint8_t k_lab_tr[] = "cprisk.sign.intermediate.degraded.trace.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_tr, sizeof(k_lab_tr) - 1u);
@@ -2758,6 +3083,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(4u, seed);
     } else if (degraded_tier == 5) {
+        // 仅 DBI 命中：中间 16 字节混合，层级 5。
         static const uint8_t k_lab_db[] = "cprisk.sign.intermediate.degraded.dbi.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_db, sizeof(k_lab_db) - 1u);
@@ -2771,6 +3097,7 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
         cprisk_secure_zero(mask, sizeof(mask));
         cprisk_signing_mix_set_fp_i(5u, seed);
     } else if (ambient) {
+        // ambient hook-surface（mprotect 交叉校验不一致等）：头部 8 字节混合，层级 7。
         static const uint8_t k_lab_am[] = "cprisk.sign.intermediate.ambient.v1";
         cprisk_sha256_init(&ctx);
         cprisk_sha256_update(&ctx, k_lab_am, sizeof(k_lab_am) - 1u);
@@ -2787,10 +3114,14 @@ void cprisk_signing_runtime_material_intermediate_mix(uint8_t buf[32]) {
     cprisk_secure_zero(seed_le, sizeof(seed_le));
 }
 
+// 返回最近一次签名混合指纹；0 表示尚未混合。
 uint32_t cprisk_get_signing_mix_fingerprint(void) {
     return s_signing_mix_last_fp;
 }
 
+// 白盒/PRF 压力位掩码：bit0 watchdog staged、bit1 anti-dump staged、bit2 trace/DBI、
+// bit3/4 mprotect 交叉校验不一致、bit5 mprotect 篡改、bit6 时序、bit7 TTY/开发者磁盘/libc 回退、
+// bit8 watchdog 慢波。位定义是内部契约，改动需同步签名混合分层。
 uint32_t cprisk_integrity_wb_prf_pressure_mask(void) {
     uint32_t m = 0u;
     if (atomic_load(&s_staged_watchdog_hits) > 0u)
@@ -2816,6 +3147,7 @@ uint32_t cprisk_integrity_wb_prf_pressure_mask(void) {
     return m;
 }
 
+// 测试钩子：按机型与档位计算阈值；非 DEBUG 构建返回 0。
 uint64_t cprisk_test_init_timing_threshold_ns_for_machine(
     const char *machine,
     cprisk_runtime_hardening_mode_t mode
@@ -2827,11 +3159,13 @@ uint64_t cprisk_test_init_timing_threshold_ns_for_machine(
     return cprisk_compute_init_timing_threshold_ns_for_machine_i(machine, mode);
 }
 
+// 判断 init 是否超过当前阈值；超过返回 1（可能被插桩/调试），否则 0。
 int cprisk_check_init_timing(void) {
     const uint64_t thr = cprisk_get_init_timing_threshold_ns();
     return s_init_elapsed_ns > thr ? 1 : 0;
 }
 
+// 测试钩子：暴露 secure_zero；非 DEBUG 构建为空操作。
 void cprisk_test_secure_zero(void *buf, size_t len) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -2842,6 +3176,12 @@ void cprisk_test_secure_zero(void *buf, size_t len) {
 
 /* ── Hybrid Key Derivation (Three-Layer KDF) ───────────────────────── */
 
+// 初始化三层 Hybrid KDF（单线程，init 路径调用）：
+//   Layer 2 deviceKey     = CPRisk-MAC(rootKey, deviceSalt)；
+//   Layer 3 effectiveRoot = MAC(deviceKey, sessionKey)（无 session 时退化为 deviceKey）。
+// 失败语义（issue 60）：设备绑定失败时没有 effectiveRoot，绝不回退到原始 rootKey；
+// 返回 -1 且两个 ready 标志均为 0，调用方必须 fail-closed。
+// 每次调用先清零旧状态；不应与并发读取同时进行。
 int cprisk_init_hybrid_kdf(const uint8_t *root_key) {
     if (!root_key)
         return -1;
@@ -2879,6 +3219,9 @@ int cprisk_init_hybrid_kdf(const uint8_t *root_key) {
      * responsibility), not at effective_root. */
     if (has_session && s_device_key_ready) {
         /* effectiveRoot = CPRisk-MAC(deviceKey, sessionKey) — binds to device AND session. */
+        // 同时绑定设备与会话：session token 变化会得到不同 effectiveRoot，旧会话密钥无法复用。
+        // 故意不混入每进程时间戳：effectiveRoot 必须在同设备同 session 下跨进程字节一致，
+        // 否则会与构建期加密的材料不匹配。
         cprisk_mac_sha256(s_device_key, CPRISK_ARMOR_KEY_SIZE,
                            session_key, CPRISK_ARMOR_KEY_SIZE,
                            s_effective_root);
@@ -2886,6 +3229,7 @@ int cprisk_init_hybrid_kdf(const uint8_t *root_key) {
     } else if (s_device_key_ready) {
         /* Fallback when no session token: effectiveRoot = deviceKey.
          * Key is still bound to the physical device. */
+        // 无 session token 时退化为 deviceKey：仍绑定设备，但不绑定会话。
         memcpy(s_effective_root, s_device_key, CPRISK_ARMOR_KEY_SIZE);
         s_effective_root_ready = 1;
     } else {
@@ -2893,6 +3237,8 @@ int cprisk_init_hybrid_kdf(const uint8_t *root_key) {
          * is no effective root. Silently falling back to the raw rootKey
          * would present an unbound key as a device/session-bound one.
          * Callers see s_effective_root_ready == 0 and fail closed. */
+        // 无设备绑定：清空 effectiveRoot 并保持未就绪；
+        // 不做任何“原始 rootKey”回退，避免把未绑定密钥冒充为设备/会话绑定密钥。
         cprisk_secure_zero(s_effective_root, sizeof(s_effective_root));
         s_effective_root_ready = 0;
         cprisk_secure_zero(session_key, sizeof(session_key));
@@ -2904,6 +3250,7 @@ int cprisk_init_hybrid_kdf(const uint8_t *root_key) {
     return 0;
 }
 
+// 导出 deviceKey 副本；未就绪或 out 为 NULL 返回 -1（fail-closed，不返回部分密钥）。
 int cprisk_get_device_key(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]) {
     if (!out_key)
         return -1;
@@ -2913,6 +3260,7 @@ int cprisk_get_device_key(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]) {
     return 0;
 }
 
+// 导出 effectiveRoot 副本；未就绪或 out 为 NULL 返回 -1，调用方应拒绝继续派生。
 int cprisk_get_effective_root(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]) {
     if (!out_key)
         return -1;

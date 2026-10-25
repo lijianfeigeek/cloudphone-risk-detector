@@ -6,8 +6,19 @@
  * on the stack and is cleared after each scan.
  */
 
+// 文件职责：一次性采集 Frida/Gum 的四类运行时线索，填充 cprisk_frida_runtime_snapshot_t。
+// 字段来源：image_hit_count = 加载镜像路径关键字命中数；dlsym_hit_count = 已知 Gum
+//   导出符号存在数；proc_hit_count = 进程表 p_comm 命中数；behavior_* = 入口序言/
+//   跳板前缀/外来可执行地址/信任面 hook 四类行为检查；flags 为各通道“是否命中”的位或。
+// 失败语义：所有通道都是线索（fail-open），0 不代表绝对干净；模拟器 supported=0，
+//   其余字段全 0，且函数仍返回 0（“采集完成”而非“未发现”）。
+// 采样开销：每轮枚举全部镜像/进程并做多次 dlsym 与序言比对，适合低频快照，不可高频调用。
+// 线程模型：只读扫描；序言基线由被调模块的原子状态保护，可并发调用。
+
 #include "include/CRiskCore.h"
 
+// 若公共头未声明快照结构，则在此提供 ABI 兼容定义（布局必须与头文件一致）。
+// flags 的每一位对应一条已命中的通道；BEHAVIOR 位由四个 behavior 子位聚合而来。
 #ifndef CPRISK_FRIDA_RUNTIME_SNAPSHOT_DECLARED
 enum {
     CPRISK_FRIDA_RT_IMAGE = 1u << 0,
@@ -15,12 +26,21 @@ enum {
     CPRISK_FRIDA_RT_PROC = 1u << 2,
     CPRISK_FRIDA_RT_BEHAVIOR = 1u << 3,
 };
+// 行为层子标志：入口序言与基线不符、跳板前缀命中、关键函数地址不在任何镜像的
+// 可执行段内、Security/trust 相关入口被改写。每位置位者都是对应的校验函数。
 enum {
     CPRISK_FRIDA_RT_BEHAVIOR_PROLOGUE = 1u << 0,
     CPRISK_FRIDA_RT_BEHAVIOR_TRAMPOLINE = 1u << 1,
     CPRISK_FRIDA_RT_BEHAVIOR_FOREIGN_EXEC = 1u << 2,
     CPRISK_FRIDA_RT_BEHAVIOR_TRUST_SURFACE = 1u << 3,
 };
+// 字段来源（按采集顺序）：
+//   supported = 是否为可执行真实扫描的平台（Apple 真机 1，模拟器/其他 0）；
+//   flags = IMAGE/DLSYM/PROC/BEHAVIOR 四个通道命中位的并集；
+//   image_hit_count = 路径含关键字的镜像数；dlsym_hit_count = 命中的已知 Gum 符号数；
+//   proc_hit_count = 进程名命中数；behavior_flags = BEHAVIOR_* 子位；
+//   behavior_hit_count = 行为层命中总权重（序言/外来执行各 1，跳板与 trust 面按命中数累加）。
+// 不变量：flags 非 0 当且仅当至少一个 hit_count > 0 或 behavior_flags 非 0。
 typedef struct cprisk_frida_runtime_snapshot {
     uint32_t supported;
     uint32_t flags;
@@ -50,6 +70,9 @@ typedef struct cprisk_frida_runtime_snapshot {
 #include <sys/proc.h>
 #endif
 
+// v1 标签解码：mask = SHA256(label)，密文按 32 字节循环异或，输出 NUL 结尾明文。
+// 要求 out_sz > enc_len（至少留 1 字节给 NUL），否则返回 -1 且不写 out。
+// 明文只存在于调用方提供的缓冲中，调用方负责用后清零。
 int cprisk_obf_decode_sha256_label(
     const char *label,
     size_t label_len,
@@ -70,6 +93,9 @@ int cprisk_obf_decode_sha256_label(
     return 0;
 }
 
+// v1 标签解码（带域）：mask = SHA256(le32(domain) || le32(key_id))，
+// 同一域内不同 key_id 得到不同掩码；tag 的字节序是二进制契约，不可改。
+// 参数/返回语义与 label 版本一致：容量不足或空密文返回 -1。
 int cprisk_obf_decode_sha256_tag(
     uint32_t domain,
     uint32_t key_id,
@@ -101,6 +127,8 @@ int cprisk_obf_decode_sha256_tag(
 
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
 
+// 单条关键字匹配：解码到 96 字节栈缓冲后做子串查找，随即清零。
+// 缓冲不足或解码失败返回 0（该关键字本轮不可用），不抛出错误。
 static int cprisk_frida_path_needle_hit_i(
     const char *path,
     uint32_t domain,
@@ -120,6 +148,9 @@ static int cprisk_frida_path_needle_hit_i(
     return hit;
 }
 
+// 路径关键字总表：7 条大小写敏感子串 + 1 条大小写不敏感（GumJS 常见小写写法）。
+// 密文与 key_id 一一对应且已固化在二进制中，新增条目只能追加新的 key_id。
+// 返回 1 = 任一关键字命中；0 = 未命中或 path 为空。
 static int cprisk_token_in_path(const char *path) {
     if (!path || path[0] == '\0') {
         return 0;
@@ -163,6 +194,8 @@ static int cprisk_token_in_path(const char *path) {
     return 0;
 }
 
+// 枚举 dyld 已加载镜像名并计数关键字命中；hits > 0 才置 IMAGE 通道位。
+// 命中数（而非布尔）保留给上层做置信度加权；无镜像或路径为空时 hits=0。
 static void cprisk_frida_scan_dyld_images(uint32_t *flags_out, uint32_t *image_hits_out) {
     uint32_t hits = 0;
     const uint32_t n = _dyld_image_count();
@@ -183,6 +216,9 @@ static void cprisk_frida_scan_dyld_images(uint32_t *flags_out, uint32_t *image_h
     }
 }
 
+// 通过 dlsym(RTLD_DEFAULT) 探测 5 个 Gum 内部符号是否导出（init/deinit/embed/
+// agent main/backend）。符号存在才计数；存在本身是线索，不证明实际启用了注入。
+// 注意：这里用 libc dlsym，可能被 hook；因此它只作为四通道之一，不单独定性。
 static void cprisk_frida_scan_dlsym(uint32_t *flags_out, uint32_t *dlsym_hits_out) {
     static const uint8_t e_gum_init[] = {0x76, 0x13, 0xf9, 0x65, 0x84, 0x20, 0xb7, 0x32};
     static const uint8_t e_gum_deinit[] = {0x34, 0xd0, 0x1a, 0x54, 0xeb, 0x42, 0xaa, 0xb6, 0xc5, 0xaa};
@@ -236,6 +272,9 @@ static void cprisk_frida_scan_dlsym(uint32_t *flags_out, uint32_t *dlsym_hits_ou
     }
 }
 
+// 进程名判定：p_comm 只有 16 字节（超长被内核截断），因此先做前缀大小写不敏感
+// 比较，再退化为子串查找；关键字同样是运行时解码的混淆串。
+// 返回 1 = 疑似；0 = 未命中/空串。
 static int cprisk_comm_looks_like_frida(const char *comm) {
     if (!comm || comm[0] == '\0') {
         return 0;
@@ -267,7 +306,12 @@ static int cprisk_comm_looks_like_frida(const char *comm) {
     return hit;
 }
 
+// 通过直调 sysctl 读取全进程表（KERN_PROC_ALL），解析 p_comm 并统计命中数。
+// 采样开销：一次内核查询 + 一次堆分配（大小与进程数成正比，限制在 32MB 内）；
+// sysctl 失败或返回尺寸异常时静默返回（hits 保持 0），不视为“干净”的证据。
 static void cprisk_frida_scan_proc_table(uint32_t *flags_out, uint32_t *proc_hits_out) {
+    // 先问内核需要多大缓冲，再按需分配；中间进程数变化会导致第二次查询失败，
+    // 此时直接放弃本轮（fail-open），下一轮快照自然重试。
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t buf_size = 0;
     int err = 0;
@@ -303,6 +347,10 @@ static void cprisk_frida_scan_proc_table(uint32_t *flags_out, uint32_t *proc_hit
     }
 }
 
+// 判断地址是否位于“某个已加载镜像的可执行段”内。
+// 实现：dladdr 只用来取所属镜像基址，再经 _dyld_* 找到对应 header 与 slide，
+// 遍历 LC_SEGMENT_64 检查 initprot & EXECUTE 的段区间。
+// 返回 1 = 在镜像可执行段内；0 = 不在/无法解析（dladdr 失败、非 64 位镜像等）。
 static int cprisk_frida_addr_in_loaded_image_exec_i(const void *addr) {
     if (!addr) {
         return 0;
@@ -345,6 +393,8 @@ static int cprisk_frida_addr_in_loaded_image_exec_i(const void *addr) {
     return 0;
 }
 
+// 行为层四项检查；每项独立置位并累加命中权重。
+// 约定：被调校验函数返回 1 表示“通过”，返回 0 或负值都按失败处理（fail-closed 判定）。
 static void cprisk_frida_scan_behavior_i(
     uint32_t *flags_out,
     uint32_t *behavior_flags_out,
@@ -353,17 +403,22 @@ static void cprisk_frida_scan_behavior_i(
     uint32_t behavior_flags = 0u;
     uint32_t hits = 0u;
 
+    // objc_msgSend/dyld 入口等序言与基线不符：典型的 Frida Interceptor 改写。
     if (cprisk_verify_runtime_hook_surface_prologues() != 1) {
         behavior_flags |= CPRISK_FRIDA_RT_BEHAVIOR_PROLOGUE;
         hits++;
     }
 
+    // 入口前缀扫描：命中数按权重累加，命中越多置信度越高。
     const int trampoline_hits = cprisk_scan_hook_surface_trampoline_prefixes();
     if (trampoline_hits > 0) {
         behavior_flags |= CPRISK_FRIDA_RT_BEHAVIOR_TRAMPOLINE;
         hits += (uint32_t)trampoline_hits;
     }
 
+    // 外来可执行地址：dlsym/dlopen 是编译器/加载器符号，objc_msgSend 来自 libobjc，
+    // 三者都必须落在某个已加载镜像的可执行段；任一落空说明地址被替换到裸映射。
+    // objc_msgSend 解析失败时不参与判断，避免旧系统/裁剪环境误报。
     void *objc_msgsend_addr = dlsym(RTLD_DEFAULT, "objc_msgSend");
     if (!cprisk_frida_addr_in_loaded_image_exec_i((const void *)dlsym) ||
         !cprisk_frida_addr_in_loaded_image_exec_i((const void *)dlopen) ||
@@ -372,6 +427,9 @@ static void cprisk_frida_scan_behavior_i(
         hits++;
     }
 
+    // Security.framework 信任评估入口与 dlopen/dlsym 序言被改写：
+    // 这是针对证书固定/信任链的高价值 hook 面；mask 非 0 时按置位数累加权重，
+    // mask 为 0 但整体失败时至少记 1，保证失败不会被权重 0 掩盖。
     uint32_t trust_mask = 0u;
     if (cprisk_verify_trust_hook_surface_integrity(&trust_mask) != 1) {
         behavior_flags |= CPRISK_FRIDA_RT_BEHAVIOR_TRUST_SURFACE;
@@ -391,6 +449,10 @@ static void cprisk_frida_scan_behavior_i(
 
 #endif /* Apple device */
 
+// 采集一份完整的 Frida 运行时快照：先清零，再依次跑四条通道并把各 hit_count
+// 直接写入 out 对应字段；flags 只在通道命中时由各扫描函数置位。
+// 返回 -1 仅表示 out 为 NULL；0 表示“采集完成”（可能一条线索都没有）。
+// 模拟器/非 Apple：supported=0，其余字段保持 0，仍返回 0——调用方必须看 supported。
 int cprisk_frida_runtime_snapshot(cprisk_frida_runtime_snapshot_t *out) {
     if (!out) {
         return -1;

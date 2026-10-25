@@ -10,6 +10,15 @@
  *      does not immediately know they have been flagged.
  */
 
+// 文件职责：后台低频巡检线程，为内存 dump / 注入类攻击提供“活性”信号。
+// 四条通道：VM 区段（shared+write、RWX）、无镜像归属的匿名 RX、已加载镜像路径、
+//   task_for_pid 计数增量；命中后只向完整性层投毒（staged 或 now），不直接崩溃进程。
+// 采样开销：每轮一次全地址空间 vm_region 遍历 + 一次 dyld 镜像枚举 + 一次进程表读取，
+//   因此默认 5 秒均值、[2,9] 秒抖动区间；停机最坏延迟约 1 秒（1 秒切片睡眠）。
+// 误报抑制：检测结果是“线索”而非判决；RWX 对合法 JIT（JavaScriptCore/WebKit）也会命中，
+//   由上层结合 staged 通知与运行模式抑制，不在本文件内做白名单放行。
+// 线程模型：start/stop 由 s_probe_mutex 串行化；s_probe_running 为原子标志。
+
 #include "include/CRiskCore.h"
 #include "include/cprisk_secure_zero.h"
 #include <stdatomic.h>
@@ -20,9 +29,12 @@
 #include <unistd.h>
 #include <time.h>
 
+// 巡检线程句柄（joinable，stop 时 join）、生命周期互斥锁。
 static pthread_t s_probe_thread;
 static pthread_mutex_t s_probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+// 原子运行标志：巡检线程与 stop 在不同线程读写，避免用普通 int 造成无限等待。
 static _Atomic int s_probe_running;
+// 是否已成功创建线程；只在持有 s_probe_mutex 时读写，保证 start 幂等。
 static int s_probe_started;
 /*
  * Anti-debug review weakness #1: a fixed 5-second interval gave the
@@ -31,15 +43,21 @@ static int s_probe_started;
  * MEAN of a per-iteration draw clamped to [min, max], so any single
  * window the attacker observes does not predict the next.
  */
+// 间隔语义：s_probe_interval_seconds 是“均值”，min/max 是每轮均匀采样的闭区间，
+// 由 start 按均值 ± 50% 重新计算，保证攻击者观察到的窗口不可预测下一次。
 static int s_probe_interval_seconds = 5;
 static int s_probe_interval_min = 2;
 static int s_probe_interval_max = 9;
+// SplitMix64 状态；0 表示尚未播种，首次使用时用地址 + 单调时钟初始化。
 static _Atomic uint64_t s_probe_jitter_state;
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
+// 首次读取的 task_for_pid 累计计数，作为后续增量比较的基线；UINT32_MAX 表示未采样。
 static atomic_uint_fast32_t s_task_for_pid_baseline = UINT32_MAX;
 #endif
 
 /* Encoded needles: mask = SHA256(le32(domain)||le32(key_id)) — no searchable ASCII literals. */
+// 注入框架名不以明文出现：每行 enc 是明文与 SHA-256 掩码循环异或后的密文，
+// 运行时才解码到栈缓冲并在比对后清零；行列顺序与 key_id 是二进制契约，不可重排。
 
 /*
  * Probe: scan VM regions for suspicious mappings.
@@ -50,6 +68,11 @@ static atomic_uint_fast32_t s_task_for_pid_baseline = UINT32_MAX;
  *
  * Returns 0 if clean, -1 if suspicious activity detected.
  */
+// 遍历本任务所有 VM 区段：shared+write 可能是 vm_read_overwrite 类外读通道；
+// RWX 是 Frida Gum/Substrate 跳板与代码重定位的典型形态。
+// 注意：本实现不按镜像路径豁免合法 JIT，因此 JIT/脚本引擎也会命中，
+// 这是上层按 staged 通知抑制误报的原因；obj_name 只用于释放端口引用，不参与判定。
+// 返回 0 = 本轮未发现；-1 = 发现可疑映射（首个命中即返回，控制开销）。
 static int cprisk_scan_vm_regions(void) {
     vm_address_t addr = 0;
     vm_size_t size = 0;
@@ -102,6 +125,9 @@ static int cprisk_scan_vm_regions(void) {
 }
 
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
+// 读取本任务的 TASK_EXTMOD_INFO，统计外部 task_for_pid 调用次数。
+// 首次只建立基线；之后允许比基线多 1 次（系统/调试工具的正常噪声），
+// 超过才报可疑。task_info 失败返回 0（看不到不等于异常）。
 static int cprisk_probe_task_for_pid_escalation(void) {
     task_extmod_info_data_t extmod;
     mach_msg_type_number_t cnt = TASK_EXTMOD_INFO_COUNT;
@@ -126,6 +152,8 @@ static int cprisk_probe_task_for_pid_escalation(void) {
  * schedule is unique. Not cryptographic; the goal is to deny the
  * attacker a deterministic time-of-next-scan oracle, not key material.
  */
+// SplitMix64 取下一个伪随机数；播种材料含本进程地址与单调时钟，
+// 使不同进程/不同启动时刻的窗口序列不同。非密码学用途，只用于时间不可预测性。
 static uint64_t cprisk_probe_jitter_next_i(void) {
     uint64_t s = atomic_load(&s_probe_jitter_state);
     if (s == 0u) {
@@ -151,6 +179,8 @@ static uint64_t cprisk_probe_jitter_next_i(void) {
 /* Per-cycle interval drawn uniformly from [min, max]. Sub-second jitter
  * (0..999 ms) is folded in via an extra nanosleep so even when the mean
  * is small, two consecutive cycles never have identical timing. */
+// 在 [min, max] 上均匀取一个整数秒；min/max 已由 start 夹紧到 >=1 且 hi>=lo，
+// 这里仍做防御性修正，防止运行期被写坏后出现除零/负数取模。
 static int cprisk_probe_pick_interval_i(void) {
     int lo = s_probe_interval_min;
     int hi = s_probe_interval_max;
@@ -161,6 +191,8 @@ static int cprisk_probe_pick_interval_i(void) {
     return (int)((r % span) + (uint64_t)lo);
 }
 
+// 可取消睡眠：按 1 秒切片检查运行标志，把 stop() 的最坏等待压到约 1 秒；
+// 末尾再叠加 0..999ms 的亚秒抖动，使“等满固定整秒再 dump”的启发式失效。
 static void cprisk_probe_sleep_cancelable(int total_seconds) {
     if (total_seconds <= 0)
         total_seconds = 1;
@@ -192,6 +224,10 @@ static void cprisk_probe_sleep_cancelable(int total_seconds) {
  *
  * Returns 0 if clean, -1 if injection indicators found.
  */
+// 枚举已加载镜像路径，对每个路径尝试匹配 9 个混淆后的注入框架关键字。
+// 每个关键字解码到 64 字节栈缓冲（长度不足则跳过该行），比对后立即清零；
+// 解码失败按“该关键字不可用”跳过（fail-open），不影响其余关键字。
+// 返回 0 = 未命中；-1 = 命中任一关键字。
 static int cprisk_check_dylib_injection(void) {
     static const uint8_t e1[] = {0x1c, 0x19, 0x59, 0x9c, 0x06};
     static const uint8_t e2[] = {0xd6, 0xb9, 0x49, 0xc2, 0x2e, 0xf2, 0xf5};
@@ -264,6 +300,10 @@ static int cprisk_check_dylib_injection(void) {
  * Runs as a joinable thread so stop() can block until the probe exits,
  * avoiding leaked thread resources across repeated start/stop cycles.
  */
+// 巡检主循环：每轮先睡一个抖动区间，再按“VM → 匿名 RX → 镜像路径 → task_for_pid”
+// 顺序检查。前三条通道用 staged 投毒（延后生效，避免打草惊蛇），
+// 镜像路径命中是强证据，用 now 立即投毒；任一命中后跳过本轮剩余检查。
+// 线程返回 NULL，由 stop 通过 pthread_join 回收。
 static void *cprisk_probe_main(void *arg) {
     (void)arg;
     while (s_probe_running) {
@@ -312,6 +352,10 @@ static void *cprisk_probe_main(void *arg) {
  *
  * Returns 0 on success, -1 on thread creation failure.
  */
+// 启动巡检线程（幂等）：重复调用只更新间隔参数，不创建第二个线程。
+// interval_seconds <= 0 时保持原均值；均值会换算成 [mean-half, mean+half]
+// 并夹到 [1, 30] 秒，保证最坏间隔不会大到失去检测意义。
+// 返回 0 = 已运行/创建成功；-1 = pthread_create 失败（运行标志已回滚）。
 int cprisk_start_anti_dump_probe(int interval_seconds) {
     pthread_mutex_lock(&s_probe_mutex);
 
@@ -355,6 +399,9 @@ int cprisk_start_anti_dump_probe(int interval_seconds) {
  * Sets the volatile flag and lets the sleep() expire naturally.
  * Safe to call even if the thread was never started.
  */
+// 停止并 join 巡检线程；未启动时安全返回。
+// 先在锁内取走线程句柄并清 started，再在锁外 join，避免持锁等待整轮扫描。
+// 最坏等待约 1 秒（睡眠切片）加上当前扫描耗时。
 void cprisk_stop_anti_dump_probe(void) {
     pthread_t thread_to_join;
 

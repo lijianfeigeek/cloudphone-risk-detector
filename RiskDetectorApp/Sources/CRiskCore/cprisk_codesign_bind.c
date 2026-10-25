@@ -6,6 +6,14 @@
  * See cprisk_codesign_bind.h for full rationale.
  */
 
+// 文件职责：从运行中 App 的 Team Identifier 派生 64 位 salt，供 whitebox S-box
+// XOR pad 绑定签名身份；换签/重打包会得到不同 salt，使解密出的 PRF 输入静默错误。
+// 派生顺序：SecTask 读取内存中的 entitlement → 失败则退化为可执行文件路径哈希。
+// 失败语义：本函数是“加盐”而非“验收”，完全失败返回 0（中性盐），
+//   调用方不得把 0 当完整性判决；真正的重打包检测由 whitebox 输出错误体现。
+// 线程模型：无锁；首次调用可能重复计算但结果一致，之后只读原子缓存。
+// 平台限制：仅 Apple 真机走 entitlement；模拟器/其他平台恒返回 0。
+
 #include "include/cprisk_codesign_bind.h"
 #include "include/CRiskCore.h"
 
@@ -27,10 +35,14 @@
 /* ── Cached result ───────────────────────────────────────────────────────── */
 
 /* 0 == not yet computed; 1 == failed; anything else == valid salt. */
+// 用 1 作为“已计算但为空”的哨兵，避免每次调用都重试昂贵的 Security 查询；
+// 因为只缓存一次，且写入值与派生结果无关顺序，relaxed 足够。
 static _Atomic(uint64_t) s_salt_cache = ATOMIC_VAR_INIT(0u);
 
 /* ── SplitMix64 avalanche ────────────────────────────────────────────────── */
 
+// SplitMix64 终混函数：把 FNV 的输出雪崩成均匀 64 位值。
+// 不是密码学哈希，只用于让相邻 TeamID/路径不产生相近的 salt。
 static uint64_t smix64(uint64_t x) {
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
@@ -39,6 +51,7 @@ static uint64_t smix64(uint64_t x) {
 
 /* ── FNV-1a byte-by-byte hash ────────────────────────────────────────────── */
 
+// FNV-1a 64 位：对 UTF-8 字节串做确定性压缩，空输入也有固定初值（由调用方筛除）。
 static uint64_t fnv1a64(const uint8_t *data, size_t len) {
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < len; i++) {
@@ -52,10 +65,15 @@ static uint64_t fnv1a64(const uint8_t *data, size_t len) {
 
 #if defined(__APPLE__)
 
+// 首选派生：读取当前任务内存中的 TeamID entitlement，FNV-1a 后与 "CODESIGN"
+// 常量异或再做 SplitMix 雪崩。任一环节失败（无 SecTask、无 entitlement、
+// 非字符串、空串）都返回 0，由调用方切换到路径回退。
 static uint64_t derive_from_team_id(void) {
 #ifndef CPRISK_CODESIGN_HAVE_SECTASK
     return 0u;
 #else
+    // 下面的密文数组是固定字面量的整体替换，不逐字节维护；修改必须与注释中的
+    // 明文和 XOR 键一起改，否则读取到的 entitlement 名会失效并静默落到路径回退。
     /* Entitlement key: "com.apple.developer.team-identifier"
      * XOR-obfuscated with key 0x55 to avoid plain-text scanning.
      *
@@ -108,6 +126,9 @@ static uint64_t derive_from_team_id(void) {
 #endif
 }
 
+// 回退派生：哈希可执行文件路径。同一个构建/安装内稳定，重打包到不同 bundle 路径
+// 会得到不同 salt；但它不绑定签名者身份，安全性弱于 TeamID。
+// 路径缓冲区固定 1024 字节，_NSGetExecutablePath 失败或空路径返回 0。
 static uint64_t derive_from_executable_path(void) {
     /* Fallback: hash the executable path — stable within a build/install but
      * different across repackaged binaries (different bundle path). */
@@ -123,10 +144,14 @@ static uint64_t derive_from_executable_path(void) {
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
+// 返回稳定的 64 位签名绑定 salt；0 表示派生完全失败（中性盐，不做任何绑定）。
+// 首次调用可能触发 Security.framework 查询（毫秒级），之后走原子缓存（纳秒级）。
+// 并发首次调用可能各算一次，但写入值相同；缓存一旦写入不再重试。
 uint64_t cprisk_codesign_team_salt(void) {
     uint64_t cached = atomic_load_explicit(&s_salt_cache, memory_order_relaxed);
     if (cached != 0u) return (cached == 1u) ? 0u : cached;
 
+    // 模拟器没有真实签名 TeamID，直接给 0，避免把模拟器环境误判成某个签名身份。
 #if defined(__APPLE__) && !TARGET_OS_SIMULATOR
     uint64_t salt = derive_from_team_id();
     if (salt == 0u)

@@ -34,10 +34,20 @@
 #include <time.h>
 #include <mach-o/dyld.h>
 
+// 文件职责：解析 cprisk-armor 加密导入表，把“索引”还原为可调用符号地址。
+// 流程：whitebox 派生密钥 → 定位 __DATA 加密表 → 校验头/索引边界 → SHA-256 密钥流
+//   解密符号名 → CPRisk-MAC 校验 → 优先导出 trie、失败再 dlsym → 地址合法性复检 → 缓存。
+// 索引语义：普通索引落在 [0, count)；>= CPRISK_SWIFT_BRIDGE_IMPORT_BASE 的高区间
+//   不是表内索引，而是 Swift 桥接别名 cpra_NNNN 的稳定编号（见 resolve_swift_bridge_alias）。
+// 失败语义：任何一步失败都返回 -1 且 *out_addr 保持 NULL（fail-closed）；
+//   解析出可疑地址时额外向 watchdog 通道投毒。
+// 线程模型：导入缓存由 s_import_cache_mutex_i 保护；密钥/明文只存在于栈并即时清零。
+
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
+// 兼容性兜底：旧 SDK 头可能未导出 RTLD_DEFAULT；-2 是 dyld 约定的“默认搜索作用域”。
 #ifndef RTLD_DEFAULT
 #define RTLD_DEFAULT ((void *)(intptr_t)-2)
 #endif
@@ -47,6 +57,8 @@
  * Mismatch → return NULL for this resolve (fail closed) without global poison,
  * to reduce false positives from DYLD interposition / tooling.
  */
+// 编译期开关：iOS 真机默认开启 dlsym/trie 交叉校验，其余平台关闭。
+// 关闭时只影响“额外交叉校验”，主解析路径仍然优先走导出 trie。
 #ifndef CPRISK_IMPORT_DLSYM_TRIE_CROSSCHECK
 #if defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS && \
     (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
@@ -63,6 +75,8 @@
  * libc dlsym). When trie resolution in known system dylibs yields a unique
  * address that disagrees with dlsym, fail closed.
  */
+// 导出 trie 的符号名不带前导下划线（cprisk_dlsym 自己会补 '_'），
+// 而解密出的 C 符号名可能自带 '_'，这里统一去掉，避免查成 "__symbol"。
 static const char *cprisk_import_trie_sym_i(const char *name_buf) {
     if (!name_buf || name_buf[0] == '\0') {
         return NULL;
@@ -70,6 +84,9 @@ static const char *cprisk_import_trie_sym_i(const char *name_buf) {
     return (name_buf[0] == '_') ? (name_buf + 1) : name_buf;
 }
 
+// 允许作为“唯一导出”来源的系统 dylib 白名单。
+// 用途有二：一是遍历它们找唯一地址，二是校验最终地址的 dladdr 归属；
+// 只列系统库，避免把普通 App/注入库的同名导出当成可信来源。
 static const char *const s_import_system_libs_i[] = {
     "libsystem_kernel.dylib",
     "libsystem_c.dylib",
@@ -82,6 +99,10 @@ static const char *const s_import_system_libs_i[] = {
     "libsystem_trace.dylib",
 };
 
+// 在白名单系统库里逐个用导出 trie 查同一符号。
+// 若两个库给出不同地址，说明符号来源歧义（或其中一个被替换），置 AMBIGUOUS 并返回 NULL；
+// 只看到一个唯一地址才置 TRIE_UNIQUE 并返回它；全部未命中返回 NULL 且不置位。
+// 该函数不做地址合法性复检，复检由调用方统一完成。
 static void *cprisk_import_resolve_via_export_trie_i(const char *name_buf, uint32_t *path_flags_out) {
     const char *sym = cprisk_import_trie_sym_i(name_buf);
     if (!sym || sym[0] == '\0') {
@@ -109,6 +130,9 @@ static void *cprisk_import_resolve_via_export_trie_i(const char *name_buf, uint3
     return seen;
 }
 
+// 把 dlsym(RTLD_DEFAULT) 结果与“唯一 trie 地址”比较：
+// 只有 trie 唯一命中且地址不同才返回 NULL（该符号解析失败，fail-closed）；
+// trie 无唯一结果时无法证伪，保留 dlsym 结果，减少 DYLD interposition 误报。
 static void *cprisk_import_crosscheck_dlsym_vs_trie_i(
     const char *name_buf,
     void *rtld_addr
@@ -123,6 +147,9 @@ static void *cprisk_import_crosscheck_dlsym_vs_trie_i(
     return rtld_addr;
 }
 
+// 测试钩子：对明文符号名预测本模块会走哪条解析路径，返回 PATH_* 位组合。
+// 非 DEBUG 构建直接返回 0，避免在生产二进制里暴露解析策略。
+// 返回值只用于测试断言，不参与运行期判决；NULL/空名返回 NONE。
 uint32_t cprisk_test_import_resolve_strategy_for_symbol(const char *symbol_name) {
 #if !defined(DEBUG) || !DEBUG
     /* Test hook: inert outside DEBUG builds (issue 18). */
@@ -147,6 +174,9 @@ uint32_t cprisk_test_import_resolve_strategy_for_symbol(const char *symbol_name)
     return flags;
 }
 
+// 诊断：比较 mprotect 的 dlsym 结果与 libsystem_kernel 导出 trie 结果。
+// 返回 -1 = 任一路解析失败（无法比较）；0 = 一致；1 = 不一致（可能被 hook）。
+// 该函数不投毒、不改状态，供启动早期快速自检使用。
 int cprisk_verify_mprotect_dlsym_matches_export_trie(void) {
     void *a = dlsym(RTLD_DEFAULT, "mprotect");
     void *b = cprisk_dlsym("libsystem_kernel.dylib", "mprotect");
@@ -157,12 +187,21 @@ int cprisk_verify_mprotect_dlsym_matches_export_trie(void) {
 }
 
 /* CPRISK_IMPORT_MAGIC: "CPIM" = 0x43494D50 */
+// 表头 16 字节 = magic + version + count + reserved；索引项 48 字节 =
+// data_offset(4) + data_length(4) + nonce(8) + mac_tag(32)。
+// 这些尺寸与 Swift 侧打包器逐字节绑定，不能单独修改；version 不匹配即拒绝解析。
 #define CPRISK_IMPORT_MAGIC     0x43494D50
 #define CPRISK_IMPORT_VERSION   1
 #define CPRISK_IMPORT_INDEX_SZ  48
 #define CPRISK_IMPORT_HDR_SZ     16
+// 缓存槽数固定 32：槽位 = symbol_index % 32，冲突时直接覆盖（见 cache_store）。
+// 小容量换取“无堆分配 + 常数时间查找”，偶发覆盖只会导致重新解析。
 #define CPRISK_IMPORT_CACHE_SLOTS 32u
 
+// 缓存项：symbol_index 用于识别槽位冲突；addr 是解析结果；tag 是用当前白盒密钥
+// 对 (index, addr, 表指纹) 计算的 32 位 MAC，防止攻击者直接改内存伪造缓存；
+// path_flags 必须随 addr 一起保存，因为 owner 校验规则依赖“是否唯一 trie 命中”。
+// valid 最后写入，读者只在 valid 非 0 时信任其余字段。
 typedef struct cprisk_import_cache_entry_i {
     uint32_t symbol_index;
     uintptr_t addr;
@@ -172,9 +211,13 @@ typedef struct cprisk_import_cache_entry_i {
     uint8_t _reserved[3];
 } cprisk_import_cache_entry_i;
 
+// 缓存数组为进程级共享；锁只保护数组读写，不覆盖 dladdr/dlsym 等外部调用。
 static pthread_mutex_t s_import_cache_mutex_i = PTHREAD_MUTEX_INITIALIZER;
 static cprisk_import_cache_entry_i s_import_cache_i[CPRISK_IMPORT_CACHE_SLOTS];
 
+// 用 dladdr 取地址所属镜像路径，判断是否包含任一预期系统库名。
+// 只在“trie 唯一命中”时使用：此时来源应当是系统库，若实际归属不符，视为地址被替换。
+// 返回 1 = 归属匹配；0 = 不匹配或 dladdr 失败（失败按不匹配处理，偏保守）。
 static int cprisk_import_symbol_owner_matches_i(
     const void *addr,
     const char *const *expected_libs,
@@ -196,6 +239,11 @@ static int cprisk_import_symbol_owner_matches_i(
     return 0;
 }
 
+// 解析结果的三重复检，任一失败返回 -1（调用方随后投毒并拒绝该地址）：
+//   1) 地址必须落在某个已加载镜像的可执行段内（拒绝裸映射/堆上 trampoline）；
+//   2) 入口 16 字节不能是可疑跳板前缀（拒绝 Frida/Gum 的 b/br/adrp 序列）；
+//   3) 若来自“唯一 trie 命中”，其 dladdr 归属必须仍是白名单系统库。
+// 注意：第 3 条只在 TRIE_UNIQUE 时执行，避免把合法的 DYLD interposition 一律判死。
 static int cprisk_import_validate_resolved_addr_i(const void *addr, uint32_t path_flags) {
     if (addr == NULL) {
         return -1;
@@ -216,6 +264,8 @@ static int cprisk_import_validate_resolved_addr_i(const void *addr, uint32_t pat
     return 0;
 }
 
+// 系统版本混合值：对 kern.osrelease 做 FNV-1a；不可读时返回固定常量。
+// 仅用于给 timing 噪声加一点环境差异，不参与安全判定。
 static uint32_t cprisk_import_os_mix_i(void) {
     char osrelease[128];
     size_t len = sizeof(osrelease);
@@ -231,11 +281,15 @@ static uint32_t cprisk_import_os_mix_i(void) {
     return mix;
 }
 
+// 镜像数量混合值：把“当前加载了多少镜像”折叠进噪声，进程布局变化时噪声也随之变化。
 static uint32_t cprisk_import_dyld_mix_i(void) {
     const uint32_t image_count = _dyld_image_count();
     return (image_count << 11u) ^ (image_count >> 3u) ^ 0xA24BAED5u;
 }
 
+// 解析阶段的轻量时间噪声：读单调时钟后做 32..95 轮依赖数据的自旋。
+// 目的不是密码学防护，而是让 dlsym 调用在时间维度上不那么规整，抬高远程
+// 计时观测的难度；开销固定且很小（每符号一次）。
 static void cprisk_import_timing_hook_i(uint32_t stage, uint32_t symbol_index) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -254,6 +308,9 @@ static void cprisk_import_timing_hook_i(uint32_t stage, uint32_t symbol_index) {
     (void)sink;
 }
 
+// 缓存完整性标签：MAC-SHA256(key, index || addr || table_fingerprint) 后截取前 4 字节。
+// key 来自 whitebox，攻击者无法离线伪造；table_fingerprint 确保换表后旧缓存自动失效。
+// 中间消息与摘要都清零，避免密钥派生材料残留在栈上。
 static uint32_t cprisk_import_cache_tag_i(
     const uint8_t key[CPRISK_ARMOR_KEY_SIZE],
     uint32_t symbol_index,
@@ -275,6 +332,11 @@ static uint32_t cprisk_import_cache_tag_i(
     return tag;
 }
 
+// 查缓存：锁内按 symbol_index 找槽并重算 tag，命中则拷贝 addr/path_flags 后立即解锁，
+// 在锁外做地址复检（dladdr 等外部调用不应持锁）。
+// 返回 1 = 命中且复检通过（*out_addr 已写）；0 = 未命中/标签不符/复检失败。
+// 复检失败会向 watchdog 通道投毒并清除该槽，但清除前再次核对 index/addr/tag，
+// 防止把并发写入的新条目误删（ABA）。
 static int cprisk_import_cache_lookup_i(
     const uint8_t key[CPRISK_ARMOR_KEY_SIZE],
     uint32_t symbol_index,
@@ -327,6 +389,9 @@ static int cprisk_import_cache_lookup_i(
     return 0;
 }
 
+// 写缓存：先复检地址，不合格则投毒并放弃写入（绝不缓存可疑地址）。
+// 槽位由 index % 32 决定，冲突时覆盖旧条目；tag 与 addr 一起计算/写入，
+// 保证“读到 tag 正确”就意味着 addr/fingerprint 匹配当前密钥与表。
 static void cprisk_import_cache_store_i(
     const uint8_t key[CPRISK_ARMOR_KEY_SIZE],
     uint32_t symbol_index,
@@ -353,6 +418,9 @@ static void cprisk_import_cache_store_i(
     pthread_mutex_unlock(&s_import_cache_mutex_i);
 }
 
+// 用 whitebox 的 Domain-8 从全零种子派生导入表密钥。
+// 刻意没有回退派生：白盒求值失败就清零输出并返回错误，让导入解析硬失败；
+// 任何“确定性回退密钥”都会变成攻击者可稳定复现的弱路径。
 static int cprisk_derive_import_key(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]) {
     if (!out_key) return -1;
 
@@ -375,6 +443,10 @@ static int cprisk_derive_import_key(uint8_t out_key[CPRISK_ARMOR_KEY_SIZE]) {
 
 /* ── Keystream derivation (matches Swift side) ──────────────────────── */
 
+// 生成与 Swift 打包端一致的密钥流：material = key(32) || index_le32 || nonce(8) || counter_le64，
+// SHA256(material) 逐块拼接。index 由调用方传 symbol_index+1（打包端从 1 开始计数），
+// 该 +1 是格式契约，改动会导致所有符号名解密错误。
+// 输出长度恰为 name_len，调用方需在事后清零。
 static void derive_keystream(
     const uint8_t *key, uint32_t index,
     const uint8_t *nonce, size_t name_len,
@@ -417,28 +489,44 @@ static void derive_keystream(
 
 /* ── Own Mach-O header (self-locating) ──────────────────────────────── */
 
+// 自定位本 SDK 的 Mach-O 头：把本函数地址交给解析器，由它反查所属镜像。
+// 不依赖 dyld API，避免 dlsym/dladdr 被 hook 后“找不到自己”的降级路径。
 static const struct mach_header_64 *cprisk_own_hdr(void) {
     return cprisk_find_own_header((const void *)cprisk_own_hdr);
 }
 
+// 由 cprisk_swift_bridge_exports.c 提供：引用别名表，防止链接器把 cpra_NNNN 当作死代码剔除。
 void cprisk_swift_bridge_force_link(void);
 
+// Swift 桥接高区间解析：index >= CPRISK_SWIFT_BRIDGE_IMPORT_BASE（0x40000000）时，
+// 索引不是加密表行号，而是“BASE + 序号”；序号 0..COUNT-1 一一对应
+// cprisk_swift_bridge_exports.c 中的 cpra_0001..cpra_0126 别名。
+// 不变量：BASE/COUNT 与 include/cprisk_swift_bridge.h 完全一致；别名只允许追加，
+//   禁止重排或复用序号，否则已编译的 Swift 客户端会指到错误函数。
+// 返回：0 = 成功写入 *out_addr；-1 = 序号越界、dlsym 序言被改写、别名名生成失败
+//   或 dlsym 未找到；1 = 防御性拒绝（传入的 index 其实低于 BASE，不应发生）。
 static int cprisk_resolve_swift_bridge_alias_i(uint32_t symbol_index, void **out_addr) {
     if (!out_addr || symbol_index < CPRISK_SWIFT_BRIDGE_IMPORT_BASE) {
         return 1;
     }
 
+    // 先做区间归一化再查表：序号必须严格小于 COUNT，防止越界访问别名表。
     const uint32_t bridge_index = symbol_index - CPRISK_SWIFT_BRIDGE_IMPORT_BASE;
     if (bridge_index >= CPRISK_SWIFT_BRIDGE_IMPORT_COUNT) {
         return -1;
     }
 
+    // 高区间最终仍要经 dlsym 取别名地址；序言被改写时直接失败，不把被 hook 的
+    // 解析结果交给调用方（fail-closed）。
     if (cprisk_verify_dlsym_prologue() == 0) {
         return -1;
     }
 
+    // 强制引用别名表：确保护航符号已被链接进镜像，否则 dlsym 找不到 cpra_NNNN。
     cprisk_swift_bridge_force_link();
 
+    // 别名从 1 开始编号（cpra_0001 对应序号 0），格式固定为 4 位十进制；
+    // 16 字节缓冲足够容纳 "cpra_" + 4 位 + NUL，snprintf 返回值用于检测截断。
     char alias_name[16];
     const int written = snprintf(
         alias_name,
@@ -457,18 +545,27 @@ static int cprisk_resolve_swift_bridge_alias_i(uint32_t symbol_index, void **out
 
 /* ── Main resolver ─────────────────────────────────────────────────── */
 
+// 主入口：把导入索引解析成可调用地址。
+// 返回值：0 = 成功（*out_addr 非 NULL）；-1 = 任何失败（*out_addr 保持 NULL）。
+// 所有权：out_addr 由调用方提供，函数先写 NULL 再按成功路径覆盖。
+// 线程安全：可并发调用；缓存有锁，密钥/明文为栈局部。
+// 高区间语义：index >= BASE 直接走 Swift 桥接别名解析，不读加密表。
+// 失败语义：表损坏、MAC 不符、地址复检失败、dlsym 序言被改写都 fail-closed。
 int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
     if (!out_addr) return -1;
     *out_addr = NULL;
 
+    // 高区间不是表索引：先分流，避免用巨大 index 去计算表内偏移。
     if (symbol_index >= CPRISK_SWIFT_BRIDGE_IMPORT_BASE) {
         return cprisk_resolve_swift_bridge_alias_i(symbol_index, out_addr);
     }
 
     /* Import table is encrypted with WhiteBox Domain-8 key on the Swift side. */
+    // 白盒密钥派生失败即整体失败，不做任何“默认密钥”降级。
     uint8_t key[CPRISK_ARMOR_KEY_SIZE];
     if (cprisk_derive_import_key(key) != 0) return -1;
 
+    // 从自身 Mach-O 里定位加密段；找不到头/段都按失败处理并清零密钥。
     const struct mach_header_64 *hdr = cprisk_own_hdr();
     if (!hdr) {
         cprisk_secure_zero(key, sizeof(key));
@@ -489,6 +586,7 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
     }
 
     /* Verify header */
+    // 表头四字段按小端读取；magic/version 任一不符即拒绝（防止旧格式或伪造表）。
     uint32_t magic = 0;
     uint32_t version = 0;
     uint32_t count = 0;
@@ -503,6 +601,8 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
         return -1;
     }
 
+    // count 来自不可信段内容：先做乘法溢出检查，再验证索引表整体落在段内，
+    // 防止 count 被改大后越界读取后续内存。
     if (count > (UINT32_MAX / CPRISK_IMPORT_INDEX_SZ)) {
         cprisk_secure_zero(key, sizeof(key));
         return -1;
@@ -514,6 +614,8 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
         return -1;
     }
 
+    // 表指纹把 magic/version/count/reserved/段大小折叠进缓存标签：
+    // 表被替换或重打包后，即便 symbol_index 相同，旧缓存也会因标签不符而失效。
     const uint32_t table_fingerprint =
         magic ^
         (version << 7u) ^
@@ -521,12 +623,15 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
         (reserved * 0x45D9F3Bu) ^
         (uint32_t)sec_sz;
 
+    // 缓存命中即返回成功；此处同样先清零密钥再返回，保证任何出口都不留密钥。
     if (cprisk_import_cache_lookup_i(key, symbol_index, table_fingerprint, out_addr) != 0) {
         cprisk_secure_zero(key, sizeof(key));
         return 0;
     }
 
     /* Read index entry */
+    // 索引项内部布局固定：offset(0..3)、length(4..7)、nonce(8..15)、mac(16..47)；
+    // nonce/mac 是打包端写入的字段，解析器只按偏移读取，不做结构体映射以规避对齐问题。
     const uint8_t *idx = sec + CPRISK_IMPORT_HDR_SZ
                         + (uintptr_t)symbol_index * CPRISK_IMPORT_INDEX_SZ;
 
@@ -538,11 +643,15 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
     const uint8_t *stored_mac = idx + 16;
 
     /* Encrypted name data starts after all index entries */
+    // data_offset 是相对于“名称数据区起点”的偏移，不是相对段起点；
+    // 若误用段起点会导致跨符号读取，后续 MAC 也许仍可能通过（同一密钥流），必须按格式解析。
     const uint8_t *encrypted_names_base = sec + index_table_end;
     const size_t encrypted_names_len = sec_sz - index_table_end;
     const uint8_t *encrypted_name = encrypted_names_base + data_off;
 
     /* Bounds check */
+    // 先保证 offset 本身不越界，再保证 length 不越过剩余长度；两步都用减法形式，
+    // 避免 data_off + data_len 的加法溢出。
     if ((size_t)data_off > encrypted_names_len ||
         (size_t)data_len > encrypted_names_len - (size_t)data_off) {
         cprisk_secure_zero(key, sizeof(key));
@@ -550,12 +659,15 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
     }
 
     /* Decrypt symbol name */
+    // 名称上限 512 字节：符号名远短于此，超长视为表损坏并拒绝；
+    // 同时保证后续 MAC 输入缓冲（8 + 512）有确定上界。
     char name_buf[512];
     if (data_len >= sizeof(name_buf)) {
         cprisk_secure_zero(key, sizeof(key));
         return -1;
     }
 
+    // 这里的 symbol_index + 1 必须与 Swift 打包端的计数起点一致（见 derive_keystream）。
     uint8_t ks[512];
     derive_keystream(key, symbol_index + 1, nonce, data_len, ks);
 
@@ -566,6 +678,8 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
 
     /* Verify CPRisk-MAC-SHA256 over nonce || plaintext_name.
      * CPRisk-MAC input = nonce (8 bytes) || plaintext_name. */
+    // MAC 覆盖 nonce 与明文名：既绑定每次加密的随机性，也保证解密出的名字未被篡改；
+    // 校验失败说明密钥错误或表被改写，必须清零后 fail-closed。
     uint8_t mac_input[8 + 512];
     memcpy(mac_input, nonce, 8);
     memcpy(mac_input + 8, name_buf, data_len);
@@ -589,6 +703,7 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
      * Prefer export-trie resolution first: this avoids handing the recovered
      * plaintext symbol to hooked RTLD paths when a unique system export exists.
      */
+    // 优先 trie：明文名不会传给可能被 hook 的 RTLD_DEFAULT，只有 trie 无唯一结果才回退。
     uint32_t resolve_path_flags = 0u;
     void *addr = cprisk_import_resolve_via_export_trie_i(name_buf, &resolve_path_flags);
     if (addr == NULL) {
@@ -601,6 +716,8 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
             cprisk_secure_zero(computed_mac, sizeof(computed_mac));
             return -1;
         }
+        // 序言检查已通过：标记回退路径、加一点时间噪声，再交给 RTLD_DEFAULT。
+        // 该结果仍会经过下方统一地址复检，不会直接信任。
         resolve_path_flags |= CPRISK_IMPORT_RESOLVE_PATH_RTLD_FALLBACK;
         cprisk_import_timing_hook_i(1u, symbol_index);
         addr = dlsym(RTLD_DEFAULT, name_buf);
@@ -611,6 +728,8 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
         }
 #endif
     }
+    // 两条解析路径共用同一出口：地址复检失败则投毒并丢弃结果；
+    // 通过才允许写入缓存（cache_store 内部会再复检一次，防止 TOCTOU）。
     if (addr != NULL) {
         if (cprisk_import_validate_resolved_addr_i(addr, resolve_path_flags) != 0) {
             cprisk_integrity_poison_watchdog_lane_now();
@@ -621,6 +740,7 @@ int cprisk_resolve_import(uint32_t symbol_index, void **out_addr) {
     }
 
     /* Clean up decrypted name before returning */
+    // 单出口统一清零：明文名、密钥流、MAC 输入/结果、白盒密钥，避免残留在栈上。
     cprisk_secure_zero(name_buf, data_len);
     cprisk_secure_zero(ks, data_len < sizeof(ks) ? data_len : sizeof(ks));
     cprisk_secure_zero(mac_input, sizeof(mac_input));

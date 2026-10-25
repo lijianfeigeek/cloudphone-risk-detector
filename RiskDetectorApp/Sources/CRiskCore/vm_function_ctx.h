@@ -1,3 +1,8 @@
+// 文件职责：函数级 VM 上下文——每函数独立的编码、密钥、状态机与栈/完整性参数。
+// 现状：未接入主路径（issue 65），保留仅为兼容，其保护能力不计入防御声明。
+// 所有权：init 初始化调用方提供的结构体；bytecode_cache 由本模块 malloc，clear/copy 管理。
+// 线程模型：ctx 与 pool 均无锁，同一对象只能单线程读写；池操作需外部串行。
+// 平台/失败语义：纯 C，无架构分支；非法参数或初始化失败返回 -1（fail-closed）。
 /* ════════════════════════════════════════════════════════════════════
  * DEPRECATED — 未接入主路径（issue 65）。
  * 本模块经核查无任何生产调用方（仅自身内部引用 / 仅被本模块自身包含），
@@ -37,6 +42,9 @@
  * - 即使是相同源代码的函数，编码后也完全不同
  */
 
+// 上下文状态机：UNINITIALIZED 刚清零；INITIALIZING 保留未用；READY 可进入；
+// EXECUTING 执行中；SUSPENDED 让出后暂停；COMPLETED 正常退出；ERROR 失败粘滞。
+// 只有 clear 能把 ERROR 复位；数值会参与状态校验，不能重排。
 /* 函数上下文状态 */
 typedef enum {
     VM_FUNC_CTX_UNINITIALIZED = 0,
@@ -48,6 +56,9 @@ typedef enum {
     VM_FUNC_CTX_ERROR = 6
 } vm_func_ctx_state_t;
 
+// 保护级别决定编码版本与启用的子保护：NONE/BASIC→V0，STANDARD→V1/V2，
+// HIGH→V2/V3 并启用栈混淆，CRITICAL→V3 并启用完整性参数。
+// 数值写入字节码头的 protect_level 字节，属于协议常量。
 /* 函数保护级别 */
 typedef enum {
     VM_PROTECT_LEVEL_NONE = 0,      /* 无保护 */
@@ -57,6 +68,8 @@ typedef enum {
     VM_PROTECT_LEVEL_CRITICAL = 4   /* 关键保护 (V3 + 完整性校验) */
 } vm_protect_level_t;
 
+// 元数据位：HAS_* 描述控制流特征，IS_* 描述函数属性，NEEDS_* 触发栈加密/完整性初始化。
+// 由 init/调用方置位，调度与加固层只读；位值固定，改动会影响已有元数据。
 /* 函数元数据标志 */
 #define VM_FUNC_META_HAS_LOOPS      0x01u  /* 包含循环 */
 #define VM_FUNC_META_HAS_BRANCHES   0x02u  /* 包含分支 */
@@ -66,6 +79,9 @@ typedef enum {
 #define VM_FUNC_META_NEEDS_STACK_ENC 0x20u /* 需要栈加密 */
 #define VM_FUNC_META_NEEDS_INTEGRITY 0x40u /* 需要完整性校验 */
 
+// 函数上下文：一个受保护函数一份，除 bytecode_cache 外均为内联值。
+// 单位：execution_count 为次数，step_count/max_steps 为指令步数，stack_rot 为 0..63。
+// 所有权：结构体由调用方提供；bytecode_cache 由本模块 malloc，clear 负责释放并清零。
 /* 函数级VM上下文 */
 typedef struct {
     /* 标识信息 */
@@ -73,6 +89,8 @@ typedef struct {
     uint32_t func_hash;             /* 函数代码哈希 */
 
     /* 编码方案 (核心) */
+    // encoding 是完整副本（含密钥）；下面的 encoding_version/opcode_xor_key 等是派生中间值，
+    // 正常路径应与 encoding 内对应字段一致，但代码未强制校验两者。
     vm_encoding_ctx_t encoding;     /* 编码上下文 */
     uint32_t encoding_version;      /* 编码版本 V0-V3 */
     uint32_t opcode_xor_key;        /* 操作码异或密钥 */
@@ -99,6 +117,8 @@ typedef struct {
     uint64_t checksum_chain;        /* 校验和链 */
     uint8_t  integrity_tag[16];     /* 完整性标签 */
 
+    // bytecode_cache 是 malloc 的字节缓冲（原始或编码字节），bytecode_size 为其字节数；
+    // entry_point 是字节偏移。last_execution_time 当前实际存 execution_count，不是时间戳。
     /* 运行时数据 */
     void *bytecode_cache;           /* 字节码缓存 */
     size_t bytecode_size;           /* 字节码大小 */
@@ -109,6 +129,8 @@ typedef struct {
     uint32_t anomaly_flags;         /* 异常标志 */
 } vm_function_ctx_t;
 
+// 池固定 64 槽：用位图复用上下文，避免运行期堆分配与加锁；超出容量时分配失败。
+// 不变量：位图第 i 位为 1 ⇔ contexts[i] 已分配；active_count 等于置位数量。
 /* 函数上下文池 */
 #define VM_FUNC_CTX_POOL_SIZE 64
 typedef struct {
@@ -117,6 +139,9 @@ typedef struct {
     uint32_t active_count;
 } vm_function_ctx_pool_t;
 
+// 初始化：清零 → 写标识/哈希/级别 → 选编码版本 → 派生密钥 → 初始化编码与步数预算。
+// ctx 非 NULL；level 非法时走默认预算。成功 0 且 state=READY，失败 -1 且 state=ERROR。
+// 只写 ctx；失败后 ctx 已被部分写入，调用方应 clear 丢弃，不得继续使用。
 /*
  * 初始化函数上下文
  * 为指定函数创建独立的VM上下文
@@ -125,17 +150,25 @@ int vm_function_ctx_init(vm_function_ctx_t *ctx,
                          uint64_t func_id,
                          vm_protect_level_t level);
 
+// 从 func_id 经白盒 PRF 派生 64 字节材料，切分为操作码密钥/盐/调度种子/版本种子/
+// 栈密钥/旋转量/偏移/校验链/完整性标签。成功 0，ctx NULL 返回 -1。
+// 只写 ctx；材料用后 secure_zero；无全局状态，不同 ctx 可并发派生。
 /*
  * 从函数ID派生所有密钥参数
  * 使用WhiteBox PRF确保密钥不可提取
  */
 int vm_function_ctx_derive_keys(vm_function_ctx_t *ctx, uint64_t func_id);
 
+// 按级别选择编码版本：NONE/BASIC→V0，STANDARD→V1/V2，HIGH→V2/V3，CRITICAL→V3。
+// 中间档的二选一依赖运行时 mprotect 交叉校验计数（非随机数），同进程内可复现。
+// 纯函数、线程安全；非法 level 回落 V0。
 /*
  * 根据保护级别选择编码版本
  */
 vm_encoding_version_t vm_function_ctx_select_encoding(vm_protect_level_t level);
 
+// 覆盖元数据位；max_steps 仅在 >0 时生效，0 表示保留初始化预算。
+// ctx NULL 时静默返回；无返回值。不得与执行线程并发调用。
 /*
  * 设置函数元数据
  */
@@ -143,41 +176,60 @@ void vm_function_ctx_set_metadata(vm_function_ctx_t *ctx,
                                    uint32_t flags,
                                    uint32_t max_steps);
 
+// 校验并补齐栈参数：密钥为 0 时填固定兜底值，rot 为 0 时用 17。
+// 兜底只为算法可运行，不提供随机性。返回 0；ctx NULL 返回 -1。只写 ctx。
 /*
  * 初始化栈加密参数
  */
 int vm_function_ctx_init_stack_crypto(vm_function_ctx_t *ctx);
 
+// 完整性参数：version_seed 为 0 时填入 0x9E3779B9，避免全零种子退化。
+// 返回 0；ctx NULL 返回 -1。只写 ctx。
 /*
  * 初始化完整性校验参数
  */
 int vm_function_ctx_init_integrity(vm_function_ctx_t *ctx);
 
+// 进入执行态：仅 READY/SUSPENDED → EXECUTING；进入时 execution_count+1，
+// step_count 与 anomaly_flags 清零，使每次执行拥有独立预算。
+// 返回 0，NULL 或非法状态 -1；修改 state，需与同一 ctx 的操作串行。
 /*
  * 进入函数执行状态
  */
 int vm_function_ctx_enter(vm_function_ctx_t *ctx);
 
+// 退出执行态：仅 EXECUTING → COMPLETED；返回 0，否则 -1。
+// last_execution_time 实际写入 execution_count（简化实现，不是时间戳）。
 /*
  * 退出函数执行状态
  */
 int vm_function_ctx_exit(vm_function_ctx_t *ctx);
 
+// 挂起执行：仅 EXECUTING → SUSPENDED，用于 yield/中断；返回 0，其他状态 -1。
+// 不改变步数预算与执行计数，恢复后继续累计；需与同一 ctx 串行。
 /*
  * 挂起函数执行 (用于yield/中断)
  */
 int vm_function_ctx_suspend(vm_function_ctx_t *ctx);
 
+// 恢复执行：仅 SUSPENDED → EXECUTING；返回 0，其他状态 -1。
+// 保留 step_count，因此挂起前消耗的预算仍然有效；需串行。
 /*
  * 恢复函数执行
  */
 int vm_function_ctx_resume(vm_function_ctx_t *ctx);
 
+// 返回内部编码上下文指针（借用，调用方不得释放）；ctx NULL 返回 NULL。
+// 生命周期同 ctx；只读，与写 encoding 的并发需外部同步。
 /*
  * 获取函数编码上下文
  */
 const vm_encoding_ctx_t *vm_function_ctx_get_encoding(const vm_function_ctx_t *ctx);
 
+// 用函数专属方案把原始字节码编码为 malloc 缓冲，布局：
+// func_id(8)||version(1)||level(1)||指令流；输入每条指令固定 9 字节（opcode+operand 小端）。
+// 参数不可 NULL、raw_len>0；成功（0）时 *out_encoded 归调用方 free，失败 -1 且不写输出。
+// 只读 ctx；不足 9 字节的尾部被丢弃；当前不推进 V3 chain_state。
 /*
  * 编码函数的字节码
  * 使用函数专属的编码方案
@@ -188,6 +240,9 @@ int vm_function_ctx_encode_bytecode(vm_function_ctx_t *ctx,
                                     uint8_t **out_encoded,
                                     size_t *out_len);
 
+// 解码 pc 处的单条指令；pc 是编码缓冲字节偏移，须 ∈ [10, encoded_len)。
+// 成功 0 并写 opcode/operand；NULL、越界或底层失败 -1。
+// 剩余不足 9 字节时尾部补零，V0/V1 可能解出垃圾而不报错。只读，可并发。
 /*
  * 解码函数的字节码
  */
@@ -198,6 +253,7 @@ int vm_function_ctx_decode_bytecode(vm_function_ctx_t *ctx,
                                     uint32_t *opcode_out,
                                     uint64_t *operand_out);
 
+// 执行计数与步数各 +1；ctx NULL 安全忽略。无锁，需与同一 ctx 串行。
 /*
  * 更新执行计数器
  */
@@ -208,6 +264,8 @@ static inline void vm_function_ctx_inc_execution(vm_function_ctx_t *ctx) {
     }
 }
 
+// 返回 0 表示仍有预算，-1 表示 ctx NULL 或 step_count >= max_steps。
+// 只读；达到上限后调用方应中止执行。
 /*
  * 检查执行步数限制
  */
@@ -219,6 +277,8 @@ static inline int vm_function_ctx_check_step_limit(const vm_function_ctx_t *ctx)
     return 0;
 }
 
+// OR 异常标志并把状态置 ERROR（粘滞，clear 前不再接受执行）；ctx NULL 安全忽略。
+// 无返回值，仅写 ctx。
 /*
  * 记录异常
  */
@@ -230,45 +290,61 @@ static inline void vm_function_ctx_record_anomaly(vm_function_ctx_t *ctx,
     }
 }
 
+// 廉价自检：状态枚举范围、func_hash 与 func_id 是否匹配、编码版本是否越界。
+// 返回 0 通过，NULL 或任一失败 -1。不是密码学校验，同时篡改 func_id 与哈希可绕过。
 /*
  * 验证函数上下文完整性
  */
 int vm_function_ctx_verify_integrity(const vm_function_ctx_t *ctx);
 
+// 浅拷贝后对 bytecode_cache 做字节级深拷贝；dst 原有指针须先 clear，否则泄漏。
+// 成功 0；参数非法或分配失败 -1（dst 可能已部分写入，应 clear 丢弃）。
+// 读 src/写 dst，需保证 src 不被并发修改。
 /*
  * 复制函数上下文
  */
 int vm_function_ctx_copy(vm_function_ctx_t *dst, const vm_function_ctx_t *src);
 
+// 释放并清零 bytecode_cache，再 secure_zero 整个上下文；可重复调用。
+// 不释放 ctx 本身，也不改动池位图；调用后必须重新 init 才能使用。
 /*
  * 安全清除函数上下文
  */
 void vm_function_ctx_clear(vm_function_ctx_t *ctx);
 
+// 上下文池：固定 64 槽、无锁；以下所有操作都必须由调用方串行化。
 /* ==================== 上下文池管理 ==================== */
 
+// 池初始化：清零所有槽与位图，active_count=0；pool NULL 时静默返回。
 /*
  * 初始化上下文池
  */
 void vm_function_ctx_pool_init(vm_function_ctx_pool_t *pool);
 
+// 线性查找第一个空闲位，置位、清零槽并 active_count+1。
+// 成功返回池内借用指针（不可 free）；池满或 pool NULL 返回 NULL。
 /*
  * 从池中分配上下文
  */
 vm_function_ctx_t *vm_function_ctx_pool_alloc(vm_function_ctx_pool_t *pool);
 
+// 归还槽：ctx 必须指向 pool->contexts 数组内部；先 clear 再清位、active_count-1。
+// 对同一槽重复归还会使计数下溢，调用方必须保证只归还一次。
 /*
  * 释放上下文回池
  */
 void vm_function_ctx_pool_free(vm_function_ctx_pool_t *pool,
                                vm_function_ctx_t *ctx);
 
+// 按 func_id 线性扫描已分配槽，不比较级别；返回借用指针或 NULL。复杂度 O(64)。
 /*
  * 查找函数的上下文
  */
 vm_function_ctx_t *vm_function_ctx_pool_find(vm_function_ctx_pool_t *pool,
                                               uint64_t func_id);
 
+// 先查后建：已存在直接复用（忽略 level）；否则分配并 init。
+// 成功返回池内指针；池满、init 失败或 pool NULL 返回 NULL；init 失败会立即归还槽。
 /*
  * 获取或创建函数上下文
  */
@@ -276,6 +352,7 @@ vm_function_ctx_t *vm_function_ctx_pool_get_or_create(vm_function_ctx_pool_t *po
                                                        uint64_t func_id,
                                                        vm_protect_level_t level);
 
+// 逐一 clear 已分配槽，再整池清零（位图与 active_count 一并复位）；pool NULL 时返回。
 /*
  * 清理池中的所有上下文
  */

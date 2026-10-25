@@ -1,3 +1,8 @@
+// 由 experiments/vm-cpsv-v2/generate_runtime.py 生成，禁止手改；顺序即 CPSV2 wire kind 顺序。
+// 包含 58 个编译期独立函数身份：6 个固定入口 + 线程 lane A/B 各 26 个 opcode handler。
+// 消费方：cprisk_vm_cpsv2_runtime.inc 定义 CPRISK_CPSV2_IDENTITY(name) 后展开本表，
+// 取函数地址以独立计算 RVA 并保留符号；编译开关为 CPRISK_VM_THREADED_DISPATCH（默认 0）。
+// 修改本表必须重新生成产物并重跑 layout，否则运行时校验必然失败。
 /* Generated independent compiled identities, in wire kind order. */
 CPRISK_CPSV2_IDENTITY(cprisk_vm_execute)
 CPRISK_CPSV2_IDENTITY(cprisk_vm_interp_loop_a)

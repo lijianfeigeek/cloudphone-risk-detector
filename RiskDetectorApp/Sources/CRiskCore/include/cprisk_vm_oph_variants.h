@@ -1,6 +1,12 @@
 #ifndef CPRISK_VM_OPH_VARIANTS_H
 #define CPRISK_VM_OPH_VARIANTS_H
 
+// cprisk_vm_oph_variants.h — 多态变体池声明（仅 CRiskCore 内部与单元测试使用）。
+// ABI：所有处理器/选择器签名均为 cprisk_vm_flow_t (*)(frame*, u8, u8, u64, u32, u32)，
+//      与 cprisk_vm_oph_fn 完全兼容，可直接替换 cprisk_vm_oph_table.c 中使用的 canonical 指针。
+// 约定：分发表只允许调用 select_*；*_v0 委托 canonical，*_v1/_v2 为等价实现，结果必须逐位一致。
+// 所有权：fr 由调用方持有；本层不分配内存、不保存跨调用状态。
+// 线程模型：不同线程各自持有独立 frame 时可重入；同一 frame 不可并发。
 /*
  * cprisk_vm_oph_variants.h
  *
@@ -15,10 +21,12 @@
 
 #include "cprisk_vm_interpreter_internal.h"
 
+// C++ 兼容：以下声明按 C 链接，保证测试代码以 C++ 编译时符号与 C 侧一致。
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// 变体函数本体：公开声明仅为单元测试直接驱动，生产路径必须经由 select_*。
 /* Variant bodies (exposed for testing) */
 cprisk_vm_flow_t cprisk_vm_oph_nop_v0(cprisk_vm_interp_frame_t *fr, uint8_t op_raw, uint8_t logical, uint64_t imm, uint32_t pc, uint32_t hvar);
 cprisk_vm_flow_t cprisk_vm_oph_nop_v1(cprisk_vm_interp_frame_t *fr, uint8_t op_raw, uint8_t logical, uint64_t imm, uint32_t pc, uint32_t hvar);
@@ -32,6 +40,8 @@ cprisk_vm_flow_t cprisk_vm_oph_add_v0(cprisk_vm_interp_frame_t *fr, uint8_t op_r
 cprisk_vm_flow_t cprisk_vm_oph_add_v1(cprisk_vm_interp_frame_t *fr, uint8_t op_raw, uint8_t logical, uint64_t imm, uint32_t pc, uint32_t hvar);
 cprisk_vm_flow_t cprisk_vm_oph_add_v2(cprisk_vm_interp_frame_t *fr, uint8_t op_raw, uint8_t logical, uint64_t imm, uint32_t pc, uint32_t hvar);
 
+// 运行时选择器：每个 opcode 一组，按会话状态在 3 个等价体间选择；
+// 变体表为函数内 __const，调用方不得绕过选择器直接依赖某个变体地址。
 /* Runtime selectors — use these in cprisk_vm_oph_table.c */
 
 /* Original pool: NOP / XOR_MIX / ADD */

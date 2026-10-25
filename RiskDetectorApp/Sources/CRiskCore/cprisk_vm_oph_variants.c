@@ -1,3 +1,9 @@
+// cprisk_vm_oph_variants.c — 高频 opcode 的多态变体池：同一语义提供 3 份不同机器码实现。
+// 目的：对抗按地址缓存反汇编结果的动态分析（如 unidbg 的 Capstone L1/L2 缓存），
+// 使同一 opcode 在多次执行中落到不同函数地址，削弱“一个 opcode 对应一个 handler”的映射。
+// v0 一律委托 canonical handler；v1/v2 通过等价恒等变换（双重取负、异或折叠、加减抵消）改写指令序列。
+// 不变量：变体必须与 canonical 完全等价——acc/vregs/opaque_*/steps/encoded_pc 的结果逐位一致。
+// 线程模型：只读写传入的 fr，变体表为 __const；同一帧不可并发执行。
 /*
  * cprisk_vm_oph_variants.c
  * CRiskCore
@@ -45,6 +51,8 @@
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
 
+// vv_avalanche32：32 位雪崩混合（xor-shift + 两次乘法）。无状态纯函数，
+// 用于把会话/帧状态压成变体索引；不是密码学哈希，不要用于认证或密钥派生。
 static inline uint32_t vv_avalanche32(uint32_t x) {
     x ^= x >> 16u;
     x *= 0x7FEB352Du;
@@ -72,6 +80,8 @@ static inline uint32_t vv_avalanche32(uint32_t x) {
  * semantics) but unpredictable across sessions and across positions in the
  * bytecode stream.
  */
+// 选择器契约：相同输入必然选出相同变体（保证语义确定）；但 opaque_chain 每步更新，
+// 因此同一 opcode 在字节流不同位置、不同会话中会落到不同 handler 地址。
 static inline uint32_t vv_select_index(const cprisk_vm_interp_frame_t *fr,
                                         uint8_t logical,
                                         uint32_t n_variants) {
@@ -83,12 +93,14 @@ static inline uint32_t vv_select_index(const cprisk_vm_interp_frame_t *fr,
         fr->session_mix ^
         ((uint32_t)logical * 0x9E3779B9u)
     );
+    // Lemire 乘高位归约：n_variants<=256 时无取模偏斜，且不引入数据相关分支。
     /* Bias-free reduction via Lemire's method for n_variants <= 256. */
     return (uint32_t)(((uint64_t)mix * (uint64_t)n_variants) >> 32u);
 }
 
 /* ── NOP variants ─────────────────────────────────────────────────────────── */
 
+// NOP 池：v0 委托 canonical，v1 双重异或、v2 加减抵消；净效果均为 0，仅指令地址与序列不同。
 /* v0: canonical (delegates to existing handler) */
 cprisk_vm_flow_t cprisk_vm_oph_nop_v0(cprisk_vm_interp_frame_t *fr,
                                        uint8_t op_raw,
@@ -147,6 +159,8 @@ cprisk_vm_flow_t cprisk_vm_oph_nop_v2(cprisk_vm_interp_frame_t *fr,
 /* ── XOR_MIX variants ──────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// XOR_MIX 池：三份实现计算完全相同的 mix_imm（ROTL64(imm,17) + family 标签），
+// 区别只在旋转/取反的写法，因此 raw_region 收到的值与 canonical 一致。
 cprisk_vm_flow_t cprisk_vm_oph_xor_mix_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw,
                                             uint8_t logical,
@@ -213,6 +227,7 @@ cprisk_vm_flow_t cprisk_vm_oph_xor_mix_v2(cprisk_vm_interp_frame_t *fr,
 /* ── ADD variants ──────────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// ADD 池：v1 双重取负、v2 “先加 K 再减 K”，都把 imm 以不同编码送入同一条 lane poly 路径。
 cprisk_vm_flow_t cprisk_vm_oph_add_v0(cprisk_vm_interp_frame_t *fr,
                                        uint8_t op_raw,
                                        uint8_t logical,
@@ -297,8 +312,11 @@ cprisk_vm_flow_t cprisk_vm_oph_add_v2(cprisk_vm_interp_frame_t *fr,
 
 /* ── Variant selector ──────────────────────────────────────────────────────── */
 
+// 原始池大小固定为 3：新增变体必须同步扩展对应的 variants[]，否则 vv_select_index 会越界。
 #define CPRISK_VM_OPH_N_VARIANTS 3u
 
+// 变体选择器通用模式：vv_select_index 取 [0,3) 下标后从 __const 表调用。
+// 表项都是可达变体地址，因此这里出现静态函数指针表不会泄漏 dead handler 信息。
 cprisk_vm_flow_t cprisk_vm_oph_select_nop(cprisk_vm_interp_frame_t *fr,
                                            uint8_t op_raw,
                                            uint8_t logical,
@@ -344,6 +362,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_add(cprisk_vm_interp_frame_t *fr,
     return variants[idx](fr, op_raw, logical, imm, pc, hvar);
 }
 
+// v7.5 扩展池：原实现只覆盖 3/23 个 opcode，其余 handler 地址固定；
+// 补齐高频指令后，动态分析的枚举成本从 O(1) 提升到 O(变体数 × 执行次数)。
 /* ═══════════════════════════════════════════════════════════════════════════
  * v7.5: Variants for OR_LANE / AND_LANE / SUB_LANE / ROL_ACC / BRANCH_REL
  *
@@ -357,6 +377,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_add(cprisk_vm_interp_frame_t *fr,
 /* ── OR_LANE variants ─────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// OR_LANE 池：v1 拆分 route 计算、v2 双重取反，route 数值不变，仅 ARM64 编码不同。
 cprisk_vm_flow_t cprisk_vm_oph_or_lane_v0(cprisk_vm_interp_frame_t *fr,
                                            uint8_t op_raw, uint8_t logical,
                                            uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -408,6 +429,7 @@ cprisk_vm_flow_t cprisk_vm_oph_or_lane_v2(cprisk_vm_interp_frame_t *fr,
 /* ── AND_LANE variants ────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// AND_LANE 池：v1 用“移出 MSB 再补回”、v2 用运行时 k 的加减抵消，route 值一致。
 cprisk_vm_flow_t cprisk_vm_oph_and_lane_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -455,6 +477,7 @@ cprisk_vm_flow_t cprisk_vm_oph_and_lane_v2(cprisk_vm_interp_frame_t *fr,
 /* ── SUB_LANE variants ────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// SUB_LANE 池：v1 用 (imm+noise)-noise、v2 用双重取负，把同一 imm 以不同指令序列送入 lane poly。
 cprisk_vm_flow_t cprisk_vm_oph_sub_lane_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -509,6 +532,7 @@ cprisk_vm_flow_t cprisk_vm_oph_sub_lane_v2(cprisk_vm_interp_frame_t *fr,
 /* ── ROL_ACC variants ─────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// ROL_ACC 池：v1 用会话加减恒等、v2 用双重取负，旋转量语义不变（helper 仍取 &31）。
 cprisk_vm_flow_t cprisk_vm_oph_rol_acc_v0(cprisk_vm_interp_frame_t *fr,
                                            uint8_t op_raw, uint8_t logical,
                                            uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -555,6 +579,7 @@ cprisk_vm_flow_t cprisk_vm_oph_rol_acc_v2(cprisk_vm_interp_frame_t *fr,
 /* ── BRANCH_REL variants ──────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// BRANCH_REL 池：v1 双重取负、v2 异或折叠，delta 不变；对齐/越界校验仍由 helper 统一完成。
 cprisk_vm_flow_t cprisk_vm_oph_branch_rel_v0(cprisk_vm_interp_frame_t *fr,
                                               uint8_t op_raw, uint8_t logical,
                                               uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -599,8 +624,10 @@ cprisk_vm_flow_t cprisk_vm_oph_branch_rel_v2(cprisk_vm_interp_frame_t *fr,
 
 /* ── Selectors for new opcode variant pools ───────────────────────────────── */
 
+// 扩展池同样为 3；与 N_VARIANTS 分开定义，允许两批池的尺寸独立演化。
 #define CPRISK_VM_OPH_N_VARIANTS_LANE 3u
 
+// 以下 select_* 与原始池同构：下标来自 vv_select_index，表项为 3 个等价变体。
 cprisk_vm_flow_t cprisk_vm_oph_select_or_lane(cprisk_vm_interp_frame_t *fr,
                                                uint8_t op_raw, uint8_t logical,
                                                uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -664,6 +691,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_branch_rel(cprisk_vm_interp_frame_t *fr,
 /* ── MUL_LANE variants ────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// MUL_LANE 池：v1 加噪声再减回、v2 异或折叠，imm 位型不变，lane 2 的结果一致。
 cprisk_vm_flow_t cprisk_vm_oph_mul_lane_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -730,6 +758,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_mul_lane(cprisk_vm_interp_frame_t *fr,
 
 /* ── ADD_ROL_ACC variants ─────────────────────────────────────────────────── */
 
+// ADD_ROL_ACC 池：融合指令必须同时保证“加数”和“旋转量”两半正确，
+// 所以 v1/v2 对低 32 位与高 32 位分别施加独立的恒等变换，再走与 canonical 相同的两步语义。
 /*
  * ADD_ROL_ACC is a fused opcode: low-32(imm) feeds the add lane, high-32(imm)
  * is the rotation amount.  Variants apply independent identity transforms to
@@ -812,6 +842,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_add_rol_acc(cprisk_vm_interp_frame_t *fr,
 
 /* ── BRANCH_COND variants ─────────────────────────────────────────────────── */
 
+// BRANCH_COND 池：谓词输入包含 acc/steps/profile，变体只对 imm 低 32 位做恒等变换；
+// 高 32 位原样保留，确保 (uint32_t)imm 与 canonical 完全一致，不改变跳转判定。
 /*
  * cprisk_vm_branch_cond_mixed_eval_i takes uint32_t insn = (uint32_t)imm.  The
  * predicate result depends on (insn, fr->acc, fr->steps, semantic_family,
@@ -858,6 +890,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_branch_cond(cprisk_vm_interp_frame_t *fr,
     return variants[idx](fr, op_raw, logical, imm, pc, hvar);
 }
 
+// emitter 池：每个 opcode 有 3 份实现，v1 双重取负、v2 异或折叠；
+// 变换只改 imm 到达 mix_imm 的路径，acc/steps 更新与 canonical 逐位一致。
 /* ═══════════════════════════════════════════════════════════════════════════
  * Emitter-family variant pools: MOV_WIDE / ADR_ADD / COND_SELECT / LOAD_STORE
  *
@@ -871,6 +905,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_branch_cond(cprisk_vm_interp_frame_t *fr,
 
 /* ── MOV_WIDE variants (logical 8, shift 1) ───────────────────────────────── */
 
+// MOV_WIDE 池：v0 委托；v1/v2 在推导 mix_imm 前改写 imm，profile 分支选择的后端保持不变。
 cprisk_vm_flow_t cprisk_vm_oph_mov_wide_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -939,6 +974,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_mov_wide(cprisk_vm_interp_frame_t *fr,
 
 /* ── ADR_ADD variants (logical 9, shift 2) ────────────────────────────────── */
 
+// ADR_ADD 池：与 MOV_WIDE 同构，右移量固定为 2，恒等变换在 mix_imm 之前完成。
 cprisk_vm_flow_t cprisk_vm_oph_adr_add_v0(cprisk_vm_interp_frame_t *fr,
                                            uint8_t op_raw, uint8_t logical,
                                            uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1007,6 +1043,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_adr_add(cprisk_vm_interp_frame_t *fr,
 
 /* ── COND_SELECT variants (logical 10, shift 3) ───────────────────────────── */
 
+// COND_SELECT 池：右移量 3；变体只决定 imm 的到达路径，不改变条件选择语义。
 cprisk_vm_flow_t cprisk_vm_oph_cond_select_v0(cprisk_vm_interp_frame_t *fr,
                                                uint8_t op_raw, uint8_t logical,
                                                uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1075,6 +1112,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_cond_select(cprisk_vm_interp_frame_t *fr,
 
 /* ── LOAD_STORE variants (logical 11, shift 4, always raw_region) ─────────── */
 
+// LOAD_STORE 池：固定走 raw_region（原条件恒真），右移量 4；三份实现仅 imm 到达路径不同。
 cprisk_vm_flow_t cprisk_vm_oph_load_store_v0(cprisk_vm_interp_frame_t *fr,
                                               uint8_t op_raw, uint8_t logical,
                                               uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1131,6 +1169,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_load_store(cprisk_vm_interp_frame_t *fr,
     return variants[idx](fr, op_raw, logical, imm, pc, hvar);
 }
 
+// VREG 池：imm 是打包描述符（callee_id 或寄存器/操作位域），恒等变换必须逐位不变，
+// 否则会改变被调函数或寄存器选择。每池同样是 v0 委托、v1 双重取负、v2 异或折叠。
 /* ═══════════════════════════════════════════════════════════════════════════
  * VREG-family variant pools: VM_CALL_FUNC / VREG_MOV / VREG_ALU / VREG_MEM
  *
@@ -1143,6 +1183,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_load_store(cprisk_vm_interp_frame_t *fr,
 
 /* ── VM_CALL_FUNC variants ────────────────────────────────────────────────── */
 
+// VM_CALL_FUNC 池：v1/v2 只重写 imm 的计算路径，callee_id 位型不变，嵌套调用行为完全一致。
 cprisk_vm_flow_t cprisk_vm_oph_vm_call_func_v0(cprisk_vm_interp_frame_t *fr,
                                                 uint8_t op_raw, uint8_t logical,
                                                 uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1179,6 +1220,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_vm_call_func(cprisk_vm_interp_frame_t *fr,
 
 /* ── VREG_MOV variants ────────────────────────────────────────────────────── */
 
+// VREG_MOV 池：dst/src/mode 位域必须原样到达 helper，否则会读写错误寄存器。
 cprisk_vm_flow_t cprisk_vm_oph_vreg_mov_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1215,6 +1257,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_vreg_mov(cprisk_vm_interp_frame_t *fr,
 
 /* ── VREG_ALU variants ────────────────────────────────────────────────────── */
 
+// VREG_ALU 池：dst/a/b/op 位域不变，保证 ALU 运算对象与操作符一致。
 cprisk_vm_flow_t cprisk_vm_oph_vreg_alu_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1251,6 +1294,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_vreg_alu(cprisk_vm_interp_frame_t *fr,
 
 /* ── VREG_MEM variants ────────────────────────────────────────────────────── */
 
+// VREG_MEM 池：dst/base/store 位域不变，保证存取方向与 acc 窗口位置一致。
 cprisk_vm_flow_t cprisk_vm_oph_vreg_mem_v0(cprisk_vm_interp_frame_t *fr,
                                             uint8_t op_raw, uint8_t logical,
                                             uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1288,6 +1332,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_vreg_mem(cprisk_vm_interp_frame_t *fr,
 /* ── RET variants ─────────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// RET 池：v1 用 acc 双异或、v2 用 opaque_chain 加减抵消制造瞬时扰动；
+// 两者都在委托 canonical 之前完成净零操作，三级返回语义不变。
 cprisk_vm_flow_t cprisk_vm_oph_ret_v0(cprisk_vm_interp_frame_t *fr,
                                        uint8_t op_raw, uint8_t logical,
                                        uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1330,6 +1376,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_ret(cprisk_vm_interp_frame_t *fr,
 /* ── HALT variants ────────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// HALT 池：同样以净零扰动区分编码；终止语义（status=OK + LEAVE）与 canonical 完全一致。
 cprisk_vm_flow_t cprisk_vm_oph_halt_v0(cprisk_vm_interp_frame_t *fr,
                                         uint8_t op_raw, uint8_t logical,
                                         uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1372,6 +1419,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_halt(cprisk_vm_interp_frame_t *fr,
 /* ── RAW_REGION variants ──────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// RAW_REGION 池：v1 双重取负、v2 异或折叠；imm_eff 位型不变，
+// 若开启 opaque-vpc 类别，mask 仍在 canonical 内部按原始位型混入。
 cprisk_vm_flow_t cprisk_vm_oph_raw_region_v0(cprisk_vm_interp_frame_t *fr,
                                               uint8_t op_raw, uint8_t logical,
                                               uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1411,6 +1460,8 @@ cprisk_vm_flow_t cprisk_vm_oph_select_raw_region(cprisk_vm_interp_frame_t *fr,
 /* ── BRANCH_IND variants ──────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// BRANCH_IND 池：imm 同时承载标签位、vidx、acc 字节偏移与前跳跨度，
+// 恒等变换必须保持全部位，否则标签判定和目标计算都会改变。
 cprisk_vm_flow_t cprisk_vm_oph_branch_ind_v0(cprisk_vm_interp_frame_t *fr,
                                               uint8_t op_raw, uint8_t logical,
                                               uint64_t imm, uint32_t pc, uint32_t hvar) {
@@ -1450,6 +1501,7 @@ cprisk_vm_flow_t cprisk_vm_oph_select_branch_ind(cprisk_vm_interp_frame_t *fr,
 /* ── CALL variants ────────────────────────────────────────────────────────── */
 
 /* v0: canonical */
+// CALL 池：imm 是相对 delta，恒等变换保持位型；返回栈压入与深度校验仍由 canonical 完成。
 cprisk_vm_flow_t cprisk_vm_oph_call_v0(cprisk_vm_interp_frame_t *fr,
                                         uint8_t op_raw, uint8_t logical,
                                         uint64_t imm, uint32_t pc, uint32_t hvar) {

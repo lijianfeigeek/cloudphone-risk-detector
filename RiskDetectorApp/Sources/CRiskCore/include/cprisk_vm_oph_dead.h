@@ -1,3 +1,9 @@
+// cprisk_vm_oph_dead.h — 死处理器池声明与设计说明（仅 CRiskCore 内部使用）。
+// 池中 32 个 handler 地址在会话初始化时折叠进 session_mix，但其 opcode 永不出现在真实字节码。
+// 目的：扩大可达 handler 地址空间，让动态分析无法通过一次执行建立完整的 opcode→地址映射。
+// 不变量：dead handler 行为必须与 unknown 一致（LEAVE + POISON），否则可被行为特征筛出。
+// 集成约束：cprisk_vm_dead_touch_i 每次会话只能调用一次，且必须早于第一次分发。
+// 线程模型：touch 直接异或 fr->session_mix，需在单线程初始化阶段调用。
 #ifndef CPRISK_VM_OPH_DEAD_H
 #define CPRISK_VM_OPH_DEAD_H
 
@@ -57,8 +63,11 @@
 extern "C" {
 #endif
 
+// 池大小：必须与 touch 例程中展开的 &handler 数量严格一致；
+// 改小会留下未绑定的 handler，改大则覆盖不足，session 熵与布局绑定都会弱化。
 #define CPRISK_VM_DEAD_HANDLER_COUNT 32u
 
+// 把全部 handler 地址折叠进 session_mix；不触碰 acc/steps/PC，也不改变执行流。
 /*
  * Touch the dead handler table and fold all function-pointer addresses into
  * a 32-bit hash that is XOR'd into fr->session_mix.  Call once per session

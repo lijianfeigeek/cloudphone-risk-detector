@@ -1,3 +1,9 @@
+// 文件职责：头文件内联的 FIPS-180-4 SHA-256，供 CPRisk-MAC、整性摘要与装甲派生使用。
+// 安全目标：所有函数强制内联到调用方 text 段，不产生 PLT/GOT 符号，避免被 Frida 直接 hook CC_SHA256。
+// 实现特征：K[64] 与 H0[8] 以“加法拆分份额 + 每轮重掩码”保存，减少完整常量以单一字面量出现在 rodata。
+// 线程模型：上下文由调用方独占；无全局可变状态，不同上下文可并发使用。
+// 平台限制：纯 C，依赖 32 位无符号回绕；不做端序假设，输入输出显式按大端转换。
+// 失败语义：无返回值/错误码；调用方必须保证指针与长度有效，NULL+0 长度是唯一安全空输入。
 /*
  * cprisk_sha256.h — Header-only, fully-inlined FIPS-180-4 SHA-256.
  *
@@ -23,51 +29,64 @@
 
 #include "cprisk_crypto_trace.h"
 
+// 摘要长度（字节）；SHA-256 固定 32 字节，调用方缓冲区不得小于该值。
 #define CPRISK_SHA256_DIGEST_LENGTH 32
 
+// 增量哈希上下文。调用方负责分配与生命周期；不可在多个线程间共享同一实例。
 typedef struct {
+    // 8 个 32 位链接变量（中间/最终摘要状态），主机端序。
     uint32_t state[8];
+    // 已输入的总字节数（不是位数）；final 时再乘 8。
     uint64_t count;
+    // 未满一个 512 位分组的尾部数据，最多 63 字节有效。
     uint8_t  buffer[64];
 } cprisk_sha256_ctx;
 
 /* ── helpers ───────────────────────────────────────────────────────── */
 
+/// 32 位循环右移；n 为 0 或 ≥32 时原样返回，避免未定义移位。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_rotr(uint32_t x, unsigned n) {
     return (n == 0 || n >= 32) ? x : ((x >> n) | (x << (32 - n)));
 }
 
+/// SHA-256 的 Ch(x,y,z) = (x & y) ^ (~x & z)，按位选择函数。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
 }
 
+/// SHA-256 的 Maj(x,y,z)，三者按位多数函数。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_maj(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (x & z) ^ (y & z);
 }
 
+/// Σ0(x) = ROTR2 ^ ROTR13 ^ ROTR22，用于压缩函数。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_sigma0(uint32_t x) {
     return cprisk_sha256_rotr(x, 2) ^ cprisk_sha256_rotr(x, 13) ^ cprisk_sha256_rotr(x, 22);
 }
 
+/// Σ1(x) = ROTR6 ^ ROTR11 ^ ROTR25，用于压缩函数。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_sigma1(uint32_t x) {
     return cprisk_sha256_rotr(x, 6) ^ cprisk_sha256_rotr(x, 11) ^ cprisk_sha256_rotr(x, 25);
 }
 
+/// σ0(x) = ROTR7 ^ ROTR18 ^ SHR3，用于消息扩展。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_gamma0(uint32_t x) {
     return cprisk_sha256_rotr(x, 7) ^ cprisk_sha256_rotr(x, 18) ^ (x >> 3);
 }
 
+/// σ1(x) = ROTR17 ^ ROTR19 ^ SHR10，用于消息扩展。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_gamma1(uint32_t x) {
     return cprisk_sha256_rotr(x, 17) ^ cprisk_sha256_rotr(x, 19) ^ (x >> 10);
 }
 
+/// 从 4 字节大端数据读取一个 32 位字（SHA-256 规定的输入端序）。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_load_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) |
@@ -76,6 +95,7 @@ uint32_t cprisk_sha256_load_be32(const uint8_t *p) {
            ((uint32_t)p[3]);
 }
 
+/// 把 32 位字按大端写入 4 字节缓冲区（摘要输出端序）。
 static inline __attribute__((always_inline))
 void cprisk_sha256_store_be32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)(v >> 24);
@@ -84,6 +104,7 @@ void cprisk_sha256_store_be32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v);
 }
 
+/// 把 64 位消息总位数按大端写入 8 字节（final 的填充长度字段）。
 static inline __attribute__((always_inline))
 void cprisk_sha256_store_be64(uint8_t *p, uint64_t v) {
     p[0] = (uint8_t)(v >> 56);
@@ -100,6 +121,8 @@ void cprisk_sha256_store_be64(uint8_t *p, uint64_t v) {
  * Split K[i] = K_lo[i] + K_hi[i] (unsigned wrap) — avoids storing each full
  * word as one XOR-encoded literal in rodata.
  */
+// 查找表说明：下面两组各 64 项，按 32 位无符号回绕相加即得 FIPS-180-4 的 K[64]。
+// 拆分保存是为了避免完整常量以单一字面量出现在只读数据段，降低静态特征匹配价值。
 static const uint32_t cprisk_sha256_K_lo[64] = {
     0x1bd35e74u, 0xd8123a8eu, 0xf9901199u, 0x5295e566u,
     0xf90e2815u, 0x762dd6dau, 0x2d276115u, 0x3e49ed60u,
@@ -119,6 +142,7 @@ static const uint32_t cprisk_sha256_K_lo[64] = {
     0xa8ea219au, 0x80f5a80cu, 0x798e2fedu, 0xb5ab6993u
 };
 
+// 查找表说明：K_hi 与上面的 K_lo 配对，回绕相加得到标准 K 表；不逐项注释。
 static const uint32_t cprisk_sha256_K_hi[64] = {
     0x26b6d124u, 0x99250a03u, 0xbc30ea36u, 0x971ff63fu,
     0x40489a46u, 0xe3c33b17u, 0x6518218fu, 0x6cd27175u,
@@ -138,17 +162,20 @@ static const uint32_t cprisk_sha256_K_hi[64] = {
     0xe7d4de60u, 0x235ac4dfu, 0x456b740au, 0x10c60f5fu
 };
 
+// 查找表说明：H0_lo/H0_hi 按回绕相加得到 8 个标准初始链接变量；不逐项注释。
 static const uint32_t cprisk_sha256_H0_lo[8] = {
     0xb0b3db30u, 0x87931ee6u, 0xfad3c8eeu, 0xcfeb81bcu,
     0xc3bbf4e0u, 0x62f02117u, 0x0cc6db72u, 0x1e360382u,
 };
 
+// 查找表说明：与 H0_lo 配对，回绕相加得到 FIPS-180-4 的 H(0)。
 static const uint32_t cprisk_sha256_H0_hi[8] = {
     0xb9560b37u, 0x33d48f9fu, 0x419b2a84u, 0xd564737eu,
     0x8d525d9fu, 0x38154775u, 0x12bcfe39u, 0x3daac997u,
 };
 
 /* Non-cryptographic mixing table — extra memory traffic in the transform. */
+// 查找表说明：非密码学混合噪声表，仅用于每轮掩码派生与额外访存；不参与摘要正确性。
 static const uint8_t cprisk_sha256_memnoise[64] = {
     0x47u, 0x1eu, 0x9cu, 0x63u, 0xb0u, 0x2fu, 0x55u, 0x88u,
     0xadu, 0x31u, 0x72u, 0x04u, 0xe8u, 0xcfu, 0x1bu, 0x5eu,
@@ -160,11 +187,16 @@ static const uint8_t cprisk_sha256_memnoise[64] = {
     0xaeu, 0x41u, 0x82u, 0x59u, 0x07u, 0xd0u, 0xcbu, 0x3eu,
 };
 
+// 一轮用到的 K[i] 的加法拆分：share0 + share1 ≡ K[i] (mod 2^32)。
 typedef struct {
+    // 低/主份额，参与第一路累加。
     uint32_t share0;
+    // 补偿份额，参与第二路累加，最终两条 lane 相加抵消掩码。
     uint32_t share1;
 } cprisk_sha256_masked_word;
 
+/// 为第 i 轮派生一次性掩码种子；lane_seed 由当前状态与消息字混合得到。
+/// 抖动来自 memnoise 查表与乘法常量，目的是让每轮掩码值不同，而非提供密码学强度。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_round_mask_seed(unsigned i, uint32_t lane_seed) {
     uint32_t mem_mix = (uint32_t)cprisk_sha256_memnoise[(i * 13u) & 63u] << 24;
@@ -179,6 +211,8 @@ uint32_t cprisk_sha256_round_mask_seed(unsigned i, uint32_t lane_seed) {
     return mask;
 }
 
+/// 取第 i 轮 K 值的拆分表示，并保证两条份额都非退化。
+/// 若掩码恰好等于 0、K_hi 或 -K_lo，拆分会让某条 lane 直接暴露 K；此时用常量扰动避开。
 static inline __attribute__((always_inline))
 cprisk_sha256_masked_word cprisk_sha256_K_masked_at(unsigned i, uint32_t lane_seed) {
     uint32_t round_mask = cprisk_sha256_round_mask_seed(i, lane_seed);
@@ -194,6 +228,8 @@ cprisk_sha256_masked_word cprisk_sha256_K_masked_at(unsigned i, uint32_t lane_se
     return out;
 }
 
+/// 计算一轮的 T1 = h + Σ1(e) + Ch(e,f,g) + K[i] + W[i]。
+/// 把 K 与 W 分到两条 volatile lane 上累加，避免完整 K[i] 以单一标量操作数出现。
 static inline __attribute__((always_inline))
 uint32_t cprisk_sha256_round_t1_masked(uint32_t h,
                                        uint32_t e,
@@ -203,6 +239,7 @@ uint32_t cprisk_sha256_round_t1_masked(uint32_t h,
                                        unsigned i,
                                        uint32_t lane_seed) {
     cprisk_sha256_masked_word masked_K = cprisk_sha256_K_masked_at(i, lane_seed);
+    // volatile 阻止编译器把两条 lane 合并回一个完整 K[i] 表达式。
     volatile uint32_t lane0 = h + cprisk_sha256_sigma1(e);
     volatile uint32_t lane1 = Wi;
     lane0 += cprisk_sha256_ch(e, f, g);
@@ -213,8 +250,16 @@ uint32_t cprisk_sha256_round_t1_masked(uint32_t h,
 
 /* ── block transform ───────────────────────────────────────────────── */
 
+/// 处理一个 512 位分组，就地更新 8 个链接变量。
+/// - Parameters:
+///   - state: 8 个 32 位链接变量，输入输出；不允许 NULL。
+///   - block: 64 字节输入分组；允许未对齐；所有权归调用方，函数不保留指针。
+/// - Returns: 无。
+/// - Thread safety: 只操作传入的 state/block，可重入。
+/// - 失败语义: 指针无效时未定义；内部不做长度校验。
 static inline __attribute__((always_inline))
 void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
+    // W[0..15] 由分组大端解码，W[16..63] 按 SHA-256 消息扩展递推。
     uint32_t W[64];
     for (int i = 0; i < 16; i++)
         W[i] = cprisk_sha256_load_be32(block + i * 4);
@@ -225,9 +270,11 @@ void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
     uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
     uint64_t trace_round16_ticks = 0u;
+    // 噪声累加器：只用于增加数据相关访存与掩码派生，不影响最终摘要。
     volatile uint32_t noise_sink = state[0] ^ W[0] ^ 0xA5C31F27u;
 
     for (int i = 0; i < 64; i++) {
+        // 每轮种子混合当前状态、消息字与轮序号，使掩码不可提前预计算。
         uint32_t round_seed = noise_sink ^ a ^
                               cprisk_sha256_rotr(e, (unsigned)(((unsigned)i & 7u) + 1u)) ^
                               W[((unsigned)i + 9u) & 63u] ^
@@ -236,6 +283,7 @@ void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
         uint32_t T2 = cprisk_sha256_sigma0(a) + cprisk_sha256_maj(a, b, c);
         h = g; g = f; f = e; e = d + T1;
         d = c; c = b; b = a; a = T1 + T2;
+        // 每 4 轮注入一次诱饵计算，维持噪声 sink 的数据依赖，不参与摘要。
         if (((unsigned)i & 3u) == 0u) {
             uint32_t decoy = a ^ cprisk_sha256_rotr(e, (unsigned)(((unsigned)i & 7u) + 1u));
             decoy += W[((unsigned)i + 11u) & 63u] ^ cprisk_sha256_sigma0(c);
@@ -244,6 +292,7 @@ void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
             noise_sink ^= decoy;
             noise_sink = cprisk_sha256_rotr(noise_sink, (unsigned)(((unsigned)i & 7u) + 1u));
         }
+        // 在第 16 轮与第 48 轮各取一次时间戳：用中段耗时样本捕捉整体拖慢，且不暴露首尾边界。
         if (i == 15) {
             trace_round16_ticks = cprisk_crypto_trace_now_i();
         } else if (i == 47 && trace_round16_ticks != 0u) {
@@ -256,6 +305,7 @@ void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 
+    // 收尾噪声迭代：延续数据相关访存，结果最终丢弃，不影响状态。
     for (unsigned j = 0u; j < 24u; j++) {
         uint32_t lane = state[j & 7u] ^ W[(j * 7u) & 63u] ^ noise_sink;
         lane = cprisk_sha256_sigma0(lane) ^ cprisk_sha256_gamma1(lane ^ (j * 0x51ED270Bu));
@@ -270,6 +320,12 @@ void cprisk_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
 
 /* ── public API ────────────────────────────────────────────────────── */
 
+/// 初始化 SHA-256 上下文。
+/// - Parameters:
+///   - ctx: 调用方分配的上下文；不允许 NULL，所有权仍归调用方。
+/// - Returns: 无。
+/// - Thread safety: 同一 ctx 不可并发使用；不同 ctx 可并发。
+/// 初始链接变量由 H0_lo + H0_hi 回绕相加得到，不在代码中存完整 H0 字面量。
 static inline __attribute__((always_inline))
 void cprisk_sha256_init(cprisk_sha256_ctx *ctx) {
     for (unsigned j = 0; j < 8u; j++)
@@ -278,12 +334,21 @@ void cprisk_sha256_init(cprisk_sha256_ctx *ctx) {
     memset(ctx->buffer, 0, 64);
 }
 
+/// 追加数据到哈希上下文（可多次调用）。
+/// - Parameters:
+///   - ctx: 已初始化且未 final 的上下文。
+///   - data: 输入数据；len>0 时不允许 NULL。函数只读取，不接管所有权。
+///   - len: 字节数；0 合法且不改变状态。
+/// - Returns: 无。
+/// - Thread safety: 调用方需串行化对同一 ctx 的访问。
+/// - 失败语义: 指针无效时未定义；本函数不做参数校验。
 static inline __attribute__((always_inline))
 void cprisk_sha256_update(cprisk_sha256_ctx *ctx,
                           const uint8_t *data, size_t len) {
     size_t buf_used = (size_t)(ctx->count & 63);
     ctx->count += (uint64_t)len;
 
+    // 先补齐上次遗留的半个分组；数据不足以补齐时只拷贝并返回。
     if (buf_used > 0) {
         size_t avail = 64 - buf_used;
         if (len < avail) {
@@ -296,23 +361,34 @@ void cprisk_sha256_update(cprisk_sha256_ctx *ctx,
         len  -= avail;
     }
 
+    // 整分组直接在调用方缓冲区上变换，避免额外拷贝。
     while (len >= 64) {
         cprisk_sha256_transform(ctx->state, data);
         data += 64;
         len  -= 64;
     }
 
+    // 剩余不足一组的数据留待下次 update/final 处理。
     if (len > 0)
         memcpy(ctx->buffer, data, len);
 }
 
+/// 完成填充并输出 32 字节摘要；调用后 ctx 内容不再有意义，复用前必须重新 init。
+/// - Parameters:
+///   - ctx: 已 init 且可含若干次 update 的上下文；函数会改动其 state/buffer。
+///   - out: 调用方提供的至少 32 字节缓冲区；不允许 NULL，所有权归调用方。
+/// - Returns: 无。
+/// - Thread safety: 同一 ctx 需串行；输出缓冲区不得与其他线程共享写入。
+/// - 失败语义: 无错误码；缓冲区过小会越界写，调用方必须保证 ≥ CPRISK_SHA256_DIGEST_LENGTH。
 static inline __attribute__((always_inline))
 void cprisk_sha256_final(cprisk_sha256_ctx *ctx, uint8_t out[32]) {
+    // FIPS 填充：追加 0x80，补 0 至 56 mod 64，再写 64 位大端消息总位数。
     uint64_t total_bits = ctx->count * 8;
     size_t buf_used = (size_t)(ctx->count & 63);
 
     ctx->buffer[buf_used++] = 0x80;
 
+    // 剩余空间不足 8 字节长度字段时，先把当前分组补满并变换，再开新分组。
     if (buf_used > 56) {
         memset(ctx->buffer + buf_used, 0, 64 - buf_used);
         cprisk_sha256_transform(ctx->state, ctx->buffer);
@@ -327,9 +403,18 @@ void cprisk_sha256_final(cprisk_sha256_ctx *ctx, uint8_t out[32]) {
         cprisk_sha256_store_be32(out + i * 4, ctx->state[i]);
 }
 
+/// 一次性哈希 data，等价于 init + update + final。
+/// - Parameters:
+///   - data: 输入数据；len>0 时不允许 NULL。
+///   - len: 字节数；0 合法（返回空串摘要）。
+///   - out: 至少 32 字节输出缓冲区；所有权归调用方。
+/// - Returns: 无。
+/// - Thread safety: 全部状态在栈上，可重入、可并发。
+/// - 副作用: 入口调用一次 cprisk_crypto_trace_primitive_enter_i()，用于观测运行环境是否被拖慢。
 static inline __attribute__((always_inline))
 void cprisk_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
     cprisk_crypto_trace_primitive_enter_i();
+    // 上下文放栈上并立即使用；不擦除是因为其中只含公开输入派生的中间值，调用方如需保密自行清零。
     cprisk_sha256_ctx ctx;
     cprisk_sha256_init(&ctx);
     cprisk_sha256_update(&ctx, data, len);

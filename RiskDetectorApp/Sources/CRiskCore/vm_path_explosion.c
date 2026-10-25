@@ -1,3 +1,9 @@
+// 文件职责：向 VM 执行路径中注入不透明谓词、诱饵分支与 MBA 混淆运算，
+// 让符号执行器在求解约束时面临受控的路径爆炸，同时不改变 VM 的实际语义。
+// 现状：头文件标注 DEPRECATED（issue 65），当前无生产调用方，仅保留兼容。
+// 线程模型：ctx 无锁、单写者；apply_to_interp 每次新建局部 ctx，fork/decoy 计数不跨调用累积。
+// 预算：MBA 最多 4 层、每 16 条指令一个检查点、诱饵循环 ≤256 步、符号炸弹 ≤4 层；循环均有硬上界。
+// 失败语义：ctx/fr 为 NULL 时静默返回或返回 0；纯 C 无平台分支；谓词恒定，价值在于迫使分析器建模。
 /*
  *  vm_path_explosion.c
  *  CRiskCore
@@ -48,6 +54,8 @@
 #include <string.h>
 
 /* 路径爆炸配置参数 */
+// 配置预算：MBA 层数上限、每个分支点设计的路径数、检查点间隔。
+// 注意 VM_PATH_EXPLOSION_FORK_COUNT 目前只是设计契约，代码中未直接使用。
 #define VM_PATH_EXPLOSION_LAYERS        4   /* MBA混淆层数 */
 #define VM_PATH_EXPLOSION_FORK_COUNT    8   /* 每个分支点产生的路径数 */
 #define VM_PATH_EXPLOSION_DECOY_DENSITY 16  /* 每16条指令插入一个诱饵 */
@@ -56,6 +64,9 @@
  * 不透明谓词类型枚举
  * 每种类型基于不同的数学性质构造
  */
+// 注意：调度器 vm_path_explosion_checkpoint 实际只覆盖 ALWAYS_TRUE/FALSE、FERMAT、
+// WILSON、COLLATZ 与 WB_PRF；EULER、ALWAYS_TRUE_2、ALWAYS_FALSE_2 没有独立分支，
+// 枚举值保留为接口稳定性占位。
 typedef enum {
     VM_OPAQUE_PREDICATE_ALWAYS_TRUE_1 = 0,   /* x*x >= 0 */
     VM_OPAQUE_PREDICATE_ALWAYS_TRUE_2,        /* x + x = 2x */
@@ -72,6 +83,7 @@ typedef enum {
  * 假分支结构体
  * 描述一个假分支的元数据
  */
+// 当前实现只保留结构定义，尚未在上下文或检查点中实例化。
 typedef struct {
     uint32_t predicate_seed;        /* 谓词生成种子 */
     uint32_t branch_target_fake;    /* 假分支目标地址 */
@@ -85,6 +97,8 @@ typedef struct {
  * MBA表达式状态
  * 用于MBA混淆的上下文
  */
+// accumulator 是主状态，xor_mask/add_mask 是两套混合掩码，
+// rotate_count 预留给后续循环旋转；四者均为 32 位无符号，允许回绕。
 typedef struct {
     uint32_t accumulator;
     uint32_t xor_mask;
@@ -96,6 +110,9 @@ typedef struct {
  * 路径爆炸上下文
  * 管理整个路径爆炸防御的状态
  */
+// func_id/bytecode_hash 决定谓词选择，fork_counter/decoy_counter 记录预算消耗，
+// mba 保存混合状态，path_marker 是 32 字节路径指纹累加器。
+// 不变量：path_marker[pc%32] 以 XOR 累加谓词结果，同一 pc 命中两次会相互抵消。
 typedef struct {
     uint64_t func_id;
     uint32_t bytecode_hash;
@@ -112,6 +129,13 @@ typedef struct {
  * 原理: a XOR b = (a|b) - (a&b)
  *       然后对a|b和a&b再次应用MBA变换
  */
+// MBA 风格的 XOR 混淆：基准值 a^b，随后每层用 (a|b)-(a&b) 的等价形式
+// 加恒等变换，再做一次非线性乘加混合，最后用结果刷新 a/b 进入下一层。
+// 注意：末轮 `>> 16 ^ result` 并不保持 a^b 的代数等价性，因此本函数只能用于
+// 不透明状态混淆，不能当作可逆/等价替换使用。
+// layers 被硬性夹到 VM_PATH_EXPLOSION_LAYERS，迭代次数 O(1)，
+// 防止调用方传入巨大值造成 DoS。
+// 返回：确定的 32 位混合值；纯函数，线程安全。
 static uint32_t vm_mba_xor_obfuscate_i(uint32_t a, uint32_t b, uint32_t layers) {
     uint32_t result = a ^ b;  /* 基准结果 */
 
@@ -124,6 +148,8 @@ static uint32_t vm_mba_xor_obfuscate_i(uint32_t a, uint32_t b, uint32_t layers) 
         layers = VM_PATH_EXPLOSION_LAYERS;
     }
     for (uint32_t i = 0; i < layers && i < VM_PATH_EXPLOSION_LAYERS; i++) {
+        // 这些恒等变换只增加表达式树深度，符号执行器必须逐层化简；
+        // or*2-or 与 ~(~and) 在无符号回绕语义下都严格等于原值。
         /* MBA等价: XOR = OR - AND */
         uint32_t or_part = a | b;
         uint32_t and_part = a & b;
@@ -158,6 +184,11 @@ static uint32_t vm_mba_xor_obfuscate_i(uint32_t a, uint32_t b, uint32_t layers) 
  * 2. 任何数与自身的按位或等于自身: x | x == x
  * 3. 双重否定: !!x 等价于 x != 0
  */
+// 永真不透明谓词：三个数学上恒成立的条件依次检查，
+// 任一条件“不成立”都返回 0——正常输入下不可达，但分析器必须证明它不可达。
+// 注意：x*x 在 int64 上对接近 2^32 的输入可能溢出（有符号溢出为 UB），
+//       因此该检查不能作为可靠的控制流依据；返回值只用于混淆统计。
+// 返回：1（正常路径）或 0（理论不可达）。
 static int vm_opaque_predicate_always_true_i(uint32_t seed, uint32_t pc) {
     /* 方法1: x*x >= 0 对所有整数成立 */
     int64_t x = (int64_t)(seed ^ pc);
@@ -189,6 +220,9 @@ static int vm_opaque_predicate_always_true_i(uint32_t seed, uint32_t pc) {
  * 1. 任何整数的平方都非负，所以 x*x < 0 永假
  * 2. x & (~x) = 0 对所有x成立，所以 x & (~x) != 0 永假
  */
+// 永假不透明谓词：x*x<0 与 x&(~x)!=0 都不可能成立，正常输入下返回 0；
+// 返回 1 的三处分支均为不可达诱饵，用于诱导分析器探索假路径。
+// 与 always_true 相同：平方可能溢出，结果不作为控制流依据。
 static int vm_opaque_predicate_always_false_i(uint32_t seed, uint32_t pc) {
     /* 方法1: x*x < 0 永假 */
     int64_t x = (int64_t)(seed ^ pc);
@@ -219,6 +253,10 @@ static int vm_opaque_predicate_always_false_i(uint32_t seed, uint32_t pc) {
  * 对于非零整数a,b,c，不存在 a^2 + b^2 = c^2 的解(当a,b,c互质且特定条件)
  * 实际上我们构造的是永真谓词，但让符号执行器求解二次丢番图方程
  */
+// 费马风格的平方和谓词：取三个非零字节 a/b/c，检查 a²+b²==c²。
+// 对大多数输入不成立（返回 1），但存在毕达哥拉斯三元组时会返回 0，
+// 因此它不是严格永真谓词；构造目的是让求解器处理二次丢番图约束。
+// 返回：1 或 0，均为确定性结果。
 static int vm_opaque_predicate_fermat_style_i(uint32_t seed) {
     /* 构造形式: a^2 + b^2 != c^2 对于特定选择的a,b,c */
     uint32_t a = (seed & 0xFF) | 1;  /* 确保非零 */
@@ -244,6 +282,9 @@ static int vm_opaque_predicate_fermat_style_i(uint32_t seed) {
  * 威尔逊定理: (p-1)! ≡ -1 (mod p) 当且仅当p是素数
  * 我们利用这个性质构造复杂谓词
  */
+// 威尔逊定理谓词：从 6 个小素数中按 seed 选 p，计算 (p-1)! mod p。
+// 对素数 p 结果恒为 p-1（返回 1）；循环最多 249 次，成本有界。
+// 返回：1 或 0；纯计算，无副作用。
 static int vm_opaque_predicate_wilson_style_i(uint32_t seed) {
     /* 选择几个小素数 */
     const uint32_t primes[] = {251, 241, 239, 233, 229, 227};
@@ -267,6 +308,10 @@ static int vm_opaque_predicate_wilson_style_i(uint32_t seed) {
  *
  * 我们限制循环次数，构造一个"看似可能发散"的谓词
  */
+// 考拉兹风格谓词：把 seed 映射到 1..64，最多迭代 256 步。
+// 在该小范围内所有数都会收敛到 1，因此实际恒返回 1；
+// 循环有硬上界，不会因猜想本身未证明而失控。
+// 返回：1（收敛）或 0（理论上界内未收敛）。
 static int vm_opaque_predicate_collatz_style_i(uint32_t seed) {
     uint32_t n = (seed & 0x3F) + 1;  /* 1-64之间的数 */
     uint32_t steps = 0;
@@ -296,6 +341,8 @@ static int vm_opaque_predicate_collatz_style_i(uint32_t seed) {
  * 3. 最终结果通过确定性路径验证，对合法输入恒为 1
  * 4. SMT solver 需要处理 256 个 bitvector 约束
  */
+// 256 字节 AES S-box（双射，代数度 7）。整表只在此处说明，不逐行注释；
+// 表内容固定，符号执行器必须对全部 256 项建模才能求值。
 static const uint8_t vm_opaque_wb_table[256] = {
     /* 确定性生成的双射 S-box (AES S-box, 代数度 7) */
     0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5,
@@ -332,6 +379,10 @@ static const uint8_t vm_opaque_wb_table[256] = {
     0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16
 };
 
+// 白盒 PRF 风格谓词：用 idx 做三次链式 S-box 查表，再把结果互相异或，
+// 最后 `(verify | 1u)` 保证返回值恒为真（非零）。
+// 目的不是语义判断，而是迫使 SMT 求解器展开 256 项 bitvector 查找表。
+// 返回：恒为 1；纯函数，相同输入必得相同结果。
 static int vm_opaque_predicate_wb_prf_style_i(uint32_t seed, uint32_t pc) {
     /*
      * 白盒风格的非线性查表谓词
@@ -373,6 +424,15 @@ static int vm_opaque_predicate_wb_prf_style_i(uint32_t seed, uint32_t pc) {
  * @param acc VM累加器状态
  * @return 0表示应继续执行实际路径，1表示进入诱饵路径
  */
+// 在 pc 处插入一个不透明谓词检查点，并更新 MBA/路径状态。
+// selector = (pc ^ bytecode_hash ^ func_id) % 9 决定谓词类型，保证同一函数同一 pc
+// 的选择稳定可复现（没有随机源）。
+// 返回：1 表示应进入诱饵路径，0 表示继续真实路径。
+// 当前实现中除 case 1 外 is_decoy_path 恒为 0；而 case 1 的谓词永假，
+// 因此实际不会返回 1——诱饵路径目前不会被触发。
+// 副作用：acc 参数未使用；每次调用 fork_counter+1、path_marker[pc%32] 异或、
+//         accumulator 重新混淆、xor_mask 循环左移 1 位。
+// 线程安全：写 ctx，需单写者。
 int vm_path_explosion_checkpoint(vm_path_explosion_ctx_t *ctx,
                                   uint32_t pc,
                                   uint8_t acc[32]) {
@@ -380,6 +440,8 @@ int vm_path_explosion_checkpoint(vm_path_explosion_ctx_t *ctx,
         return 0;
     }
 
+    // 用 pc、字节码哈希与函数 ID 三者异或后对 9 取模，避免仅凭 pc 就能预测谓词类型；
+    // 三者都稳定，因此结果可复现。
     /* 基于PC和函数ID确定使用哪种不透明谓词 */
     uint32_t selector = (pc ^ ctx->bytecode_hash ^ (uint32_t)ctx->func_id) % 9;
 
@@ -465,6 +527,11 @@ int vm_path_explosion_checkpoint(vm_path_explosion_ctx_t *ctx,
  * 这些指令在语义上是NOP(不改变最终计算结果)，
  * 但会执行一些中间计算，使符号执行器跟踪额外状态
  */
+// 执行 4 组语义等价的诱饵运算（加法抵消、异或自反、双重取反、模幂），
+// 结果写入 volatile sink 防止被优化掉；不改变 ctx 的 VM 语义，只递增 decoy_counter。
+// 费马小定理那组：a 为 1..255 的奇数，exp=250，mod 251；
+// 当 a==251 时定理不适用、结果可能为 0，但该值不参与控制流。
+// 返回：无；ctx 为 NULL 时无操作。
 void vm_path_explosion_nop_decoy(vm_path_explosion_ctx_t *ctx, uint32_t pc) {
     if (!ctx) {
         return;
@@ -508,6 +575,11 @@ void vm_path_explosion_nop_decoy(vm_path_explosion_ctx_t *ctx, uint32_t pc) {
 /*
  * 公开API: 初始化路径爆炸上下文
  */
+// 初始化路径爆炸上下文：清零、记录 func_id，从 32 字节字节码哈希抽样出 32 位混合值，
+// 再据此设置 MBA 的 accumulator/xor_mask/add_mask 与 path_marker 初值。
+// 注意：hash_mix 只取每个 4 字节组的首字节（共 8 字节），不是完整哈希；
+//       它只用于确定性打散，不承担完整性职责。
+// 参数：bytecode_hash 必须可读 32 字节（由调用方保证，函数内不判 NULL）。
 void vm_path_explosion_init(vm_path_explosion_ctx_t *ctx,
                              uint64_t func_id,
                              const uint8_t bytecode_hash[32]) {
@@ -539,6 +611,10 @@ void vm_path_explosion_init(vm_path_explosion_ctx_t *ctx,
  * 公开API: 获取当前路径指纹
  * 用于检测符号执行器的路径覆盖
  */
+// 生成 32 字节路径指纹：从 mba.accumulator 起，按 i 做黄金比例乘加，
+// 与 path_marker[i] 异或后写入 fingerprint[i]，再把标记反馈回 mix。
+// 返回：无；fingerprint 必须可写 32 字节。ctx 或 fingerprint 为 NULL 时静默返回。
+// 它是确定性摘要，不是 MAC，不能用于跨进程身份认证。
 void vm_path_explosion_get_fingerprint(vm_path_explosion_ctx_t *ctx,
                                         uint8_t fingerprint[32]) {
     if (!ctx || !fingerprint) {
@@ -559,6 +635,13 @@ void vm_path_explosion_get_fingerprint(vm_path_explosion_ctx_t *ctx,
  *
  * 此函数应在VM主循环的每个指令周期调用
  */
+// VM 主循环钩子：每次调用都用帧状态的快照临时重建 ctx：
+// bytecode_hash 直接取 acc 的 32 字节，accumulator 取 opaque_chain，fork_counter 取 steps。
+// 每 VM_PATH_EXPLOSION_DECOY_DENSITY 条指令执行一次检查点；若进入诱饵则跑 NOP 序列；
+// 最后把 accumulator 写回 opaque_chain，并把路径指纹写入 trace_scratch。
+// 注意：局部 ctx 在函数返回时丢弃，fork/decoy 计数不会跨调用保留；
+//       acc 被当作哈希使用，因此同一帧在不同累加器状态下会选到不同谓词。
+// 返回：无；fr 为 NULL 时无操作。
 void vm_path_explosion_apply_to_interp(cprisk_vm_interp_frame_t *fr) {
     if (!fr) {
         return;
@@ -577,6 +660,7 @@ void vm_path_explosion_apply_to_interp(cprisk_vm_interp_frame_t *fr) {
 
     /* 在每个指令边界检查是否插入检查点 */
     uint32_t pc = 0;
+    // pc 用 steps 的低 16 位代理，仅用于节流检查点密度，不代表真实字节码地址。
     /* 从encoded_pc解码PC值 */
     /* 简化处理:使用steps作为PC的代理 */
     pc = (uint32_t)(fr->steps % 65536);
@@ -602,6 +686,10 @@ void vm_path_explosion_apply_to_interp(cprisk_vm_interp_frame_t *fr) {
  * 公开API: 触发符号爆炸
  * 当检测到可疑行为时主动增加符号执行负担
  */
+// 主动增加符号执行负担：按 intensity 决定 1..4 层，每层构造 a³+b³ 与伪立方根 c³
+// 的比较（费马大定理保证对正整数无解，结果恒 0），并把 lhs 混入 opaque_chain。
+// 参数：intensity 任意，仅对 4 取模决定层数；fr 为 NULL 时无操作。
+// 返回：无。循环层数 ≤4，成本有界。
 void vm_path_explosion_trigger_symex_bomb(cprisk_vm_interp_frame_t *fr,
                                            uint32_t intensity) {
     if (!fr) {

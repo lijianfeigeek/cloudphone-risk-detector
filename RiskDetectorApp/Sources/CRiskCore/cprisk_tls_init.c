@@ -1,3 +1,11 @@
+/*
+ * cprisk_tls_init.c — TLS 回调阶段的早期加固入口。
+ * 职责：在 __DATA,__thread_init 阶段先 deny-attach，再注册异常端口并抓取基线。
+ * 线程模型：dyld 单线程加载期执行，早于 constructor / ObjC +load，无并发竞争。
+ * 平台：仅 Apple；依赖 __thread_init section，同段回调顺序由链接器决定。
+ * 失败语义：各调用内部自处理失败，本回调无返回值；被后来者覆盖由 constructor 101 兜底。
+ */
+
 #include "include/CRiskCore.h"
 #include <TargetConditionals.h>
 
@@ -18,6 +26,9 @@
  *    101）在 __mod_init_func 阶段再次验证；若被 Frida 覆盖则 task_swap_exception_ports
  *    重新抢占。详见 cprisk_exception_handler.c。
  */
+// TLS 回调实现：无参数/无返回值/不分配资源。
+// 顺序不变量：必须先 deny-attach（SVC 直调抗 Hook），再抢占异常端口；
+// 顺序颠倒会给 attach 留出窗口。线程安全：仅 dyld 加载期单线程调用。
 static void cprisk_tls_init_callback(void) {
     /* 1. deny-attach 优先：SVC 直调，不经过 libc，抗 Hook */
     cprisk_deny_attach();
@@ -31,6 +42,8 @@ static void cprisk_tls_init_callback(void) {
  * Register the callback pointer in the __DATA,__thread_init section.
  * The 'used' attribute ensures the compiler doesn't optimize it away.
  */
+// 把回调函数指针放入 __DATA,__thread_init，供 dyld 在加载期自动调用。
+// used 防止被优化删除；指针只初始化一次，之后只读，无并发写。
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA,__thread_init")))
 static void (*cprisk_tls_init_ptr)(void) = cprisk_tls_init_callback;

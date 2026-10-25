@@ -1,3 +1,9 @@
+// cprisk_vm_interpreter.c —— 自定义 VM 字节码解释器：布局校验、取指解码、语义执行与状态收尾。
+// 输入来自 Mach-O 的 __DATA,__swift5_mdvrt（dispatch）/__swift5_mdirt（bytecode）段；
+// 本文件把“函数 id”解析成入口，在加密 PC 与加密操作数/立即数之上执行字节码，输出 64 字节状态与 vreg。
+// 执行状态全部放在每次 run 独立的 cprisk_vm_interp_frame_t 中；唯一进程级状态是 atomic 缓存的
+// session_mix（只写一次，之后并发只读）。任何布局/完整性校验失败都按 fail-closed 处理：
+// 置 poison/status 后提前结束，绝不回退到明文或“尽量执行”。
 #include "include/CRiskCore.h"
 #include "include/cprisk_cff.h"
 #include "include/cprisk_vm_interpreter_internal.h"
@@ -14,6 +20,9 @@
 
 /* Deployment gate: enable only for an image finalized by the CPSV v2 injector.
  * Keep legacy shipping defaults until final-image and device acceptance passes. */
+// 线程化（CPSV v2）分发的部署开关：默认 0（走传统解释循环）。仅当镜像由 CPSV v2 injector
+// 完成最终化、且真机验收通过后才可置 1；该路径仍属实验性质，打开后必须同时满足 v2 头部与
+// CPSH 期望，缺少任一条件都会整段拒绝，而不是回退到旧路径。
 #ifndef CPRISK_VM_THREADED_DISPATCH
 #define CPRISK_VM_THREADED_DISPATCH 0
 #endif
@@ -90,12 +99,19 @@ static void cprisk_thread_b_unknown_i(struct cprisk_thread_context_i *);
 #endif
 #endif
 
+// 单次 run 的硬步数上限（DoS 防护）。实际预算由 step_limit_cap 在 [MAX-12288, MAX] 内按
+// 函数/会话随机收紧，因此这里只是上限兜底，不是常规执行长度。
 #define CPRISK_VM_MAX_STEPS 65536u
+// dispatch 类别表（class table）一次解码 32 项；缓存按 32 对齐分段，减少重复解密开销。
 #define CPRISK_VM_DISPATCH_CACHE_BYTES 32u
+// 字节码头部布局：核心 16 字节；M2 追加 vpc_a/vpc_b（16 字节）；V3 可再各追加 8 字节的
+// immediate / opcode 种子。读取任何扩展字段前都必须先用 total_bytes 做边界检查。
 #define CPRISK_VMP_BYTECODE_HEADER_CORE_BYTES ((size_t)sizeof(cprisk_vmp_bytecode_header_t))
 #define CPRISK_VMP_BYTECODE_VPC_EXT_BYTES 16u
 
 /** Re-hash bytecode segment every N steps when \c CPRISK_VMP_BC_FLAG_BC_SEG_RUNTIME_SHA256 is set. */
+// 开启 BC_SEG_RUNTIME_SHA256 时，每 256 步重算一次整段字节码哈希；周期过小会被
+// 无意义的 SHA256 拖慢热路径，过大则给运行期补丁留出窗口。
 #ifndef CPRISK_VM_BC_HASH_PERIOD
 #define CPRISK_VM_BC_HASH_PERIOD 256u
 #endif
@@ -103,25 +119,31 @@ static void cprisk_thread_b_unknown_i(struct cprisk_thread_context_i *);
  * Skip redundant periodic SHA256 when the last successful bytecode hash was fewer than this many
  * steps ago (control-flow boundary checks are unaffected).
  */
+// 距上次成功哈希不足 32 步时跳过周期性复查；RET/HALT/VM_CALL 等控制流边界不受此限制。
 #ifndef CPRISK_VM_BC_HASH_MIN_INTERVAL
 #define CPRISK_VM_BC_HASH_MIN_INTERVAL 32u
 #endif
 /** Minimum interval (in completed steps) for session-domain white-box side effects when not on a hot M3 path. */
+// 非 XOR_MIX 热路径上，白盒域副作用的最小间隔（以已完成的步数计）。
 #ifndef CPRISK_VM_WB_SIDE_PERIOD
 #define CPRISK_VM_WB_SIDE_PERIOD 64u
 #endif
 /** Strategy 13: run bytecode-loop Diophantine opaque block every N completed steps (anti_symbolic_heavy). */
+// 反符号执行策略：每 8 步跑一次完整 Diophantine opaque 块；它是纯噪声计算，不改变 acc。
 #ifndef CPRISK_VM_MATH_HALLUC_BC_PERIOD
 #define CPRISK_VM_MATH_HALLUC_BC_PERIOD 8u
 #endif
 /** Strategy 13: polymorphic lane sidefx period (steps); must be > 0. */
+// lane 级 Diophantine 副作用的周期；必须 > 0（为 0 时取模会崩溃）。
 #ifndef CPRISK_VM_MATH_HALLUC_POLY_PERIOD
 #define CPRISK_VM_MATH_HALLUC_POLY_PERIOD 64u
 #endif
+// 只有 semantic_family 达到该阈值才启用 lane 级数学噪声，避免低族函数承担额外开销。
 #ifndef CPRISK_VM_MATH_HALLUC_SEM_FAMILY_MIN
 #define CPRISK_VM_MATH_HALLUC_SEM_FAMILY_MIN 2u
 #endif
 
+// 从任意地址读取小端 u64；用 memcpy 保证未对齐安全。p == NULL 时返回 0（调用方负责判空语义）。
 uint64_t cprisk_read_le_u64_i(const uint8_t *p) {
     uint64_t value = 0;
     if (!p)
@@ -130,6 +152,7 @@ uint64_t cprisk_read_le_u64_i(const uint8_t *p) {
     return value;
 }
 
+// 同上的小端 u32 版本；NULL 返回 0。
 static uint32_t cprisk_read_le_u32_i(const uint8_t *p) {
     uint32_t value = 0;
     if (!p)
@@ -140,6 +163,8 @@ static uint32_t cprisk_read_le_u32_i(const uint8_t *p) {
 
 /* cprisk_splitmix64_next_i is now provided by cprisk_vm_interpreter_internal.h (inline) */
 
+// 判断头部是否携带 M2 扩展：PER_ENTRY_VPC / HANDLER_VARIANT_SEED / VPC_NONLINEAR
+// 任一存在，都意味着核心头部后还有 16 字节 VPC 元数据。
 static int cprisk_vmp_bytecode_has_m2_i(const cprisk_vmp_bytecode_header_t *bh) {
     if (!bh)
         return 0;
@@ -148,6 +173,7 @@ static int cprisk_vmp_bytecode_has_m2_i(const cprisk_vmp_bytecode_header_t *bh) 
         || (bh->reserved & CPRISK_VMP_BC_FLAG_VPC_NONLINEAR) != 0u;
 }
 
+// 计算头部总字节数（核心 + 按标志/版本出现的扩展块），供所有越界检查使用。
 static size_t cprisk_vmp_bytecode_header_total_bytes_i(const cprisk_vmp_bytecode_header_t *bh) {
     size_t total = CPRISK_VMP_BYTECODE_HEADER_CORE_BYTES;
     if (cprisk_vmp_bytecode_has_m2_i(bh))
@@ -161,6 +187,7 @@ static size_t cprisk_vmp_bytecode_header_total_bytes_i(const cprisk_vmp_bytecode
     return total;
 }
 
+// 单个入口描述符的步长；置 PER_ENTRY_VPC 时每个入口后追加 16 字节 VPC 数据。
 static size_t cprisk_vmp_bytecode_entry_stride_i(const cprisk_vmp_bytecode_header_t *bh) {
     size_t stride = sizeof(cprisk_vmp_bytecode_entry_t);
     if (bh && (bh->reserved & CPRISK_VMP_BC_FLAG_PER_ENTRY_VPC) != 0u)
@@ -168,10 +195,15 @@ static size_t cprisk_vmp_bytecode_entry_stride_i(const cprisk_vmp_bytecode_heade
     return stride;
 }
 
+// 仅接受 v1/v2/v3；未知版本一律视为不合法字节码。
 static int cprisk_vmp_bytecode_version_ok_i(uint32_t v) {
     return v == CPRISK_VMP_VERSION || v == CPRISK_VMP_VERSION_M2 || v == CPRISK_VMP_VERSION_V3;
 }
 
+// 读取全局（或调用方指定的）VPC 仿射参数 a,b；无 M2 扩展时返回恒等映射 (1,0)。
+// 磁盘上的 a/b 用 SplitMix64(func_id + 固定域常量) 派生的一次性掩码异或，避免明文常量。
+// - 参数：b_sec 为字节码段起点；bh 为已校验头部；func_id 参与掩码派生。
+// - 输出：out_a/out_b 必须非 NULL（调用方保证）；本函数不做额外布局校验。
 void cprisk_vmp_read_vpc_affine_i(const uint8_t *b_sec,
                                        const cprisk_vmp_bytecode_header_t *bh,
                                        uint64_t func_id,
@@ -193,10 +225,12 @@ void cprisk_vmp_read_vpc_affine_i(const uint8_t *b_sec,
     *out_b = raw_b ^ mask_b;
 }
 
+// 置 VPC_NONLINEAR 时，PC 用 8 轮 Feistel + 标签编码，而非 a*pc+b 仿射。
 static int cprisk_vmp_vpc_is_nonlinear_i(const cprisk_vmp_bytecode_header_t *bh) {
     return bh != NULL && (bh->reserved & CPRISK_VMP_BC_FLAG_VPC_NONLINEAR) != 0u;
 }
 
+// 前向声明区：主循环按执行 lane 拆分（A=lane0，B=lane1/2），并允许自检窗口按符号取地址。
 static uint32_t cprisk_vm_session_mix_i(void);
 static void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr);
 static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr);
@@ -212,6 +246,7 @@ static int cprisk_vm_execute_lane1_i(uint64_t func_id,
 static int cprisk_vm_execute_lane2_i(uint64_t func_id,
                                      cprisk_vm_run_result_t *out,
                                      const void *hdr_sym);
+// 旧版单一 run 入口的前向声明；当前实际执行由 lane0/1/2 三个变体承担，本符号无定义也无调用。
 static void cprisk_vm_run_program_i(const struct mach_header_64 *hdr,
                                     const uint8_t *d_sec,
                                     const cprisk_vmp_dispatch_header_t *dhdr,
@@ -253,16 +288,20 @@ uint64_t cprisk_vm_entry(uint64_t func_id);
 uint64_t cprisk_vm_entry_alt1(uint64_t func_id);
 uint64_t cprisk_vm_entry_alt2(uint64_t func_id);
 
+// 32 位循环左/右移：n 先对 32 取模，n == 0 时直接返回，避免移位 UB。
 static uint32_t cprisk_vmp_rotl32_i(uint32_t x, uint32_t n) {
     n &= 31u;
     return n == 0u ? x : ((x << n) | (x >> (32u - n)));
 }
 
+// 32 位循环右移；与 rotl 一起供 Feistel/混合使用。
 static uint32_t cprisk_vmp_rotr32_i(uint32_t x, uint32_t n) {
     n &= 31u;
     return n == 0u ? x : ((x >> n) | (x << (32u - n)));
 }
 
+// 32 位 avalanche finalizer（类 xxHash）：只用于扩散/混淆，不是密码学哈希，
+// 不能当作 MAC 或抗碰撞承诺使用。
 uint32_t cprisk_vmp_avalanche32_i(uint32_t x) {
     x ^= x >> 16u;
     x *= 0x7FEB352Du;
@@ -273,12 +312,15 @@ uint32_t cprisk_vmp_avalanche32_i(uint32_t x) {
 }
 
 /* 4-bit nibble permutation stored XOR-masked (no raw permutation vector in rodata). */
+// VPC 非线性编码用的 4-bit nibble S-box。表中存的是 XOR 0x5 后的值，运行时再异或还原；
+// 目的只是避免在只读段留下可直接提取的置换向量。
 static const uint8_t cprisk_vmp_vpc_sbox_enc_i[16] = {
     0x9u, 0x0u, 0x3u, 0xeu, 0xcu, 0x5u, 0xfu, 0x8u,
     0x6u, 0xbu, 0xau, 0xdu, 0x1u, 0x2u, 0x4u, 0x7u,
 };
 #define CPRISK_VMP_VPC_SBOX_XOR_I 0x5u
 
+// 对 16 位值逐 nibble 查 S-box 并拼回，作为 Feistel F 函数的非线性层。
 static uint16_t cprisk_vmp_vpc_sub16_i(uint16_t value) {
     uint16_t out = 0u;
     for (uint32_t nib = 0u; nib < 4u; nib++) {
@@ -290,8 +332,10 @@ static uint16_t cprisk_vmp_vpc_sub16_i(uint16_t value) {
     return out;
 }
 
+// 非线性 PC 编码的 Feistel 轮数；8 轮足以抵抗直接反推，同时保持常数时间。
 #define CPRISK_VMP_VPC_FEISTEL_ROUNDS 8u
 
+// 由 (a,b) 派生 Feistel 轮密钥与 salt；常量仅作域分离（"VMPC"/"M4VP"）。
 static uint32_t cprisk_vmp_vpc_key32_i(uint64_t a, uint64_t b) {
     return cprisk_vmp_avalanche32_i(
         (uint32_t)a ^
@@ -302,6 +346,7 @@ static uint32_t cprisk_vmp_vpc_key32_i(uint64_t a, uint64_t b) {
     );
 }
 
+// 由 (a,b) 派生 Feistel salt；与 key32 使用不同域常量，确保轮密钥与 salt 独立。
 static uint32_t cprisk_vmp_vpc_salt32_i(uint64_t a, uint64_t b) {
     return cprisk_vmp_avalanche32_i(
         (uint32_t)b ^
@@ -312,6 +357,7 @@ static uint32_t cprisk_vmp_vpc_salt32_i(uint64_t a, uint64_t b) {
     );
 }
 
+// 单轮 Feistel 轮函数：轮常量 + avalanche 派生轮密钥，再经 nibble S-box、旋转与再扩散。
 static uint16_t cprisk_vmp_vpc_feistel_F_i(uint16_t r, uint32_t key, uint32_t salt, uint32_t round) {
     uint32_t rk = cprisk_vmp_avalanche32_i(key ^ salt ^ (round * 0x9E3779B9u) ^ 0xDEADBEEFu);
     uint16_t piece = (uint16_t)(r ^ (uint16_t)rk ^ (uint16_t)(rk >> 16u));
@@ -320,6 +366,8 @@ static uint16_t cprisk_vmp_vpc_feistel_F_i(uint16_t r, uint32_t key, uint32_t sa
     return (uint16_t)cprisk_vmp_avalanche32_i((uint32_t)piece ^ rk ^ 0xA5C31F27u);
 }
 
+// 8 轮 Feistel 编解码；前后各做一次与 key/salt 绑定的 avalanche 白化。
+// decode 必须与 encode 严格互逆，任何不一致都会在 tag 校验处暴露。
 static uint32_t cprisk_vmp_vpc_feistel32_encode_i(uint32_t state, uint32_t key, uint32_t salt) {
     uint32_t v = state ^ cprisk_vmp_avalanche32_i(key ^ salt ^ 0xF1055A1u);
     uint16_t l = (uint16_t)(v >> 16);
@@ -334,6 +382,7 @@ static uint32_t cprisk_vmp_vpc_feistel32_encode_i(uint32_t state, uint32_t key, 
         ^ cprisk_vmp_avalanche32_i(key ^ salt ^ 0xACC0DECu);
 }
 
+// Feistel 解码：逆序回放 8 轮并还原前后白化，必须与 encode 严格互逆。
 static uint32_t cprisk_vmp_vpc_feistel32_decode_i(uint32_t encoded_state, uint32_t key, uint32_t salt) {
     uint32_t mid = encoded_state ^ cprisk_vmp_avalanche32_i(key ^ salt ^ 0xACC0DECu);
     uint16_t l = (uint16_t)(mid >> 16);
@@ -349,6 +398,7 @@ static uint32_t cprisk_vmp_vpc_feistel32_decode_i(uint32_t encoded_state, uint32
         ^ cprisk_vmp_avalanche32_i(key ^ salt ^ 0xF1055A1u);
 }
 
+// 为编码后的 PC 生成 32 位标签，绑定 key/salt；decode 时先验标签再解 Feistel。
 static uint32_t cprisk_vmp_vpc_tag32_i(uint32_t encoded_pc32, uint32_t key, uint32_t salt) {
     return cprisk_vmp_avalanche32_i(
         encoded_pc32 ^
@@ -358,6 +408,8 @@ static uint32_t cprisk_vmp_vpc_tag32_i(uint32_t encoded_pc32, uint32_t key, uint
     );
 }
 
+// 非线性 PC 编码：把 session_mix 混入 key/salt，返回 (tag32 << 32) | enc32。
+// 由于 session_mix 每进程不同，同一份磁盘字节码在不同运行中的 encoded_pc 也不同。
 static uint64_t cprisk_vmp_nonlinear_encode_pc_i(uint32_t pc, uint64_t a, uint64_t b) {
     const uint32_t session = cprisk_vm_session_mix_i();
     const uint32_t key = cprisk_vmp_vpc_key32_i(a, b) ^ session;
@@ -367,6 +419,7 @@ static uint64_t cprisk_vmp_nonlinear_encode_pc_i(uint32_t pc, uint64_t a, uint64
     return ((uint64_t)tag32 << 32u) | (uint64_t)enc32;
 }
 
+// 非线性 PC 解码：重算标签并做常数时间比较；标签不符返回 0（调用方置 BYTECODE 污染）。
 static int cprisk_vmp_nonlinear_decode_pc_i(uint64_t encoded_pc,
                                             uint64_t a,
                                             uint64_t b,
@@ -386,6 +439,8 @@ static int cprisk_vmp_nonlinear_decode_pc_i(uint64_t encoded_pc,
     return 1;
 }
 
+// 把逻辑 PC 编码成 encoded_pc。非线性模式直接走 Feistel；仿射模式做乘法/加法溢出检查，
+// 溢出时写 INVALID_BYTECODE/POISON_BYTECODE 并返回 0。out_enc 必须非 NULL。
 int cprisk_vm_encode_pc_i(const cprisk_vmp_bytecode_header_t *bh,
                                  uint32_t pc,
                                  uint64_t vpc_a,
@@ -412,6 +467,8 @@ int cprisk_vm_encode_pc_i(const cprisk_vmp_bytecode_header_t *bh,
     return 1;
 }
 
+// encode 的逆过程。仿射模式要求 encoded_pc >= vpc_b、vpc_a != 0、差值可整除且结果
+// 不超过 UINT32_MAX；任一条不满足都置 INVALID_BYTECODE/POISON_BYTECODE 并返回 0。
 static int cprisk_vm_decode_pc_i(const cprisk_vmp_bytecode_header_t *bh,
                                  uint64_t encoded_pc,
                                  uint64_t vpc_a,
@@ -458,8 +515,13 @@ static int cprisk_vm_decode_pc_i(const cprisk_vmp_bytecode_header_t *bh,
     return 1;
 }
 
+// 进程级 session_mix 的一次性缓存。0 是“未初始化”哨兵，因此最终值强制非零；
+// 初始化后只读，可被任意线程并发读取（atomic_load/atomic_store，使用默认的 seq_cst 语义）。
 static atomic_uint_fast32_t s_vm_session_mix_i = 0;
 
+// 采集单调时钟、pid、内核熵、会话密钥与运行时材料，经 avalanche 得到非零 session_mix。
+// 该值不直接决定 acc 语义，但贯穿 PC 编码、dispatch 解密、opaque 链与白盒输入；
+// 取不到某项材料时按可用子集继续（熵源 fail-open），而布局/完整性校验仍是 fail-closed。
 static uint32_t cprisk_vm_session_mix_i(void) {
     uint32_t cached = (uint32_t)atomic_load(&s_vm_session_mix_i);
     if (cached != 0u) {
@@ -514,6 +576,8 @@ static uint32_t cprisk_vm_session_mix_i(void) {
     return mix;
 }
 
+// 派生 2-bit（0..3）handler 变体号：由步数、函数 id、逻辑 op、立即数与 session_mix 决定。
+// 作用是让同一语义 op 在不同位置选择不同的等价实现路径，增加差分/符号分析成本。
 static uint32_t cprisk_vm_handler_variant_i(uint32_t hdr_reserved,
                                           uint64_t func_id,
                                           uint64_t steps,
@@ -528,6 +592,8 @@ static uint32_t cprisk_vm_handler_variant_i(uint32_t hdr_reserved,
     return mix & 3u;
 }
 
+// 32 路 lane 选择器：把 pc/func_id/步数/hvar/semantic_family/session_mix 混成 0..31 的索引，
+// 保证全部 switch 分支都可能被走到，而不是总落在少数固定分支上。
 /** 32-way semantic lane selector (seed/pc/func/handler — all reachable switch arms). */
 static uint32_t cprisk_vm_lane_poly32_i(uint32_t pc,
                                        uint64_t func_id,
@@ -543,6 +609,8 @@ static uint32_t cprisk_vm_lane_poly32_i(uint32_t pc,
 }
 
 /** Extra no-op staging (semantic identity) before poly 16–31 paths — harder trace slicing vs poly 0–15. */
+// 在高半区（poly >= 16）先做一段“语义恒等”的 staging：读改写 acc，但结果不变。
+// volatile 读与固定 12 轮循环用于在反汇编/轨迹上制造与低半区不同的形状。
 static void cprisk_vm_lane_poly_staging_i(uint8_t acc[32],
                                            uint32_t steps,
                                            uint32_t poly,
@@ -559,6 +627,9 @@ static void cprisk_vm_lane_poly_staging_i(uint8_t acc[32],
     }
 }
 
+// 解析入口描述符 reserved 中的执行 profile：高字节必须是 magic 0xA5。
+// 输出 semantic_family（4 bit）、mixed_predicate_profile（4 bit）与 max_subcall_depth（4 bit + 1）。
+// 返回 1 表示 magic 有效；返回 0 时调用方应使用 fallback，而不能把 0 当作合法 profile。
 int cprisk_vm_entry_profile_decode_i(uint32_t entry_reserved,
                                             uint32_t *semantic_family,
                                             uint32_t *mixed_predicate_profile,
@@ -574,6 +645,8 @@ int cprisk_vm_entry_profile_decode_i(uint32_t entry_reserved,
     return 1;
 }
 
+// profile 缺失或被篡改时的兜底派生。把仅运行期可知的 SPN S-box 种子混入，
+// 使攻击者无法仅凭公开的 func_id/头部 reserved 预先算出 (sem, mix, depth) 三元组。
 void cprisk_vm_entry_profile_fallback_i(uint64_t func_id,
                                                uint32_t hdr_reserved,
                                                uint32_t *semantic_family,
@@ -601,6 +674,7 @@ void cprisk_vm_entry_profile_fallback_i(uint64_t func_id,
         *max_subcall_depth = depth;
 }
 
+// 用异或/进位循环实现 8 位加法（不依赖 CPU 的 ADD），是 add_equiv 的等价实现之一。
 static uint8_t cprisk_vm_add_byte_bitwise_i(uint8_t a, uint8_t b) {
     while (b != 0u) {
         uint8_t carry = (uint8_t)(a & b);
@@ -610,6 +684,8 @@ static uint8_t cprisk_vm_add_byte_bitwise_i(uint8_t a, uint8_t b) {
     return a;
 }
 
+// 16 种 uint8 加法的语义等价写法（含 MBA 恒等式）。style 只改变实现形状，
+// 结果始终是 (lhs + rhs) mod 256。
 static uint8_t cprisk_vm_add_equiv_i(uint8_t lhs, uint8_t rhs, uint32_t style) {
     const uint32_t L = (uint32_t)lhs;
     const uint32_t R = (uint32_t)rhs;
@@ -650,6 +726,7 @@ static uint8_t cprisk_vm_add_equiv_i(uint8_t lhs, uint8_t rhs, uint32_t style) {
 }
 
 /** lane_family: 0 = ADD polymorphic, 1 = SUB (wrapping), 2 = MUL mod 256. */
+// 按 lane_family 选择运算族：0=ADD（多态等价写法）、1=SUB（uint8 回绕）、2=MUL（mod 256）。
 static uint8_t cprisk_vm_lane_combine_i(uint8_t lhs, uint8_t rhs, uint32_t style, uint32_t lane_family) {
     if (lane_family == 1u)
         return (uint8_t)(lhs - rhs);
@@ -658,6 +735,7 @@ static uint8_t cprisk_vm_lane_combine_i(uint8_t lhs, uint8_t rhs, uint32_t style
     return cprisk_vm_add_equiv_i(lhs, rhs, style);
 }
 
+// 16 种 uint8 异或的语义等价写法；结果始终是 lhs ^ rhs，style 仅改变中间表达式。
 static uint8_t cprisk_vm_xor_equiv_i(uint8_t lhs, uint8_t rhs, uint32_t style) {
     const uint32_t L = (uint32_t)lhs;
     const uint32_t R = (uint32_t)rhs;
@@ -697,6 +775,11 @@ static uint8_t cprisk_vm_xor_equiv_i(uint8_t lhs, uint8_t rhs, uint32_t style) {
     }
 }
 
+// RAW_REGION 语义：把 imm 的 8 个字节分别 XOR 到 acc 的 8 个 lane。
+// lane 索引按步数旋转；多数 poly 分支只改变施加顺序/快照方式，结果等价。
+// 注意 case 13 的 (t*2+1)&7 只遍历奇数 lane 且各两次，XOR 下相互抵消，
+// 因此该分支并不与其他分支等价；最终结果依赖实际选中的 poly，而非固定语义。
+// 失败语义：无（纯字节运算，不触碰 PC、steps 或状态标志）。
 void cprisk_vm_raw_region_apply_i(uint8_t acc[32],
                                          uint64_t imm,
                                          uint32_t steps,
@@ -845,6 +928,9 @@ void cprisk_vm_raw_region_apply_i(uint8_t acc[32],
     }
 }
 
+// 顺序执行时的 PC 推进：decode 当前 encoded_pc → 加一条指令宽度 → 重新 encode。
+// 任何 decode/encode 失败都会把错误写进 out（INVALID_BYTECODE / POISON_BYTECODE）。
+// 返回 1 成功；0 失败（调用方应返回 CPRISK_VM_FLOW_LEAVE）。
 int cprisk_vm_enc_pc_advance_ctx_i(const cprisk_vmp_bytecode_header_t *bh,
                                           uint64_t *enc_pc,
                                           uint64_t vpc_a,
@@ -871,6 +957,9 @@ int cprisk_vm_enc_pc_advance_ctx_i(const cprisk_vmp_bytecode_header_t *bh,
     );
 }
 
+// 与 raw_region_apply 相同的 lane 布局/poly 选择，但按 lane_family 做 ADD/SUB/MUL。
+// 这是 ADD/SUB/MUL 三种 opcode 的共同实现核心；注意 case 13 会重复访问奇数 lane，
+// 第二次施加会继续叠加（不是等价重排），实际结果以选中的 poly 为准。
 static void cprisk_vm_lane_family_apply_i(uint8_t acc[32],
                                           uint64_t imm,
                                           uint32_t steps,
@@ -1020,6 +1109,8 @@ static void cprisk_vm_lane_family_apply_i(uint8_t acc[32],
     }
 }
 
+// ADD/SUB/MUL 三个入口只是把 lane_family 固定为 0/1/2 的薄封装，
+// 供 opcode 层与自检窗口引用。
 void cprisk_vm_add_apply_i(uint8_t acc[32],
                                   uint64_t imm,
                                   uint32_t steps,
@@ -1030,6 +1121,7 @@ void cprisk_vm_add_apply_i(uint8_t acc[32],
     cprisk_vm_lane_family_apply_i(acc, imm, steps, variant, semantic_family, func_id, pc, 0u);
 }
 
+// SUB lane 家族入口：固定 lane_family=1（uint8 回绕减法）。
 static void cprisk_vm_sub_apply_i(uint8_t acc[32],
                                   uint64_t imm,
                                   uint32_t steps,
@@ -1040,6 +1132,7 @@ static void cprisk_vm_sub_apply_i(uint8_t acc[32],
     cprisk_vm_lane_family_apply_i(acc, imm, steps, variant, semantic_family, func_id, pc, 1u);
 }
 
+// MUL lane 家族入口：固定 lane_family=2（mod 256 乘法）。
 static void cprisk_vm_mul_apply_i(uint8_t acc[32],
                                   uint64_t imm,
                                   uint32_t steps,
@@ -1050,6 +1143,7 @@ static void cprisk_vm_mul_apply_i(uint8_t acc[32],
     cprisk_vm_lane_family_apply_i(acc, imm, steps, variant, semantic_family, func_id, pc, 2u);
 }
 
+// 三种 lane 家族处理函数的统一签名，用于最终的无分支查表调用。
 typedef void (*cprisk_vm_lane_apply_fp_i)(uint8_t acc[32],
                                           uint64_t imm,
                                           uint32_t steps,
@@ -1058,6 +1152,7 @@ typedef void (*cprisk_vm_lane_apply_fp_i)(uint8_t acc[32],
                                           uint64_t func_id,
                                           uint32_t pc);
 
+// 对 8 个字节分别取 0-b（uint8 回绕），用于把“加 imm”改写成“减 neg(imm)”等恒等变形。
 static uint64_t cprisk_vm_imm_neg_bytes_u64_i(uint64_t imm) {
     uint64_t out = 0u;
     for (unsigned i = 0u; i < 8u; i++) {
@@ -1068,6 +1163,7 @@ static uint64_t cprisk_vm_imm_neg_bytes_u64_i(uint64_t imm) {
 }
 
 /** Per-byte (uint8) addition used for semantic-equivalent lane decompositions. */
+// 对 8 个字节分别做 (a + k) mod 256，用于 ADD/SUB 的常数拆分变形。
 static uint64_t cprisk_vm_imm_add_bytes_u64_i(uint64_t imm, uint64_t k) {
     uint64_t out = 0u;
     for (unsigned i = 0u; i < 8u; i++) {
@@ -1078,6 +1174,8 @@ static uint64_t cprisk_vm_imm_add_bytes_u64_i(uint64_t imm, uint64_t k) {
     return out;
 }
 
+// 由 route/pc/步数/func/family 派生每个字节 lane 各不相同的 64 位常数 k，
+// 供 ADD/SUB 的“加 k 再减 k”拆分使用。
 static uint64_t cprisk_vm_imm_route_salt_u64_i(
     uint32_t route, uint64_t func_id, uint32_t pc, uint32_t steps, uint32_t family) {
     uint32_t s = cprisk_vmp_avalanche32_i(
@@ -1091,6 +1189,14 @@ static uint64_t cprisk_vm_imm_route_salt_u64_i(
     return out;
 }
 
+// 语义族入口：family 0/1/2 分别对应 ADD/SUB/MUL；route 决定“用哪种等价实现”。
+// route 位语义（每种变形都必须严格保持 uint8 逐 lane 等价）：
+//   0x10 — ADD 拆成 (+(imm+k), +(-k))；SUB 拆成 (-(imm+k), +k)；
+//   0x20 — MUL 用 a*b ≡ -((-a)*b) 的取负恒等式；
+//   0x08 — ADD/SUB 交叉改写（a+b ≡ a-(-b)，a-b ≡ a+(-b)）；
+//   0x01 — 直接调用对应家族实现；
+//   0x02/0x40 — 只对 imm/variant 做自消的 XOR 混淆，语义不变。
+// 其他组合走末尾通用路径；family > 2 直接返回（防御非法 route）。
 void cprisk_vm_lane_apply_poly_i(uint8_t acc[32],
                                         uint32_t family,
                                         uint64_t imm,
@@ -1187,6 +1293,8 @@ void cprisk_vm_lane_apply_poly_i(uint8_t acc[32],
     );
 }
 
+// OR_LANE / AND_LANE 的直通实现：把 imm 的 8 个字节 OR/AND 进 acc 的 8 个旋转 lane。
+// semantic_family 在此被忽略；variant 只影响 OR 的 lane 偏移，不改变位运算语义。
 static void cprisk_vm_bitwise_lane_or_i(uint8_t acc[32],
                                         uint64_t imm,
                                         uint32_t steps,
@@ -1206,6 +1314,7 @@ static void cprisk_vm_bitwise_lane_or_i(uint8_t acc[32],
     }
 }
 
+// AND_LANE 直通实现：把 imm 的 8 字节 AND 进 acc 的 8 个旋转 lane。
 static void cprisk_vm_bitwise_lane_and_i(uint8_t acc[32],
                                          uint64_t imm,
                                          uint32_t steps,
@@ -1224,6 +1333,8 @@ static void cprisk_vm_bitwise_lane_and_i(uint8_t acc[32],
     }
 }
 
+// 按 route 选择 OR/AND 的两种等价顺序：位 0 置位时正序直通，否则逆序施加；
+// 两者结果完全一致，差异仅用于打乱数据流/轨迹形状。
 void cprisk_vm_bitwise_lane_poly_i(uint8_t acc[32],
                                           uint32_t logical,
                                           uint64_t imm,
@@ -1255,6 +1366,7 @@ void cprisk_vm_bitwise_lane_poly_i(uint8_t acc[32],
     }
 }
 
+// 把 32 字节 acc 循环左移 (imm & 31) 字节；先复制快照，保证移位是原子的字节置换。
 void cprisk_vm_rol_acc_i(uint8_t acc[32], uint64_t imm) {
     unsigned rot = (unsigned)(imm & 31u);
     uint8_t t[32];
@@ -1264,6 +1376,9 @@ void cprisk_vm_rol_acc_i(uint8_t acc[32], uint64_t imm) {
 }
 
 /** Immediate: dst[2:0], src[5:3], mode[7:6] — 0=rr mov, 1=imm56@(>>8), 2=load 8B from acc[@(>>8)&31]. */
+// 虚拟寄存器 MOV，立即数字段布局：dst[2:0]、src[5:3]、mode[7:6]。
+// mode 0 = reg→reg；mode 1 = 56 位立即数；mode 2 = 从 acc 的 (imm>>8)&31 起环形读 8 字节。
+// vregs/acc 由调用方保证非 NULL；本函数不产生错误码。
 void cprisk_vm_vreg_mov_i(uint64_t vregs[8], const uint8_t acc[32], uint64_t imm) {
     uint32_t dst = (uint32_t)(imm & 7u);
     uint32_t src = (uint32_t)((imm >> 3) & 7u);
@@ -1282,6 +1397,8 @@ void cprisk_vm_vreg_mov_i(uint64_t vregs[8], const uint8_t acc[32], uint64_t imm
 }
 
 /** Immediate: dst[2:0], a[5:3], b[8:6], op[11:9] — 0 ADD 1 XOR 2 AND 3 OR. */
+// 虚拟寄存器 64 位 ALU：dst[2:0]、a[5:3]、b[8:6]、op[11:9]（0 ADD、1 XOR、2 AND、3 OR）。
+// op 取其他值时按 OR 处理，与 opcode 层的编码约定一致，不额外报错。
 void cprisk_vm_vreg_alu_i(uint64_t vregs[8], uint64_t imm) {
     uint32_t dst = (uint32_t)(imm & 7u);
     uint32_t a = (uint32_t)((imm >> 3) & 7u);
@@ -1302,6 +1419,8 @@ void cprisk_vm_vreg_alu_i(uint64_t vregs[8], uint64_t imm) {
 }
 
 /** Immediate: dst[2:0], acc_base[7:3], store bit[8] — 0=load acc→vreg, 1=store vreg→acc. */
+// 虚拟寄存器与 acc 之间的 8 字节搬运：dst[2:0]、base[7:3]、store[8]。
+// store=0 从 acc 环形窗口读到 vreg；store=1 把 vreg 写回 acc。越界由 &31 环绕处理。
 void cprisk_vm_vreg_mem_i(uint64_t vregs[8], uint8_t acc[32], uint64_t imm) {
     uint32_t dst = (uint32_t)(imm & 7u);
     uint32_t base = (uint32_t)((imm >> 3) & 31u);
@@ -1318,6 +1437,8 @@ void cprisk_vm_vreg_mem_i(uint64_t vregs[8], uint8_t acc[32], uint64_t imm) {
     }
 }
 
+// 把 32 字节 acc 与 salt 混合成 32 位摘要（旋转 + 加法 + 常量）。仅用于绑定状态/派生索引，
+// 不要求密码学强度。
 static uint32_t cprisk_vm_mix32_from_acc_i(const uint8_t acc[32], uint32_t salt) {
     uint32_t m = salt ^ 0x9E3779B9u;
     for (uint32_t i = 0; i < 32u; i++) {
@@ -1328,6 +1449,7 @@ static uint32_t cprisk_vm_mix32_from_acc_i(const uint8_t acc[32], uint32_t salt)
     return m;
 }
 
+// 同时混入主 acc 与 acc_aux 两个 bank，最后做 avalanche；用于合并与副作用的种子。
 static uint32_t cprisk_vm_mix32_from_banks_i(
     const uint8_t acc[CPRISK_VM_ACC_PRIMARY_BYTES],
     const uint8_t acc_aux[CPRISK_VM_ACC_AUX_BYTES],
@@ -1343,6 +1465,8 @@ static uint32_t cprisk_vm_mix32_from_banks_i(
     return cprisk_vmp_avalanche32_i(m ^ salt ^ 0xA24BAED5u);
 }
 
+// 把主 acc 与 acc_aux 融合成 32 字节输出：先求联合摘要，再按摘要派生索引与 twist 逐字节混合。
+// out 与 acc 不允许别名（当前调用方都写入 out->acc 或独立局部数组）。
 static void cprisk_vm_merge_banks_i(
     uint8_t out[CPRISK_VM_ACC_PRIMARY_BYTES],
     const uint8_t acc[CPRISK_VM_ACC_PRIMARY_BYTES],
@@ -1358,6 +1482,8 @@ static void cprisk_vm_merge_banks_i(
     }
 }
 
+// 用 session/opaque/func/path 初始化 acc_aux，使副 bank 不是主 acc 的简单拷贝；
+// 初始值依赖运行期 session，因此同一输入在不同进程中的中间状态不同。
 static void cprisk_vm_aux_init_i(cprisk_vm_interp_frame_t *fr) {
     uint32_t mix = cprisk_vmp_avalanche32_i(
         fr->session_mix ^
@@ -1374,6 +1500,8 @@ static void cprisk_vm_aux_init_i(cprisk_vm_interp_frame_t *fr) {
     }
 }
 
+// 每步更新 acc_aux 的 8 个 lane，并在 ROL/VREG 类 op 上追加对应副作用。
+// 不变量：本函数绝不修改 fr->acc 的语义值（只读取 acc 用于派生），也不推进 PC/steps。
 static void cprisk_vm_aux_step_i(
     cprisk_vm_interp_frame_t *fr,
     uint8_t logical,
@@ -1407,6 +1535,7 @@ static void cprisk_vm_aux_step_i(
     }
 }
 
+// 按 AArch64 条件码求值（EQ/NE/CS/.../AL/NV）。输入 flags 来自 acc 派生，而非真实 CPU 标志。
 static int cprisk_vm_eval_arm_cond_i(uint32_t cond, uint32_t n, uint32_t z, uint32_t c, uint32_t v) {
     switch (cond & 0xFu) {
     case 0x0u: return z != 0u;                 /* EQ */
@@ -1428,6 +1557,7 @@ static int cprisk_vm_eval_arm_cond_i(uint32_t cond, uint32_t n, uint32_t z, uint
     }
 }
 
+// 从环形 acc 的 lane_seed 起按小端读取 width_bytes 字节（1..8），用于 CBZ/CBNZ 与结果折叠。
 static uint64_t cprisk_vm_read_acc_word_i(const uint8_t acc[32], uint32_t lane_seed, uint32_t width_bytes) {
     uint64_t value = 0u;
     uint32_t base = lane_seed & 31u;
@@ -1440,6 +1570,11 @@ static uint64_t cprisk_vm_read_acc_word_i(const uint8_t acc[32], uint32_t lane_s
     return value;
 }
 
+// 解码并求值条件分支：
+// - B.cond：掩码 0xFF000010 == 0x54000000；imm19 为指令数，delta = simm19 * 9 字节。
+// - CBZ/CBNZ：掩码 0x7E000000 == 0x34000000；从 acc 读取 rt（与 semantic_family 异或）处的字。
+// flags 由 acc + 步数 + insn 混合得出，是确定性的“伪标志”，不依赖宿主 CPU 状态。
+// 返回 1 表示识别并求值成功；0 表示不是支持的条件分支（调用方继续尝试其他实现）。
 static int cprisk_vm_branch_cond_base_i(uint32_t insn,
                                         const uint8_t acc[32],
                                         uint64_t steps,
@@ -1481,6 +1616,8 @@ static int cprisk_vm_branch_cond_base_i(uint32_t insn,
     return 0;
 }
 
+// 混合谓词包装：base 是真实判定；mixed_profile 的每个分支都构造为与 base 严格等价
+// （g0/g1/g2 只出现在 (x||!x)、(x^x)==0 这类恒等式中），用于增加静态分析噪声。
 int cprisk_vm_branch_cond_mixed_eval_i(uint32_t insn,
                                               const uint8_t acc[32],
                                               uint64_t steps,
@@ -1520,6 +1657,8 @@ int cprisk_vm_branch_cond_mixed_eval_i(uint32_t insn,
     return 1;
 }
 
+// 设置分支目标 encoded_pc：delta 必须是 9 的整数倍；目标必须落在 [0, blen-9] 且对齐，
+// 再用 encode_pc_i 重新加密。失败写 INVALID_BYTECODE/POISON_BYTECODE 并返回 0。
 int cprisk_vm_set_branch_target_ctx_i(const cprisk_vmp_bytecode_header_t *bh,
                                              uint64_t *enc_pc,
                                              uint64_t vpc_a,
@@ -1551,12 +1690,19 @@ int cprisk_vm_set_branch_target_ctx_i(const cprisk_vmp_bytecode_header_t *bh,
     return cprisk_vm_encode_pc_i(bh, (uint32_t)target_u, vpc_a, vpc_b, enc_pc, out);
 }
 
+// 便捷宏：固定使用当前帧的 bh/vpc_b 推进 encoded_pc。
 #define cprisk_vm_enc_pc_advance_i(enc_pc, vpc_a, out) \
     cprisk_vm_enc_pc_advance_ctx_i(fr->bh, enc_pc, vpc_a, fr->vpc_b, out)
 
+// 便捷宏：固定使用当前帧的 bh 调用分支目标编码。
 #define cprisk_vm_set_branch_target_i(enc_pc, vpc_a, vpc_b, blen, pc, delta_bytes, out) \
     cprisk_vm_set_branch_target_ctx_i(fr->bh, enc_pc, vpc_a, vpc_b, blen, pc, delta_bytes, out)
 
+// 校验 dispatch / bytecode 两个段的最小 ABI：
+// - dispatch：magic/version(V1/V2)/class_table_size；V2 还要容纳表后的 8 字节种子。
+// - bytecode：magic/version；只有 V3 才允许 ENC_IMMEDIATE / ENC_OPCODE；entry_count ∈ [1,4096]。
+// - 头部、入口表与所有函数体的偏移/长度都必须落在段内、互不重叠，正文长度必须是 9 的倍数。
+// 返回 1 且（可选）回填 out_bh；任何不一致返回 0，调用方按 INVALID_DISPATCH fail-closed。
 static int cprisk_vmp_headers_ok_i(const uint8_t *d_s,
                                    unsigned long d_sz,
                                    const uint8_t *b_s,
@@ -1629,6 +1775,8 @@ static int cprisk_vmp_headers_ok_i(const uint8_t *d_s,
     return 1;
 }
 
+// 能力查询：只有 dispatch/bytecode 两段都通过 headers_ok 才返回 CAP_VMP_RUNTIME，
+// 否则返回 0。结果并入 CRiskCore 能力位，供上层判断是否启用 VM 路径。
 uint32_t cprisk_vm_query_armor_capability_bits(void) {
     const struct mach_header_64 *hdr =
         cprisk_find_own_header((const void *)&cprisk_vm_query_armor_capability_bits);
@@ -1646,6 +1794,8 @@ uint32_t cprisk_vm_query_armor_capability_bits(void) {
 }
 
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
+// 真机被调试时的诱饵状态：对 acc 做一次 SHA256，使短路返回的结果仍然“像正常输出”；
+// 模拟器没有可用的检测路径，对应实现直接 no-op（符号仍保留以稳定自检窗口布局）。
 static void cprisk_vm_traced_decoy_acc_i(uint8_t acc[32]) {
     const uint8_t *src = acc;
     cprisk_sha256_ctx pctx;
@@ -1659,6 +1809,8 @@ static void __attribute__((unused)) cprisk_vm_traced_decoy_acc_i(uint8_t acc[32]
 }
 #endif
 
+// 未知/毒化 opcode 的 acc 污染：按 opcode、类别与字节位置异或固定模式，
+// 使短路结果不可能被误认为正常输出。
 void cprisk_vm_poison_mix_unknown_i(uint8_t acc[32], uint32_t opcode, uint32_t cls) {
     for (unsigned i = 0; i < 32u; i++) {
         uint8_t b = (uint8_t)(0xA5u ^ (unsigned)opcode ^ (unsigned)cls ^ i);
@@ -1667,6 +1819,7 @@ void cprisk_vm_poison_mix_unknown_i(uint8_t acc[32], uint32_t opcode, uint32_t c
 }
 
 /* M3: FNV-1a over interpreter text (ASLR-independent: bytes only). */
+// M3 自检用的 FNV-1a：只对代码字节做哈希（不含地址），因此 ASLR 不影响结果。
 static uint32_t cprisk_vm_m3_fnv1a_bytes_i(const volatile uint8_t *p, size_t n) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < n; i++) {
@@ -1676,6 +1829,7 @@ static uint32_t cprisk_vm_m3_fnv1a_bytes_i(const volatile uint8_t *p, size_t n) 
     return h;
 }
 
+// FNV-1a 续算：把多个不连续的 TEXT 窗口串成一次滚动哈希。
 static uint32_t cprisk_vm_m3_fnv1a_continue_i(uint32_t h, const volatile uint8_t *p, size_t n) {
     for (size_t i = 0; i < n; i++) {
         h ^= (uint32_t)p[i];
@@ -1684,6 +1838,8 @@ static uint32_t cprisk_vm_m3_fnv1a_continue_i(uint32_t h, const volatile uint8_t
     return h;
 }
 
+// 编译期一致性检查：三个窗口长度之和必须等于自检总长，否则 injector 与运行期会采用
+// 不同布局。长度不匹配时用 #error 直接阻断构建，而不是运行期静默降级。
 #if CPRISK_VM_M3_SELF_INCLUDE_LOOP
 #if CPRISK_VM_M3_SELF_EXEC_BYTES + CPRISK_VM_M3_SELF_LOOP_BYTES + CPRISK_VM_M3_SELF_DISPATCH_BYTES \
     != CPRISK_VM_M3_SELF_BYTES
@@ -1694,6 +1850,8 @@ static uint32_t cprisk_vm_m3_fnv1a_continue_i(uint32_t h, const volatile uint8_t
 void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr);
 uint8_t cprisk_vm_dispatch_lookup(struct cprisk_vm_interp_frame *fr, uint32_t op, uint32_t pc_index);
 
+// 自检窗口描述 ABI：header(magic/version/count/reserved) + count 个 (vmaddr,length,kind)。
+// kind 1/2/3 分别对应 execute / loop_a / dispatch_lookup；构建期 injector 与运行期按此解析。
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -1709,6 +1867,9 @@ typedef struct {
 
 #if CPRISK_VM_THREADED_DISPATCH
 #if defined(__APPLE__)
+// 线程化构建的 CPSV v2 预留 manifest（CPRISK_CPSV2_BYTES 大小）。未注入时除 12 字节头外
+// 全为零，运行期 cprisk_cpsv2_parse 会因 UUID/范围不匹配而拒绝，不会误用半成品镜像。
+// 注意：host linker 已负责 8 字节 mdvsk 预留，不要再添加 C 侧贡献，否则段会被拼成 16 字节。
 __attribute__((used, section("__DATA," CPRISK_ARMOR_SECTION_VMP_SELF_SPANS)))
 #endif
 static const uint8_t cprisk_vm_selfchk_spans_i[CPRISK_CPSV2_BYTES] = {
@@ -1721,6 +1882,9 @@ static const uint8_t cprisk_vm_selfchk_spans_i[CPRISK_CPSV2_BYTES] = {
 #define CPRISK_VM_SELFCHK_SPAN_SECTION_ATTR "__DATA," CPRISK_ARMOR_SECTION_VMP_SELF_SPANS
 __attribute__((used, section(CPRISK_VM_SELFCHK_SPAN_SECTION_ATTR)))
 #endif
+// 非线程化构建的静态自检窗口布局（__swift5_mdvsi）。三个 entry 依次覆盖 execute、
+// interp_loop_a 与 dispatch_lookup；总长由 CPRISK_VM_M3_SELF_BYTES 固定，injector 会按
+// 同一 symtab 布局生成期望值。指针在链接后由加载器重定位为真实地址。
 static const struct {
     cprisk_vm_selfchk_span_header_t header;
     cprisk_vm_selfchk_span_entry_t entries[3];
@@ -1744,10 +1908,14 @@ static const struct {
     },
 };
 
+// 锁定 CPSV blob 的 64 字节 ABI；字段、顺序或填充的任何变化都必须同步构建期 injector。
 _Static_assert(sizeof(cprisk_vm_selfchk_spans_i) == 64u, "CPSV (__swift5_mdvsi) blob size must match ABI");
 
 #endif
 
+// 解析运行期 __DATA,__swift5_mdvsi 中的 self-span 布局：要求 magic/version/count==3、
+// 条目非空，且总长度恰好等于编译期 CPRISK_VM_M3_SELF_BYTES；否则返回 0，
+// 调用方回退到“直接按符号地址取三段代码”的 legacy 布局。
 static int cprisk_vm_selfchk_span_layout_resolve_i(const struct mach_header_64 *mh,
                                                    const cprisk_vm_selfchk_span_entry_t **out_entries,
                                                    uint32_t *out_count,
@@ -1803,6 +1971,8 @@ static int cprisk_vm_selfchk_span_layout_resolve_i(const struct mach_header_64 *
  * If `__swift5_mdvsi` is present, it must match the compile-time CPSV blob (tamper / drift detection).
  * Absent section: OK (legacy layout path).
  */
+// 若镜像中存在 CPSV 段，则必须与静态 blob 完全一致（magic/version/count、三个地址、
+// 三个长度与 kind 顺序）。段缺失返回 0（允许旧布局）；大小或内容不符返回 -1（视为篡改）。
 static int cprisk_vm_m3_selfchk_cpsv_image_matches_static_i(const struct mach_header_64 *mh) {
     unsigned long sz = 0;
     const uint8_t *p =
@@ -1833,6 +2003,8 @@ static int cprisk_vm_m3_selfchk_cpsv_image_matches_static_i(const struct mach_he
 }
 #endif
 
+// 旧布局的消息收集：按编译期常量分别从 execute / loop_a / dispatch_lookup 拷贝代码字节。
+// 若 SELF_INCLUDE_LOOP=0，则只覆盖 execute 一段，其余字节保持调用方的零初始化。
 static void cprisk_vm_selfchk_legacy_collect_msg_i(uint8_t msg[CPRISK_VM_M3_SELF_BYTES]) {
 #if CPRISK_VM_M3_SELF_INCLUDE_LOOP
     memcpy(msg, (const void *)&cprisk_vm_execute, (size_t)CPRISK_VM_M3_SELF_EXEC_BYTES);
@@ -1849,6 +2021,8 @@ static void cprisk_vm_selfchk_legacy_collect_msg_i(uint8_t msg[CPRISK_VM_M3_SELF
 #endif
 }
 
+// 优先使用运行期解析到的 span 布局拼接消息（覆盖实际链接后的代码）；解析失败或总长
+// 不符时回退 legacy 符号布局。调用方必须提供 CPRISK_VM_M3_SELF_BYTES 大小的缓冲区。
 static void cprisk_vm_selfchk_collect_msg_i(const struct mach_header_64 *hdr,
                                             uint8_t msg[CPRISK_VM_M3_SELF_BYTES]) {
     const cprisk_vm_selfchk_span_entry_t *entries = NULL;
@@ -1867,6 +2041,7 @@ static void cprisk_vm_selfchk_collect_msg_i(const struct mach_header_64 *hdr,
     cprisk_vm_selfchk_legacy_collect_msg_i(msg);
 }
 
+// 计算当前镜像中自检窗口的 FNV 值：span 布局可用时逐段续算，否则按 legacy 符号逐段续算。
 static uint32_t cprisk_vm_selfchk_observed_fnv_i(const struct mach_header_64 *hdr) {
     const cprisk_vm_selfchk_span_entry_t *entries = NULL;
     uint32_t count = 0u;
@@ -1909,6 +2084,8 @@ static uint32_t cprisk_vm_selfchk_observed_fnv_i(const struct mach_header_64 *hd
 #endif
 }
 
+// 把 32 位摘要扩展成非零 64 位 seal mix；该值会异或进 immediate/opcode 种子，
+// 从而把“自检是否通过”与后续解码绑定在一起。
 static uint64_t cprisk_vm_m3_seal_mix_from_digest_u32_i(uint32_t d) {
     uint64_t x = (uint64_t)d ^ ((uint64_t)d << 32);
     x ^= 0xC6A4A7935BD1E995ULL;
@@ -1923,6 +2100,8 @@ static uint64_t cprisk_vm_m3_seal_mix_from_digest_u32_i(uint32_t d) {
  * Bait handlers: wrong VM semantics, only referenced from provably-dead branches.
  * Kept out-of-line so the CFG shows distinct "handler" targets under disassembly.
  */
+// M3 死代码诱饵：只在可证明不可达的分支里被调用，故意用错误的 VM 语义改写 acc。
+// noinline 让反汇编中出现彼此独立的“handler”目标，干扰基于 CFG 的识别。
 __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_xor_i(uint8_t acc[32], uint32_t seed, uint32_t lane) {
     uint32_t x = (seed * 0x9E3779B9u) ^ (lane * 0x85EBCA6Bu);
     uint8_t scratch[32];
@@ -1934,6 +2113,7 @@ __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_xor_i(uint8_t acc[3
     }
 }
 
+// 诱饵变体：伪加法 + 局部 scratch，产生看似合法的累加器写操作。
 __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_add_i(uint8_t acc[32], uint32_t seed, uint32_t lane) {
     uint32_t x = seed + lane * 0x27d4eb2du;
     uint8_t scratch[16] = {0};
@@ -1944,6 +2124,7 @@ __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_add_i(uint8_t acc[3
     }
 }
 
+// 诱饵变体：以 seed 为旋转量重排 acc，并混入逐字节加法。
 __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_roll_i(uint8_t acc[32], uint32_t seed) {
     unsigned rot = (unsigned)(seed & 31u);
     uint8_t t[32];
@@ -1955,6 +2136,7 @@ __attribute__((noinline)) static void cprisk_vm_m3_dead_bait_roll_i(uint8_t acc[
     }
 }
 
+// 诱饵变体：保存/恢复 acc（净效果为恒等），中间做 4 lane 重型混合以拉长 trace。
 __attribute__((noinline)) static void cprisk_vm_m3_dead_heavy_shadow_i(uint8_t acc[32], uint32_t seed) {
     uint8_t save[32];
     memcpy(save, acc, sizeof(save));
@@ -1987,8 +2169,12 @@ __attribute__((noinline)) static void cprisk_vm_m3_dead_heavy_shadow_i(uint8_t a
  * arm entirely, removing the very decoy work units that obscure the
  * dispatcher's shape from a tracer.
  */
+// 死处理器诱饵：正常字节码永远不会到达；只在 dispatch 的 default（毒化 opcode）分支被引用。
+// 故意不标 noreturn，避免优化器删除 fall-through 臂，从而保留这些诱饵工作单元。
 static void cprisk_vm_m3_dead_dispatch_i(uint8_t acc[32], uint32_t hdr_reserved, uint32_t opkind);
 
+// 只读段诱饵表：字段看起来像 handler RVA / 流密码 / class tag，但都不是可执行指针。
+// 仅参与 opaque/relro 混合（cprisk_vmp_relro_bait_mix_i），使静态数据扫描难以区分真假分发表。
 static const struct {
     uint64_t faux_text_rva;
     uint64_t stream_xor;
@@ -2025,6 +2211,8 @@ typedef struct {
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA_CONST,__const")))
 #endif
+// 诱饵 handler 元数据：把真实函数地址与 bias/salt/rotate/class tag 绑定，让这些函数体
+// 在最终二进制中保持“活”的形态；元数据只用于派生混淆 seed，不改变 VM 语义。
 static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_meta_i[] = {
     { (const void *)&cprisk_vm_m3_dead_bait_xor_i, UINT64_C(0x6A09E667F3BCC909), 0x9E3779B9u, 5u, 0x22010031u, 0x00100020u },
     { (const void *)&cprisk_vm_m3_dead_bait_add_i, UINT64_C(0xBB67AE8584CAA73B), 0x85EBCA6Bu, 11u, 0x22020042u, 0x00180028u },
@@ -2039,6 +2227,7 @@ static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_meta_i[] = {
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA_CONST,__const")))
 #endif
+// 辅助诱饵集：额外的 entry/execute 变体，扩大可疑“分发表”的候选面。
 static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_aux_meta_i[] = {
     { (const void *)&cprisk_vm_entry, UINT64_C(0x243F6A8885A308D3), 0x31415927u, 7u, 0x31010011u, 0x00080018u },
     { (const void *)&cprisk_vm_entry_alt1, UINT64_C(0x13198A2E03707344), 0x27182818u, 13u, 0x31020022u, 0x00100020u },
@@ -2049,6 +2238,7 @@ static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_aux_meta_i[]
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA_CONST,__const")))
 #endif
+// lane 诱饵集：包含三个 lane 的 prepare/finish/loop 变体，诱导分析者误判真正入口。
 static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_lane_meta_i[] = {
     { (const void *)&cprisk_vm_execute_lane0_i, UINT64_C(0x0D6D0185A8B3C4D7), 0x4CF5AD43u, 6u, 0x41010051u, 0x00200060u },
     { (const void *)&cprisk_vm_execute_lane1_i, UINT64_C(0x1F2E3D4C5B6A7988), 0x9B9773E1u, 10u, 0x41020062u, 0x00280068u },
@@ -2063,6 +2253,7 @@ static const cprisk_vm_dispatch_bait_meta_t cprisk_vm_dispatch_bait_lane_meta_i[
     { (const void *)&cprisk_vm_dispatch_oph_materialized_i, UINT64_C(0x778899AABBCCDDEE), 0x85EBCA6Bu, 4u, 0x440200FBu, 0x007000B0u },
 };
 
+// 把一张诱饵元数据表压成 32 位混合值；target 地址也参与，但输出只用作 opaque seed。
 static uint32_t cprisk_vm_dispatch_bait_meta_mix_i(const cprisk_vm_dispatch_bait_meta_t *meta,
                                                    size_t count,
                                                    uint32_t basis) {
@@ -2085,6 +2276,7 @@ static uint32_t cprisk_vm_dispatch_bait_meta_mix_i(const cprisk_vm_dispatch_bait
     return cprisk_vmp_avalanche32_i(acc ^ (uint32_t)count * 0x27D4EB2Du);
 }
 
+// 汇总 relro 诱饵与三张诱饵元数据表的混合值；结果进入 opaque 状态，绝不影响 acc 语义。
 static uint32_t cprisk_vmp_relro_bait_mix_i(void) {
     uint32_t acc = 0u;
     for (size_t i = 0u; i < sizeof(cprisk_vmp_relro_handler_decoy) / sizeof(cprisk_vmp_relro_handler_decoy[0]); i++) {
@@ -2129,6 +2321,7 @@ static uint32_t cprisk_vmp_relro_bait_mix_i(void) {
     return cprisk_vmp_avalanche32_i(acc ^ 0xC3EF4D27u);
 }
 
+// 根据 opkind 选择并执行一组诱饵 handler；仅在死分支调用，用于制造伪 handler 轨迹。
 static void cprisk_vm_m3_dead_dispatch_i(uint8_t acc[32], uint32_t hdr_reserved, uint32_t opkind) {
     uint32_t dseed = (hdr_reserved >> 16) & 0xFFu;
     switch (opkind % 6u) {
@@ -2156,6 +2349,8 @@ static void cprisk_vm_m3_dead_dispatch_i(uint8_t acc[32], uint32_t hdr_reserved,
     }
 }
 
+// 由 lane/logical 选择诱饵表项并混合成 32 位 seed。仅服务于 opaque/relro 状态与自检布局，
+// 不参与任何 PC/acc 语义；不同 lane/op 得到不同 seed，避免被单一常量指纹识别。
 static uint32_t cprisk_vm_dispatch_bait_seed_i(uint32_t lane, uint32_t logical) {
     const cprisk_vm_dispatch_bait_meta_t *meta =
         &cprisk_vm_dispatch_bait_meta_i[
@@ -2207,6 +2402,7 @@ static uint32_t cprisk_vm_dispatch_bait_seed_i(uint32_t lane, uint32_t logical) 
     return cprisk_vmp_avalanche32_i((uint32_t)x ^ (uint32_t)(x >> 32u));
 }
 
+// 定位 dispatch 类别表：V1 紧跟头部；V2 头部后还有 8 字节 keystream 种子，需要跳过。
 static const uint8_t *cprisk_vmp_dispatch_class_table_ptr_i(const uint8_t *d_sec,
                                                             const cprisk_vmp_dispatch_header_t *dh) {
     if (!d_sec || !dh)
@@ -2217,6 +2413,8 @@ static const uint8_t *cprisk_vmp_dispatch_class_table_ptr_i(const uint8_t *d_sec
 }
 
 /* P0: one-shot keystream for dispatch v2 (build-time seed parity with VMBytecodeEmitter.dispatchKeystreamBytes). */
+// V2 类别表的一次性 keystream（构建期与 injector 对齐的产物）。当前运行期实际走
+// fill_cache 内的增量实现；本函数保留用于 ABI/测试对照，标 unused 以免被误用。
 static void __attribute__((unused)) cprisk_vmp_dispatch_v2_keystream_i(uint64_t seed,
                                                uint8_t ks_out[CPRISK_VMP_CLASS_TABLE_BYTES]) {
     uint64_t state = seed ^ 0x4D4456544B455953ULL; /* "MDVTKEYS" */
@@ -2226,6 +2424,8 @@ static void __attribute__((unused)) cprisk_vmp_dispatch_v2_keystream_i(uint64_t 
         ks_out[i] = (uint8_t)cprisk_splitmix64_next_i(&state);
 }
 
+// 仅当 dispatch 版本为 V2 且置 CLASS_TABLE_KEYSTREAM 时返回表后 8 字节种子；否则返回 0，
+// 表示类别表按明文（V1）处理。
 static uint64_t cprisk_vmp_dispatch_keystream_seed_i(const uint8_t *d_sec,
                                                      const cprisk_vmp_dispatch_header_t *dh) {
     if (!d_sec || !dh)
@@ -2237,6 +2437,8 @@ static uint64_t cprisk_vmp_dispatch_keystream_seed_i(const uint8_t *d_sec,
     return cprisk_read_le_u64_i(d_sec + sizeof(cprisk_vmp_dispatch_header_t));
 }
 
+// 解码故障注入：fault_mask == 0 是“无故障”哨兵，直接返回 0（异或后不改变数据）。
+// 非零时用 SplitMix64 派生一个字节，逐指令扰动 opcode/imm，使补丁与单步执行难以对齐语义。
 static uint8_t cprisk_vmp_dispatch_fault_byte_i(uint64_t fault_mask,
                                                 uint64_t func_id,
                                                 uint32_t pc_index,
@@ -2252,6 +2454,7 @@ static uint8_t cprisk_vmp_dispatch_fault_byte_i(uint64_t fault_mask,
     return (uint8_t)cprisk_splitmix64_next_i(&state);
 }
 
+// opcode 域的故障字节：先混入域常量再委托 dispatch_fault_byte，保持 0 哨兵语义不变。
 static uint8_t cprisk_vmp_opcode_fault_byte_i(uint64_t fault_mask,
                                               uint64_t func_id,
                                               uint32_t pc_index,
@@ -2267,6 +2470,7 @@ static uint8_t cprisk_vmp_opcode_fault_byte_i(uint64_t fault_mask,
     );
 }
 
+// immediate 域的 64 位故障掩码；同样保留 0 哨兵。
 static uint64_t cprisk_vmp_imm_fault_mask_u64_i(uint64_t fault_mask,
                                                 uint64_t func_id,
                                                 uint32_t pc_index) {
@@ -2281,6 +2485,8 @@ static uint64_t cprisk_vmp_imm_fault_mask_u64_i(uint64_t fault_mask,
 }
 
 /* P1: per-instruction immediate mask (bytecode v3 parity with VMBytecodeEmitter.immediateXorMask). */
+// V3 每指令 immediate 的 XOR keystream，与构建期 emitter 的 immediateXorMask 对齐。
+// 状态为 0 时替换成固定非零值，避免 SplitMix 退化。
 static uint64_t cprisk_vmp_imm_mask_u64_i(uint64_t func_id,
                                           uint32_t pc_index,
                                           uint64_t seed_root) {
@@ -2291,6 +2497,7 @@ static uint64_t cprisk_vmp_imm_mask_u64_i(uint64_t func_id,
 }
 
 /* P1: wire opcode byte XOR (build/runtime parity with VMBytecodeEmitter.opcodeMixByte). */
+// V3 每指令 opcode 字节的 XOR 掩码，与 emitter 的 opcodeMixByte 对齐。
 static uint8_t cprisk_vmp_opcode_mix_byte_i(uint64_t func_id, uint32_t pc_index, uint64_t opcode_seed_root) {
     uint64_t state = func_id ^ (uint64_t)pc_index ^ opcode_seed_root ^ 0x4F50434D49583152ULL; /* "OPCMIX1R" */
     if (state == 0u)
@@ -2299,6 +2506,8 @@ static uint8_t cprisk_vmp_opcode_mix_byte_i(uint64_t func_id, uint32_t pc_index,
 }
 
 /* Extra immediate scrub for rawRegion when dispatch marks opaque VPC category (paired with emitter). */
+// RAW_REGION 的附加 lane 掩码（当 dispatch 标记 opaque VPC 类别时与 emitter 配对），
+// 作为绑定根参与混淆；不改变 acc 语义。
 uint64_t cprisk_vmp_raw_lane_mask_u64_i(uint64_t func_id, uint32_t pc_index, uint64_t bind_root) {
     uint64_t state = func_id ^ (uint64_t)pc_index ^ bind_root ^ 0x5241574C4E4D3130ULL; /* "RAWLNM10" */
     if (state == 0u)
@@ -2306,6 +2515,7 @@ uint64_t cprisk_vmp_raw_lane_mask_u64_i(uint64_t func_id, uint32_t pc_index, uin
     return cprisk_splitmix64_next_i(&state);
 }
 
+// 自检失败时的 acc 污染：用 func_id 与字节位置派生噪声，保证失败结果不会与正常输出混淆。
 static void cprisk_vm_self_fail_acc_i(uint8_t acc[32], uint64_t func_id) {
     for (unsigned i = 0; i < 32u; i++) {
         uint8_t b = (uint8_t)(0xC3u ^ (unsigned)(func_id >> (i & 15u)) ^ (i * 0x1Du));
@@ -2313,6 +2523,7 @@ static void cprisk_vm_self_fail_acc_i(uint8_t acc[32], uint64_t func_id) {
     }
 }
 
+// 解析编译期常量或 __DATA 中的 CPSF（FNV 期望）blob；都不存在时返回 0（表示无期望）。
 static uint32_t cprisk_vm_m3_self_expect_resolve_i(const struct mach_header_64 *mh) {
 #if CPRISK_VM_M3_SELF_EXPECT != 0u
     (void)mh;
@@ -2331,6 +2542,7 @@ static uint32_t cprisk_vm_m3_self_expect_resolve_i(const struct mach_header_64 *
 #endif
 }
 
+// 解析 CPSH（MAC 期望）blob：在段内前 128 字节按 4 字节步长搜索 magic；找不到返回 0。
 static uint32_t cprisk_vm_m3_self_expect_mac_resolve_i(const struct mach_header_64 *mh) {
 #if CPRISK_VM_M3_SELF_EXPECT != 0u
     (void)mh;
@@ -2350,6 +2562,8 @@ static uint32_t cprisk_vm_m3_self_expect_mac_resolve_i(const struct mach_header_
 #endif
 }
 
+// 自检 MAC 的 KDF：SHA256(runtime_material || label)，label 以 XOR 0x5A 存盘。
+// 不绑定 session key，因为构建期 CPSH 期望是固定的；绑定会话会导致每次运行都失败。
 static void cprisk_vm_selfchk_mac_key_i(const uint8_t runtime_mat[32], uint8_t key_out[32]) {
     /*
      * KDF: SHA256( runtime_mat || decode(label) )
@@ -2370,6 +2584,8 @@ static void cprisk_vm_selfchk_mac_key_i(const uint8_t runtime_mat[32], uint8_t k
     cprisk_secure_zero(buf, sizeof(buf));
 }
 
+// 自检失败的故障掩码：混入 func_id/头部/期望/实测 + runtime material + session_mix，
+// 保证非零并作为后续 decode 的 fault 输入（0 表示无故障，必须避免）。
 static uint64_t cprisk_vm_selfchk_fault_mask_i(uint64_t func_id,
                                                uint32_t hdr_reserved,
                                                uint32_t expected_tag,
@@ -2396,9 +2612,15 @@ static uint64_t cprisk_vm_selfchk_fault_mask_i(uint64_t func_id,
 }
 
 #if CPRISK_VM_THREADED_DISPATCH
+// 线程化分发的 CPSV v2 运行时实现：包含 cpsv2 观测/期望解析与 lane 线程调度。
 #include "cprisk_vm_cpsv2_runtime.inc"
 #endif
 
+// M3 入口自检：
+// - 线程化构建：无条件要求 CPSV2 段与期望值一致，不做 v1/FNV 回退；
+// - 传统构建：仅当字节码置 M3_SELFCHK 时执行，可选用 MAC 或 FNV。
+// 成功时写 seal_mix（>0）；失败时置 SELF_INTEGRITY|BYTECODE、污染 acc 并写非零 fault_mask。
+// out_fault_mask/out_seal_mix 允许为 NULL；两者都非 NULL 时才同步失败 seal。
 static void cprisk_vm_m3_selfchk_run_i(const struct mach_header_64 *hdr,
                                        uint8_t acc[32],
                                        uint64_t func_id,
@@ -2515,6 +2737,8 @@ static void cprisk_vm_m3_selfchk_run_i(const struct mach_header_64 *hdr,
     }
 }
 
+// 失败/提前返回路径的收尾：把当前 acc 复制到结果、清空 aux，并跑一次 domain-5 白盒变换。
+// 白盒返回非 0 时保留原 acc，只记录 rc；返回 0 时用变换结果替换 acc。
 static void cprisk_vm_wb_finalize_i(cprisk_vm_run_result_t *out, uint8_t acc[32]) {
     memcpy(out->acc, acc, sizeof(out->acc));
     memset(out->acc_aux, 0, sizeof(out->acc_aux));
@@ -2525,24 +2749,31 @@ static void cprisk_vm_wb_finalize_i(cprisk_vm_run_result_t *out, uint8_t acc[32]
         memcpy(out->acc, wb_out, sizeof(wb_out));
 }
 
+// 主循环标记函数：noinline + volatile，仅用于在二进制中形成稳定、可被自检窗口覆盖的
+// 代码形状，不参与语义。三个 lane 各调用一个，以拉开控制流布局。
 __attribute__((noinline)) static void cprisk_vm_interp_core_marker0_i(void) {
     volatile uint32_t q = 0xC0u;
     q ^= (q << 3);
     (void)q;
 }
 
+// 标记函数 1：与 marker0 同职责，换一组常数以形成不同代码形状。
 __attribute__((noinline)) static void cprisk_vm_interp_core_marker1_i(void) {
     volatile uint32_t q = 0xC1u;
     q = (q * 7u) ^ 0x9E3779B9u;
     (void)q;
 }
 
+// 标记函数 2：与 marker0 同职责，换一组运算以形成不同代码形状。
 __attribute__((noinline)) static void cprisk_vm_interp_core_marker2_i(void) {
     volatile uint32_t q = 0xC2u;
     q |= (q >> 1);
     (void)q;
 }
 
+// 反符号执行副作用：用 session/func/imm/pc/steps 派生状态，改写 trace_shadow/trace_scratch
+// 与 vregs，但最后恢复 acc 与 vregs 的原值 —— 对语义状态是恒等变换，只留下难以切片的轨迹。
+// 仅在 m3_dead 或 anti_symbolic_heavy 时调用。
 static void cprisk_vm_trace_sidefx_i(cprisk_vm_interp_frame_t *fr,
                                      uint32_t logical,
                                      uint64_t imm,
@@ -2595,6 +2826,7 @@ static void cprisk_vm_trace_sidefx_i(cprisk_vm_interp_frame_t *fr,
  * execution history, forcing AI to perfectly track all prior steps.
  * The mix feeds back into opaque_chain for deeper path dependence.
  */
+// 把最近一次 opcode/pc/hvar/acc 摘要滚入 opaque_chain，使后续 opaque 谓词依赖完整执行历史。
 static void cprisk_vm_history_acc_mix_i(cprisk_vm_interp_frame_t *fr, uint32_t pc, uint32_t hvar) {
     if (!fr || !fr->vm_anti_symbolic_heavy)
         return;
@@ -2615,6 +2847,9 @@ static void cprisk_vm_history_acc_mix_i(cprisk_vm_interp_frame_t *fr, uint32_t p
  * Bytecode hash (when enabled) or raw_bind_root mixes into the fork id so symbolic tools see
  * opaque predicates; self-inverse XOR keeps semantics out of \c fr->acc.
  */
+// 反符号 fork：派生 0..31 的 fork id，再执行 16 个 trace 变形分支。
+// 所有分支只读写 trace_shadow/trace_scratch，不改变 acc/vregs；部分分支成对自消，
+// 部分分支留下一次性的伪状态，用于向符号执行器暴露假的中间状态迁移。
 static void cprisk_vm_antisy_equiv_fork_i(cprisk_vm_interp_frame_t *fr, uint32_t pc, uint32_t hvar) {
     if (!fr) {
         return;
@@ -2797,6 +3032,9 @@ static void cprisk_vm_antisy_equiv_fork_i(cprisk_vm_interp_frame_t *fr, uint32_t
     (void)scratch;
 }
 
+// lane 级数学噪声：仅在 anti_symbolic_heavy、semantic_family 达标且步数命中周期时运行。
+// 使用模 251 的指数/多项式/CRT 计算生成 mix，但所有 trace 更新都成对自消（净效果恒等），
+// 不读写 acc；key 低 2 位非 0 时直接跳过，进一步稀疏化。
 void cprisk_vm_diophantine_lane_poly_sidefx_i(cprisk_vm_interp_frame_t *fr,
                                               uint32_t family,
                                               uint64_t imm,
@@ -2884,6 +3122,9 @@ void cprisk_vm_diophantine_lane_poly_sidefx_i(cprisk_vm_interp_frame_t *fr,
  * All paths are semantically equivalent (self-inverse on trace state only, acc untouched).
  * LLMs will "hallucinate" solutions to these predicates and mislead attackers.
  */
+// 每 8 步执行一次的 Diophantine opaque 块：Fermat / Collatz / Euler / Wilson / 二次剩余 /
+// GF(251) 多项式 / 平方和搜索。volatile 中间量阻止优化器删除；所有分支只影响 trace 状态，
+// 不读写 acc。目的：让 LLM/符号引擎“算出”看似有意义的谓词，从而误导自动化分析。
 static void cprisk_vm_diophantine_opaque_i(cprisk_vm_interp_frame_t *fr, uint32_t pc, uint32_t hvar) {
     if (!fr)
         return;
@@ -3067,6 +3308,8 @@ static void cprisk_vm_diophantine_opaque_i(cprisk_vm_interp_frame_t *fr, uint32_
     (void)work;
 }
 
+// lane0 收尾：合并 acc/acc_aux（session_mix ^ steps 作 salt），导出 vregs/steps，
+// 再跑一次 domain-5 白盒变换。
 static void cprisk_vm_interp_finish_run_lane0_i(cprisk_vm_interp_frame_t *fr) {
     cprisk_vm_merge_banks_i(fr->out->acc, fr->acc, fr->acc_aux, fr->session_mix ^ (uint32_t)fr->steps);
     memcpy(fr->out->acc_aux, fr->acc_aux, sizeof(fr->acc_aux));
@@ -3079,6 +3322,7 @@ static void cprisk_vm_interp_finish_run_lane0_i(cprisk_vm_interp_frame_t *fr) {
         memcpy(fr->out->acc, wb_out, sizeof(wb_out));
 }
 
+// lane1 收尾：用 session_mix ^ opaque_chain 合并两个 bank；白盒结果仅在 rc == 0 时覆盖 acc。
 static void cprisk_vm_interp_finish_run_lane1_i(cprisk_vm_interp_frame_t *fr) {
     uint8_t wb_out[32];
     uint8_t merged[32];
@@ -3093,6 +3337,7 @@ static void cprisk_vm_interp_finish_run_lane1_i(cprisk_vm_interp_frame_t *fr) {
         memcpy(fr->out->acc, wb_out, sizeof(wb_out));
 }
 
+// lane2 收尾：用 opaque_session_mix ^ session_mix 合并 bank，做一次恒等的 lane 触碰后导出。
 static void cprisk_vm_interp_finish_run_lane2_i(cprisk_vm_interp_frame_t *fr) {
     uint8_t lane_acc[32];
     cprisk_vm_merge_banks_i(lane_acc, fr->acc, fr->acc_aux, fr->opaque_session_mix ^ fr->session_mix);
@@ -3108,8 +3353,15 @@ static void cprisk_vm_interp_finish_run_lane2_i(cprisk_vm_interp_frame_t *fr) {
         memcpy(fr->out->acc, wb_out, sizeof(wb_out));
 }
 
+// 分段进入桩的前向声明：按缓存段号调用不同的 noinline stub，用于布局分散。
 static void cprisk_vm_dispatch_cache_segment_enter_i(uint32_t base);
 
+// 填充 dispatch 类别表缓存：base 对齐到 32 项边界，最多解码 32 项。
+// - V1：表内容即逻辑 opcode。
+// - V2 + KEYSTREAM：用 (dispatch_decode_seed, session_mix, vm_link_token) 初始化 SplitMix64，
+//   先跳过 base 个 keystream 字以对齐当前段，再逐项异或解密。
+// - payload 缺失时整段填 POISON，lookup 将得到毒化 opcode 而不是越界读取。
+// 缓存字段（base/count）只在本次填充后由 lookup 读取，单帧内没有并发。
 static void cprisk_vm_dispatch_fill_cache_i(cprisk_vm_interp_frame_t *fr, uint32_t op) {
     const uint8_t *payload = cprisk_vmp_dispatch_class_table_ptr_i(fr->dispatch_sec, fr->dispatch_hdr);
     const uint32_t base = op & ~(CPRISK_VM_DISPATCH_CACHE_BYTES - 1u);
@@ -3144,6 +3396,9 @@ static void cprisk_vm_dispatch_fill_cache_i(cprisk_vm_interp_frame_t *fr, uint32
     }
 }
 
+// 把 wire opcode 映射为逻辑 opcode：命中缓存直接取；未命中（空缓存/越界）先 refill。
+// 未覆盖到的位置返回 POISON，随后再叠加 decode_fault_mask 的逐指令扰动。
+// 返回值不一定落在有效表内，由 dispatch_oph_core 负责 POISON/unknown 判定。
 uint8_t cprisk_vm_dispatch_lookup(cprisk_vm_interp_frame_t *fr,
                                   uint32_t op,
                                   uint32_t pc_index) {
@@ -3161,6 +3416,7 @@ uint8_t cprisk_vm_dispatch_lookup(cprisk_vm_interp_frame_t *fr,
     return logical;
 }
 
+// dispatch cache 分段桩：按段号选择不同 noinline 空操作，打散 lookup 附近的代码布局。
 __attribute__((noinline)) static void cprisk_vm_dispatch_seg_stub0_i(void) {
     volatile uint32_t u = 0x30u;
     u ^= u << 2;
@@ -3182,6 +3438,7 @@ __attribute__((noinline)) static void cprisk_vm_dispatch_seg_stub3_i(void) {
     (void)u;
 }
 
+// 按 (base >> 6) & 3 选择并调用一个分段桩；无返回值、无副作用（仅布局/轨迹噪声）。
 static void cprisk_vm_dispatch_cache_segment_enter_i(uint32_t base) {
     typedef void (*stub_fn)(void);
     static const stub_fn stub[4] = {
@@ -3193,6 +3450,8 @@ static void cprisk_vm_dispatch_cache_segment_enter_i(uint32_t base) {
     stub[(base >> 6) & 3u]();
 }
 
+// Loop B 的 opcode 簇分散桩：按逻辑 opcode 所属簇调用不同 noinline 空操作，
+// 使不同 opcode 的调用边在二进制中更分散，纯布局用途。
 __attribute__((noinline)) static void cprisk_vm_lg_spread0_i(void) {
     volatile int q = 0;
     (void)q;
@@ -3226,6 +3485,8 @@ __attribute__((noinline)) static void cprisk_vm_lg_spread7_i(void) {
     (void)q;
 }
 
+// 把逻辑 opcode 归入 8 个执行簇（0=控制/终止，1=基础，2=算术，3=分支，4=位运算，
+// 5=vreg，6=嵌套调用，7=其余）。仅用于选择分布桩，不影响执行。
 static uint32_t cprisk_vm_interp_loop_b_cluster_slot_i(uint8_t logical) {
     if (logical == CPRISK_VM_OP_POISON || logical == CPRISK_VM_OP_HALT)
         return 0u;
@@ -3246,6 +3507,7 @@ static uint32_t cprisk_vm_interp_loop_b_cluster_slot_i(uint8_t logical) {
     return 7u;
 }
 
+// 按 cluster_slot 调用对应分布桩；无返回值、无语义副作用。
 static void cprisk_vm_interp_loop_b_cluster_spread_i(uint8_t logical) {
     typedef void (*stub_fn)(void);
     static const stub_fn tbl[8] = {
@@ -3261,6 +3523,7 @@ static void cprisk_vm_interp_loop_b_cluster_spread_i(uint8_t logical) {
     tbl[cprisk_vm_interp_loop_b_cluster_slot_i(logical) & 7u]();
 }
 
+// 对任意内存块做字节级混合（含长度与轮转），用于把 pthread_t 等结构体字节纳入 opaque 种子。
 static uint32_t cprisk_vm_opaque_bytes_mix_i(const void *ptr, size_t len, uint32_t seed) {
     const uint8_t *bytes = (const uint8_t *)ptr;
     uint32_t acc = seed ^ 0xA511E9B3u;
@@ -3272,6 +3535,8 @@ static uint32_t cprisk_vm_opaque_bytes_mix_i(const void *ptr, size_t len, uint32
     return cprisk_vmp_avalanche32_i(acc ^ ((uint32_t)len * 0x9E3779B9u));
 }
 
+// 运行期“契约”混合：把 opaque_* 字段、诱饵 seed、syscall 返回值/错误码、线程与时钟状态
+// 压成一个 32 位值。所有可变输入都参与，但输出只进入 opaque/session 状态。
 static uint32_t cprisk_vm_opaque_runtime_contract_mix_i(cprisk_vm_interp_frame_t *fr,
                                                         uint32_t logical,
                                                         uint32_t pc,
@@ -3321,6 +3586,9 @@ static uint32_t cprisk_vm_opaque_runtime_contract_mix_i(cprisk_vm_interp_frame_t
     return mix;
 }
 
+// 探测运行期环境（pid、单调/墙上时钟、线程 id、mach thread port）并把成功/失败编码进混合值。
+// 关键点：syscall 失败不改变控制流，只把 rc 混入状态，避免错误注入制造可预测分支。
+// 同时刷新 opaque_pid/clock_rc/port_rc/clock_ns/port_name 等字段，供后续契约混合使用。
 static uint32_t cprisk_vm_opaque_runtime_probe_i(cprisk_vm_interp_frame_t *fr,
                                                  uint32_t logical,
                                                  uint32_t pc,
@@ -3456,6 +3724,8 @@ static uint32_t cprisk_vm_opaque_runtime_probe_i(cprisk_vm_interp_frame_t *fr,
     );
 }
 
+// 初始化 opaque 子系统：由 session/path/func 与诱饵 seed 派生 nonce、session/thread/fold/chain，
+// 再调用一次 probe 与 contract 注入运行期熵。最终 session_mix 也会被重混（保持非零）。
 static void cprisk_vm_opaque_runtime_init_i(cprisk_vm_interp_frame_t *fr) {
     uint32_t nonce = fr->session_mix ^ cprisk_vm_dispatch_bait_seed_i(fr->path_lane, 0u);
     fr->opaque_pid = 1;
@@ -3561,6 +3831,9 @@ static void cprisk_vm_opaque_runtime_init_i(cprisk_vm_interp_frame_t *fr) {
     );
 }
 
+// 推进 opaque 链：混合 runtime probe/contract、acc 摘要与 session 状态，更新
+// session_mix / opaque_rt_nonce / opaque_session_mix / opaque_runtime_fold / opaque_thread_mix，
+// 返回新的 opaque_chain。不修改 acc，也不推进 PC/steps。
 static uint32_t cprisk_vm_opaque_chain_advance_i(cprisk_vm_interp_frame_t *fr,
                                                  uint32_t logical,
                                                  uint64_t imm,
@@ -3676,6 +3949,11 @@ static uint32_t cprisk_vm_opaque_chain_advance_i(cprisk_vm_interp_frame_t *fr,
     return chain;
 }
 
+// opaque 死分支判定：先无条件推进 opaque 链（即使返回 0 也会改变混淆状态），再检查一组
+// 在 uint32/运行期语义下不可能成立的条件（例如 p + 0xFFFFFFFF == 0 且 p != 1）。
+// 这些条件在正常的 uint32/运行期语义下均不成立，设计上不会真正跳转；保留它们是为了让
+// CFG 与执行轨迹更复杂。
+// syscall/mach 的失败只被编码进掩码，不会改变返回值。
 static int cprisk_vm_opaque_dead_branch_i(cprisk_vm_interp_frame_t *fr,
                                           uint32_t logical,
                                           uint64_t imm,
@@ -3804,6 +4082,7 @@ static int cprisk_vm_opaque_dead_branch_i(cprisk_vm_interp_frame_t *fr,
 
 /* Opcode handlers live in \c cprisk_vm_oph_*.c; single-access materialization lives in \c cprisk_vm_oph_table.c. */
 
+// 32 字节比较：逐字节累积差异、不提前返回（降低时序侧信道），完全相等返回 1。
 static int cprisk_vm_ct_memeq32_i(const uint8_t *a, const uint8_t *b) {
     uint8_t d = 0;
     for (size_t i = 0; i < 32u; i++)
@@ -3811,6 +4090,8 @@ static int cprisk_vm_ct_memeq32_i(const uint8_t *a, const uint8_t *b) {
     return d == 0 ? 1 : 0;
 }
 
+// 构造白盒 PRF 的 32 字节输入：SHA256(acc || func_id || 状态混合值 || imm || vpc 打包)。
+// 输出只用于派生副作用/掩码，不回写 acc 语义。
 static void cprisk_vm_wb_sidefx_build_input_i(const cprisk_vm_interp_frame_t *fr,
                                               uint8_t logical,
                                               uint64_t imm,
@@ -3838,6 +4119,8 @@ static void cprisk_vm_wb_sidefx_build_input_i(const cprisk_vm_interp_frame_t *fr
     cprisk_sha256_final(&ctx, out32);
 }
 
+// 决定本步是否执行白盒副作用：m3_opaque 时每 32 步一次；常规每 WB_SIDE_PERIOD 步一次；
+// RET/HALT/VM_CALL_FUNC 边界强制执行（让收尾状态也被绑定）。
 static int cprisk_vm_wb_sidefx_should_run_i(const cprisk_vm_interp_frame_t *fr, uint8_t logical) {
     if (fr->m3_opaque != 0u) {
         if ((fr->steps & 31u) == 0u)
@@ -3855,6 +4138,8 @@ static int cprisk_vm_wb_sidefx_should_run_i(const cprisk_vm_interp_frame_t *fr, 
     }
 }
 
+// 把白盒输出拆成 4 个 32 位字，分别混入 opaque_chain / opaque_session_mix / opaque_rt_nonce
+// 与 session_mix，并保证 chain/session 非零。不改变 acc。
 static void cprisk_vm_wb_sidefx_apply_out_i(cprisk_vm_interp_frame_t *fr,
                                             uint8_t logical,
                                             const uint8_t wb_out[32]) {
@@ -3878,6 +4163,7 @@ static void cprisk_vm_wb_sidefx_apply_out_i(cprisk_vm_interp_frame_t *fr,
         fr->session_mix = 0x7F4A7C15u ^ (uint32_t)fr->steps;
 }
 
+// 白盒求值失败时的降级：只取输入摘要的两个字混入 chain/session，保证状态仍在推进。
 static void cprisk_vm_wb_sidefx_fallback_i(cprisk_vm_interp_frame_t *fr,
                                            uint8_t logical,
                                            const uint8_t digest[32]) {
@@ -3887,12 +4173,14 @@ static void cprisk_vm_wb_sidefx_fallback_i(cprisk_vm_interp_frame_t *fr,
     fr->session_mix = cprisk_vmp_avalanche32_i(fr->session_mix ^ w1 ^ (uint32_t)fr->steps);
 }
 
+// acc ^= xorv（32 字节）；XOR 自逆，因此同一掩码应用两次会恢复原值。
 static void cprisk_vm_xor_acc32_i(uint8_t acc[32], const uint8_t xorv[32]) {
     for (size_t i = 0u; i < 32u; i++)
         acc[i] ^= xorv[i];
 }
 
 /** Derive a full acc XOR mask from white-box output (diffusion; mask is self-inverse under XOR). */
+// 从白盒输出派生 32 字节 XOR 掩码：相邻字节与位置常量混合，掩码在 XOR 下自逆。
 static void cprisk_vm_wb_derive_xor_mask_from_wb_out_i(const uint8_t wb_out[32], uint8_t mask[32]) {
     for (size_t i = 0u; i < 32u; i++) {
         const size_t j = (i + 13u) % 32u;
@@ -3901,11 +4189,19 @@ static void cprisk_vm_wb_derive_xor_mask_from_wb_out_i(const uint8_t wb_out[32],
     }
 }
 
+// 只有 XOR_MIX 在 acc 语义路径上是 XOR 线性的，掩码应用两次可精确抵消；
+// 其他 opcode 若做同样的环绕会改变最终语义。
 static int cprisk_vm_logical_wb_xor_surround_eligible_i(uint8_t logical) {
     /** Only \c CPRISK_VM_OP_XOR_MIX is XOR-linear on the acc semantic path (mask cancels after handler). */
     return logical == CPRISK_VM_OP_XOR_MIX ? 1 : 0;
 }
 
+// opcode 分发的白盒包装层：
+// - 非 XOR_MIX：直接调用 materialized handler，再由 post_handler 做周期性白盒副作用；
+// - XOR_MIX：先用当前帧状态跑 domain-7 白盒 PRF，派生自逆 XOR 掩码并施加到 acc，
+//   执行真实 handler，再用同一掩码还原。由于 XOR_MIX 本身 XOR 线性，最终语义不变，
+//   但 acc 的中间值与会话绑定；vm_wb_inline_done 防止 post_handler 重复执行。
+// 返回 handler 的 flow（CONTINUE/LEAVE）。
 cprisk_vm_flow_t cprisk_vm_dispatch_leaf_wb_wrapped_i(cprisk_vm_interp_frame_t *fr,
                                                       uint8_t op_raw,
                                                       uint8_t logical,
@@ -3921,6 +4217,7 @@ cprisk_vm_flow_t cprisk_vm_dispatch_leaf_wb_wrapped_i(cprisk_vm_interp_frame_t *
      */
     if (cprisk_vm_logical_wb_xor_surround_eligible_i(logical) == 0) {
         const cprisk_vm_flow_t inner = materialized(fr, op_raw, logical, imm, pc, hvar);
+        // 非 XOR_MIX 路径：post_handler 可自由执行周期性白盒副作用，因此把 inline 标志清零。
         fr->vm_wb_inline_done = 0u;
         return cprisk_vm_oph_post_handler_i(fr, logical, imm, pc, hvar, inner);
     }
@@ -3952,6 +4249,11 @@ cprisk_vm_flow_t cprisk_vm_dispatch_leaf_wb_wrapped_i(cprisk_vm_interp_frame_t *
     return cprisk_vm_oph_post_handler_i(fr, logical, imm, pc, hvar, inner);
 }
 
+// 判断本步是否重算字节码段 SHA256：
+// - 未启用直接返回 0；
+// - 第 1 步强制检查，尽早发现运行期补丁；
+// - RET/HALT/VM_CALL_FUNC/BRANCH_IND 边界强制检查；
+// - 其余按 256 步周期，且距上次成功哈希至少 32 步（避免重复计算）。
 static int cprisk_vm_bc_seg_hash_should_check_i(const cprisk_vm_interp_frame_t *fr, uint8_t logical) {
     if (fr->bc_seg_hash_enabled == 0u)
         return 0;
@@ -3984,6 +4286,10 @@ static int cprisk_vm_bc_seg_hash_should_check_i(const cprisk_vm_interp_frame_t *
  * across toolchains or optimization levels. V1 omits this region; gated V2
  * measures and covers its full linked extent as roster kind 4. */
 __attribute__((noinline))
+// 所有 opcode handler 的统一后处理边界，顺序固定为：字节码哈希检查 → aux_step → 可选白盒副作用。
+// 哈希失配时写 INVALID_BYTECODE/POISON_BYTECODE、污染 acc 并返回 LEAVE（fail-closed）。
+// vm_wb_inline_done 为真时跳过白盒段（XOR_MIX 已在包装层执行过）。
+// noinline 保持独立代码区域，供 CPSV v2 按 span 度量；不保证跨工具链的字节大小。
 cprisk_vm_flow_t cprisk_vm_oph_post_handler_i(cprisk_vm_interp_frame_t *fr,
                                               uint8_t logical,
                                               uint64_t imm,
@@ -4032,6 +4338,10 @@ cprisk_vm_flow_t cprisk_vm_oph_post_handler_i(cprisk_vm_interp_frame_t *fr,
     return inner;
 }
 
+// 逻辑 opcode 的三级分发：
+// - POISON（0xFF）→ 毒化 handler；
+// - >= 24（OPH 表长）→ unknown handler；
+// - 其余 → 按族物化 handler（不暴露明文全局函数指针表）。
 static cprisk_vm_flow_t cprisk_vm_dispatch_oph_core_i(cprisk_vm_interp_frame_t *fr,
                                                       uint8_t op_raw,
                                                       uint8_t logical,
@@ -4045,10 +4355,17 @@ static cprisk_vm_flow_t cprisk_vm_dispatch_oph_core_i(cprisk_vm_interp_frame_t *
     return cprisk_vm_dispatch_oph_materialized_i(fr, op_raw, logical, imm, pc, hvar);
 }
 
+// 主解释循环 A（lane 0/默认路径）。每次迭代完成一条指令：取指 → 解密/解码 → 语义分发 → 执行。
+// 不变量：handler 负责推进 encoded_pc 与 steps；本循环只做预算检查、死分支/加固钩子与 flow 判定。
+// 退出条件：预算用尽、decode/边界校验失败（break，status 保持 STEP_LIMIT 或已写错误），
+// 或 handler 返回 CPRISK_VM_FLOW_LEAVE（goto vm_leave_a）。退出后统一走 lane0 finish。
 void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
 {
+    // 步数预算：step_limit_cap 在 prepare 阶段被随机收紧；用尽即结束，防止死循环/DoS。
     while (fr->steps < fr->step_limit_cap) {
+        // 每指令重置：默认由 post_handler 决定是否跑白盒；XOR_MIX 包装层会把它置 1。
         fr->vm_wb_inline_done = 0u;
+        // 按 lane 调用不同的标记函数，仅用于布局与自检形状。
         if (fr->path_lane == 0u) {
             cprisk_vm_interp_core_marker0_i();
         } else if (fr->path_lane == 1u) {
@@ -4063,6 +4380,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
             volatile uint32_t pl2 = (uint32_t)(fr->func_id >> 33) ^ (uint32_t)fr->steps;
             (void)(pl2 | 0u);
         }
+        // m3_opaque：在取指前插入 3 个恒假的 opaque 分支。条件理论上不可达；
+        // 即使可达也只是执行诱饵后 continue，且不推进 steps。
         if (fr->path_lane != 1u) {
             if (fr->m3_opaque != 0u) {
                 if (cprisk_vm_opaque_dead_branch_i(
@@ -4105,6 +4424,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
             }
         }
 
+        // 取指前先解码 encoded_pc，并检查 [pc, pc+9) 落在函数正文内；
+        // 任一失败都置 INVALID_BYTECODE/POISON_BYTECODE 并退出循环。
         uint32_t pc = 0u;
         if (!cprisk_vm_decode_pc_i(fr->bh, fr->encoded_pc, fr->vpc_a, fr->vpc_b, &pc, fr->out)) {
             break;
@@ -4165,21 +4486,27 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
             }
         }
 
+        // 取指与解码流水线：wire opcode 先解 opcode keystream，再叠加 fault 字节，
+        // 经 dispatch 类别表映射为逻辑 opcode；立即数按同样方式解密后再交给 handler。
         const uint8_t op_raw = fr->code[pc];
         uint8_t op = op_raw;
             const uint32_t pc_index = pc / CPRISK_VM_INSN_WIDTH;
         if (fr->enc_op != 0u) {
             op = (uint8_t)(op_raw ^ cprisk_vmp_opcode_mix_byte_i(fr->func_id, pc_index, fr->opcode_seed_root));
         }
+        // fault_mask == 0 时这一步是恒等变换（无故障哨兵）。
         op ^= cprisk_vmp_opcode_fault_byte_i(fr->decode_fault_mask, fr->func_id, pc_index, op_raw);
         fr->out->last_opcode = (uint32_t)op;
+        // 类别表映射：wire opcode → logical opcode；未覆盖项返回 POISON。
         const uint8_t logical = cprisk_vm_dispatch_lookup(fr, (uint32_t)op & 0xFFu, pc_index);
         fr->out->last_dispatch_class = (uint32_t)logical;
+        // 指令格式固定为 1 字节 opcode + 8 字节小端立即数；加密与故障掩码都在这里解开。
         uint64_t imm = cprisk_read_le_u64_i(fr->code + pc + 1u);
         if (fr->enc_imm != 0u) {
             imm ^= cprisk_vmp_imm_mask_u64_i(fr->func_id, pc_index, fr->imm_seed_root);
         }
         imm ^= cprisk_vmp_imm_fault_mask_u64_i(fr->decode_fault_mask, fr->func_id, pc_index);
+        // handler 变体号：与 semantic_family 的低 2 位混合，决定等价实现分支。
         const uint32_t hvar =
             cprisk_vm_handler_variant_i(fr->bh->reserved, fr->func_id, fr->steps, (uint32_t)op, imm)
             ^ ((fr->semantic_family & 0x3u) << 1u);
@@ -4192,6 +4519,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
             }
         }
 
+        // 反符号执行钩子：只在启用 dead handler 或 heavy 模式时维护 trace 状态；
+        // 这些状态不会改变 acc 语义。
         if (fr->m3_dead != 0u || fr->vm_anti_symbolic_heavy) {
             cprisk_vm_trace_sidefx_i(fr, (uint32_t)logical, imm, pc, hvar);
         }
@@ -4202,6 +4531,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
             cprisk_vm_diophantine_opaque_i(fr, pc, hvar);
         }
 
+        // 加固钩子顺序：解密当前块 → 完整性检查点 → 周期性的路径爆炸/假依赖/CFF 迁移/校验。
+        // 这些模块保证失败不崩溃；与语义相关的失败通过 poison/status 体现。
         /* -- Integrated hardening hooks -- */
         /* Task 3: verify bytecode block integrity before fetch */
         cprisk_vm_hardening_ondemand_decrypt(fr, pc);
@@ -4224,6 +4555,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
          * strong indicator that we are running inside unidbg — OR the flag
          * into emulator_flags and let the emulator_is_hostile check in the
          * hardening layer poison the result. */
+        // 同步屏障每 64 步引入一次外部数据依赖；若 watchdog 计数长期不动，
+        // 说明执行环境可能在批量指令模拟（如 unidbg），记录 emulator 标志并污染完整性链。
         if (cprisk_vm_sync_barrier_step(&fr->sync_barrier_ctx, fr->acc, pc)) {
             if (cprisk_vm_sync_barrier_watchdog_stuck(&fr->sync_barrier_ctx)) {
                 fr->emulator_flags |= CPRISK_EMU_FLAG_WATCHDOG_STUCK;
@@ -4234,6 +4567,8 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
         }
 
         {
+            // handler 自己负责推进 encoded_pc/steps；这里只看它是否要求退出。
+            // CONTINUE 回到循环顶部；LEAVE 跳到统一收尾。
             const cprisk_vm_flow_t flow =
                 cprisk_vm_dispatch_oph_core_i(fr, op, logical, imm, pc, hvar);
             if (flow == CPRISK_VM_FLOW_LEAVE)
@@ -4242,15 +4577,22 @@ void cprisk_vm_interp_loop_a(struct cprisk_vm_interp_frame *fr)
         }
 
     }
+// 统一退出点：合并 bank、导出 vregs/steps，并做 lane0 的白盒收尾。
 vm_leave_a:
     cprisk_vm_interp_finish_run_lane0_i(fr);
 }
 
 
+// 主解释循环 B（lane 1/2）。与 loop A 语义相同，但取指顺序（先 imm 后 opcode）、
+// 死分支标签、加固钩子间隔与布局分散调用都不同，用于抵抗跨 lane 的差分分析。
+// 退出条件与 loop A 一致；退出后按 lane 选择 lane1 或 lane2 的 finish。
 static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
 {
+    // 与 loop A 相同的步数预算；lane B 的预算同样来自 prepare 阶段的随机收紧。
     while (fr->steps < fr->step_limit_cap) {
+        // 与 loop A 相同的每指令白盒状态重置。
         fr->vm_wb_inline_done = 0u;
+        // lane 标记调用与 loop A 相同，仅布局用途。
         if (fr->path_lane == 0u) {
             cprisk_vm_interp_core_marker0_i();
         } else if (fr->path_lane == 1u) {
@@ -4267,6 +4609,7 @@ static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
             (void)(pl2 ^ pl2);
         }
         /* Loop B: different dead branch tags (0xA1, 0xB2, 0xC3) vs Loop A (0x11, 0x22, 0x33) */
+        // 与 loop A 同语义的 m3_opaque 死分支，但标签改为 0xA1/0xB2/0xC3。
         if (fr->path_lane != 1u) {
             if (fr->m3_opaque != 0u) {
                 if (cprisk_vm_opaque_dead_branch_i(
@@ -4309,6 +4652,7 @@ static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
             }
         }
 
+        // 解码 encoded_pc 并检查指令边界，规则与 loop A 相同。
         uint32_t pc = 0u;
         if (!cprisk_vm_decode_pc_i(fr->bh, fr->encoded_pc, fr->vpc_a, fr->vpc_b, &pc, fr->out)) {
             break;
@@ -4375,23 +4719,30 @@ static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
          * Loop B: alternate fetch/decode path — load immediate first, then opcode (semantically identical;
          * differs from loop A micro-order for static analysis / symbolic tooling).
          */
+        // loop B 特有：先取 immediate、再取 opcode（与 loop A 的微顺序相反），
+        // 并用一个 volatile 派生存量阻止优化器把两条路径合并。
         volatile uint64_t loop_b_fetch_tag = fr->encoded_pc ^ (fr->steps * 0x5F3759DFu);
         (void)loop_b_fetch_tag;
+        // 与 loop A 相同的 immediate 解密/故障注入，只是发生顺序更早。
         uint64_t imm = cprisk_read_le_u64_i(fr->code + pc + 1u);
         const uint32_t pc_index = pc / CPRISK_VM_INSN_WIDTH;
         if (fr->enc_imm != 0u) {
             imm ^= cprisk_vmp_imm_mask_u64_i(fr->func_id, pc_index, fr->imm_seed_root);
         }
         imm ^= cprisk_vmp_imm_fault_mask_u64_i(fr->decode_fault_mask, fr->func_id, pc_index);
+        // 与 loop A 相同的 opcode 解密/故障注入流程，只是排在 immediate 之后。
         const uint8_t op_raw = fr->code[pc];
         uint8_t op = op_raw;
         if (fr->enc_op != 0u) {
             op = (uint8_t)(op_raw ^ cprisk_vmp_opcode_mix_byte_i(fr->func_id, pc_index, fr->opcode_seed_root));
         }
+        // fault_mask 为 0 时保持恒等。
         op ^= cprisk_vmp_opcode_fault_byte_i(fr->decode_fault_mask, fr->func_id, pc_index, op_raw);
         fr->out->last_opcode = (uint32_t)op;
+        // 类别表映射与 loop A 相同；缓存按 32 项段复用。
         const uint8_t logical = cprisk_vm_dispatch_lookup(fr, (uint32_t)op & 0xFFu, pc_index);
         fr->out->last_dispatch_class = (uint32_t)logical;
+        // 与 loop A 相同的 handler 变体派生。
         const uint32_t hvar =
             cprisk_vm_handler_variant_i(fr->bh->reserved, fr->func_id, fr->steps, (uint32_t)op, imm)
             ^ ((fr->semantic_family & 0x3u) << 1u);
@@ -4436,6 +4787,7 @@ static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
             cprisk_vm_hardening_cff_verify(fr);
 
         {
+            // 与 loop A 相同：由 handler 推进状态，本循环只处理 CONTINUE/LEAVE。
             const cprisk_vm_flow_t flow =
                 cprisk_vm_dispatch_oph_core_i(fr, op, logical, imm, pc, hvar);
             if (flow == CPRISK_VM_FLOW_LEAVE)
@@ -4444,6 +4796,7 @@ static void cprisk_vm_interp_loop_b(struct cprisk_vm_interp_frame *fr)
         }
 
     }
+// 统一退出点：lane1 走 lane1 finish，其余（lane2）走 lane2 finish。
 vm_leave_b:
     if (fr->path_lane == 1u)
         cprisk_vm_interp_finish_run_lane1_i(fr);
@@ -4452,9 +4805,16 @@ vm_leave_b:
 }
 
 #if CPRISK_VM_THREADED_DISPATCH
+// 线程化 lane 调度实现（cprisk_thread_run_a_i/b_i 及各 opcode 线程体）；仅在部署开关打开时编译。
 #include "cprisk_vm_threaded.inc"
 #endif
 
+// 为一次 run 建立解释器帧：选定函数入口、恢复 VPC/鉴权种子、校验自检，然后初始化
+// 64 字节 acc/aux、vreg、opaque 状态、加固模块与同步屏障。成功返回 1 并填满 fr；
+// 字段速览：acc/acc_aux 是 32+32 双 bank 累加器；vregs 是 8 个虚拟 64 位寄存器；
+// encoded_pc 是加密 PC（取指前 decode，handler 推进后重新 encode）；session_mix 是进程级
+// 会话种子；opaque_chain 是逐步推进的混淆链（不直接进入 acc）；path_lane 选择 loop A/B。
+// 任何 ABI/布局/自检失败返回 0，out->status/poison_flags 已写好（调用方直接返回，不再执行）。
 static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
                                        const uint8_t *d_sec,
                                        const cprisk_vmp_dispatch_header_t *dhdr,
@@ -4473,6 +4833,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     uint64_t vpc_b = 0u;
     cprisk_vmp_read_vpc_affine_i(b_sec, bh, func_id, &vpc_a, &vpc_b);
 
+    // 选择入口：跳过与头部/入口表重叠或越界的描述符，按 function_id 精确匹配。
     const cprisk_vmp_bytecode_entry_t *selected = NULL;
     const uint64_t table_end =
         (uint64_t)bc_hdr_total + (uint64_t)bh->entry_count * (uint64_t)entry_stride;
@@ -4497,6 +4858,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
         return 0;
     }
 
+    // 每入口 VPC 覆盖全局 vpc_a/vpc_b；掩码同样由 func_id 与固定域常量派生。
     if ((bh->reserved & CPRISK_VMP_BC_FLAG_PER_ENTRY_VPC) != 0u) {
         const uint8_t *selp = (const uint8_t *)selected;
         uint64_t pe_raw_a = cprisk_read_le_u64_i(selp + sizeof(cprisk_vmp_bytecode_entry_t));
@@ -4518,6 +4880,8 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
         cprisk_vm_wb_finalize_i(out, acc);
         return 0;
     }
+    // profile 默认值用于旧入口（无 magic）；解析失败时走运行期 secret 派生的 fallback，
+    // 随后把 family/depth 夹到合法范围，避免 0 或越界值进入执行。
     uint32_t semantic_family = 1u;
     uint32_t mixed_predicate_profile = 0u;
     uint32_t max_subcall_depth = 4u;
@@ -4545,6 +4909,8 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     /* Per-function accumulator lane permutation: 3-bit index in entry->reserved
      * bits [2:0] selects among 3! = 6 permutations of {add_lane, sub_lane, mul_lane}.
      * Index 0 (identity {0,1,2}) is the default for legacy no-magic entries. */
+    // 每个函数的 add/sub/mul 家族置换（entry->reserved 低 3 位，仅 magic 入口生效）。
+    // 它决定每类 opcode 最终调用的运算家族；构建期生成器必须使用同一置换，错配会改变结果。
     static const uint8_t s_acc_lane_perms[8][3] = {
         {0u, 1u, 2u},  /* 0 — identity (default) */
         {0u, 2u, 1u},  /* 1 */
@@ -4558,6 +4924,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     const uint32_t lane_perm_idx = ((selected->reserved >> 24u) == CPRISK_VMP_ENTRY_PROFILE_MAGIC)
         ? (selected->reserved & 0x7u) : 0u;
 
+    // vpc_a == 0 会让仿射映射不可逆（decode 无法恢复 PC），直接判非法。
     if (vpc_a == 0u) {
         out->status = CPRISK_VM_STATUS_INVALID_BYTECODE;
         out->poison_flags |= CPRISK_VM_POISON_BYTECODE;
@@ -4565,6 +4932,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
         return 0;
     }
 
+    // 入口自检同时决定 decode 故障掩码与 seal mix；自检失败会把故障注入之后的每次取指/解密。
     uint64_t decode_fault_mask = 0u;
     uint64_t m3_seal_mix = 0u;
     cprisk_vm_m3_selfchk_run_i(hdr, acc, func_id, bh, out, &decode_fault_mask, &m3_seal_mix);
@@ -4576,10 +4944,13 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     }
 #endif
 
+    // 从头部 reserved 解出各可选特性开关；enc_* 只有在 V3 校验通过后才有意义。
     const uint32_t m3_opaque = (bh->reserved & CPRISK_VMP_BC_FLAG_M3_OPAQUE_CHAIN) != 0u ? 1u : 0u;
     const uint32_t m3_dead = (bh->reserved & CPRISK_VMP_BC_FLAG_M3_DEAD_HANDLERS) != 0u ? 1u : 0u;
     const uint32_t enc_imm = (bh->reserved & CPRISK_VMP_BC_FLAG_ENC_IMMEDIATE) != 0u ? 1u : 0u;
     const uint32_t enc_op = (bh->reserved & CPRISK_VMP_BC_FLAG_ENC_OPCODE) != 0u ? 1u : 0u;
+    // V3 种子布局：core（+M2 扩展）之后依次是 immediate seed、opcode seed。
+    // 任一步越界都拒绝执行；种子缺失时不猜测默认值。
     uint64_t imm_seed_root = 0u;
     if (enc_imm != 0u) {
         if (bh->version < CPRISK_VMP_VERSION_V3) {
@@ -4630,13 +5001,17 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     if (raw_bind_root == 0u)
         raw_bind_root = func_id ^ ((uint64_t)bh->reserved << 32) ^ 0x524157524F4F5431ULL; /* "RAWROOT1" */
 
+    // 先假定“跑满预算”：若循环因预算退出且没有其他错误，status 保持 STEP_LIMIT。
+    // HALT/RET 成功结束时会改成 OK；任何校验失败会改成 INVALID_BYTECODE。
     out->status = CPRISK_VM_STATUS_STEP_LIMIT;
 
+    // heavy 模式的触发条件：高 semantic_family、深子调用，或显式头部标志。
     const int vm_anti_symbolic_heavy =
         (semantic_family >= 10u) ||
         (max_subcall_depth >= 8u) ||
         ((bh->reserved & CPRISK_VMP_BC_FLAG_ANTI_SYMBOLIC_HEAVY) != 0u);
 
+    // 整帧清零：同时初始化 return_stack/vm_snap/vregs/加固上下文，避免未初始化状态。
     memset(fr, 0, sizeof(*fr));
     fr->hdr = hdr;
     fr->b_sec = b_sec;
@@ -4657,6 +5032,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     fr->vpc_b = vpc_b;
     fr->code = code;
     fr->blen = blen;
+    // 若启用运行期字节码哈希，先在入口建立一次 SHA256 基线，后续按周期复查。
     fr->bc_seg_hash_enabled = 0u;
     fr->bc_last_hash_step = 0u;
     memset(fr->bc_seg_hash_expect, 0, sizeof(fr->bc_seg_hash_expect));
@@ -4664,6 +5040,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
         cprisk_sha256(code, (size_t)blen, fr->bc_seg_hash_expect);
         fr->bc_seg_hash_enabled = 1u;
     }
+    // 以下字段是解释器的不变量来源：入口 PC、VPC、profile、lane 映射、加密种子与绑定根。
     fr->encoded_pc = encoded_pc;
     fr->semantic_family = semantic_family;
     fr->mixed_predicate_profile = mixed_predicate_profile;
@@ -4681,6 +5058,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     fr->m3_opaque = m3_opaque;
     fr->m3_dead = m3_dead;
     fr->vm_anti_symbolic_heavy = vm_anti_symbolic_heavy;
+    // 把进程级 session_mix 与 CFF link token 再混一次，得到本帧的会话种子；0 不允许出现。
     fr->session_mix = cprisk_vm_session_mix_i();
     fr->session_mix = cprisk_vmp_avalanche32_i(
         fr->session_mix ^ (uint32_t)cprisk_cff_get_vm_link_token()
@@ -4688,6 +5066,8 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     if (fr->session_mix == 0u)
         fr->session_mix = 0xC3EF4D27u ^ fr->path_lane;
     {
+        // 预算随机化：由 func_id/blen/family/session 派生，上限 65536、下限 53248（减 12288）。
+        // 固定迭代上限可被追踪器利用；随机上限让“跑多少步”本身依赖运行期状态。
         uint32_t cap_mix = cprisk_vmp_avalanche32_i(
             (uint32_t)func_id ^
             (uint32_t)(func_id >> 32u) ^
@@ -4699,12 +5079,15 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
         uint64_t cap = (uint64_t)CPRISK_VM_MAX_STEPS - (uint64_t)(cap_mix % 12288u);
         fr->step_limit_cap = cap;
     }
+    // 复制初始 acc（来自 runtime material），初始化副 bank 与 opaque 状态；steps 从 0 开始。
     fr->decode_fault_mask = decode_fault_mask;
     memcpy(fr->acc, acc, sizeof(fr->acc));
     cprisk_vm_aux_init_i(fr);
     cprisk_vm_opaque_runtime_init_i(fr);
     fr->steps = 0u;
     /* Initialize integrated hardening modules */
+    // 初始化五个加固模块；dead_touch 保持 16 个死处理器函数体存活并绑定其布局；
+    // sync_barrier 为每 64 步的外部数据依赖做准备。
     cprisk_vm_hardening_init(fr);
     /* Fold dead-handler addresses into session_mix: keeps all 16 dead-handler
      * bodies live in the binary and binds their layout to session entropy. */
@@ -4714,6 +5097,7 @@ static int cprisk_vm_prepare_program_i(const struct mach_header_64 *hdr,
     return 1;
 }
 
+// lane0 运行前奏：把 lane 相关的诱饵 seed 混入 opaque_chain（不改 acc）。
 static void cprisk_vm_run_prelude_lane0_i(cprisk_vm_interp_frame_t *fr) {
     fr->opaque_chain = cprisk_vmp_avalanche32_i(
         fr->opaque_chain ^
@@ -4721,6 +5105,7 @@ static void cprisk_vm_run_prelude_lane0_i(cprisk_vm_interp_frame_t *fr) {
     );
 }
 
+// lane1 运行前奏：用 lane1 的诱饵 seed 同时刷新 opaque_rt_nonce 与 opaque_chain。
 static void cprisk_vm_run_prelude_lane1_i(cprisk_vm_interp_frame_t *fr) {
     const uint32_t lane_mix =
         cprisk_vm_dispatch_bait_seed_i(1u, fr->semantic_family ^ fr->mixed_predicate_profile);
@@ -4732,6 +5117,7 @@ static void cprisk_vm_run_prelude_lane1_i(cprisk_vm_interp_frame_t *fr) {
     );
 }
 
+// lane2 运行前奏：用 max_subcall_depth/func_id 派生 seed，刷新 session/fold/chain。
 static void cprisk_vm_run_prelude_lane2_i(cprisk_vm_interp_frame_t *fr) {
     const uint32_t lane_mix =
         cprisk_vm_dispatch_bait_seed_i(2u, fr->max_subcall_depth ^ (uint32_t)(fr->func_id >> 32u));
@@ -4748,11 +5134,13 @@ static void cprisk_vm_run_prelude_lane2_i(cprisk_vm_interp_frame_t *fr) {
     );
 }
 
+// lane0 运行收尾：清理加固状态后，用 session_mix ^ opaque_chain 合并两个 bank 到 acc。
 static void cprisk_vm_run_finish_lane0_i(cprisk_vm_interp_frame_t *fr, uint8_t acc[32]) {
     cprisk_vm_hardening_cleanup(fr);
     cprisk_vm_merge_banks_i(acc, fr->acc, fr->acc_aux, fr->session_mix ^ fr->opaque_chain);
 }
 
+// lane1 运行收尾：先用线程/链状态更新 opaque_thread_mix，再以它为 salt 合并 bank。
 static void cprisk_vm_run_finish_lane1_i(cprisk_vm_interp_frame_t *fr, uint8_t acc[32]) {
     cprisk_vm_hardening_cleanup(fr);
     fr->opaque_thread_mix = cprisk_vmp_avalanche32_i(
@@ -4764,6 +5152,7 @@ static void cprisk_vm_run_finish_lane1_i(cprisk_vm_interp_frame_t *fr, uint8_t a
     cprisk_vm_merge_banks_i(acc, fr->acc, fr->acc_aux, fr->opaque_thread_mix ^ fr->opaque_chain);
 }
 
+// lane2 运行收尾：用运行期 fold 与 session_mix 混合后作为 salt 合并 bank。
 static void cprisk_vm_run_finish_lane2_i(cprisk_vm_interp_frame_t *fr, uint8_t acc[32]) {
     cprisk_vm_hardening_cleanup(fr);
     fr->opaque_runtime_fold = cprisk_vmp_avalanche32_i(
@@ -4775,6 +5164,8 @@ static void cprisk_vm_run_finish_lane2_i(cprisk_vm_interp_frame_t *fr, uint8_t a
     cprisk_vm_merge_banks_i(acc, fr->acc, fr->acc_aux, fr->opaque_runtime_fold ^ fr->session_mix);
 }
 
+// lane0 完整执行：prepare → prelude → loop A（线程化时走 cprisk_thread_run_a_i）→ finish。
+// prepare 失败时直接返回；acc 保持 prepare 期间写入的最终状态。
 static void cprisk_vm_run_program_lane0_i(const struct mach_header_64 *hdr,
                                           const uint8_t *d_sec,
                                           const cprisk_vmp_dispatch_header_t *dhdr,
@@ -4797,6 +5188,7 @@ static void cprisk_vm_run_program_lane0_i(const struct mach_header_64 *hdr,
     cprisk_vm_run_finish_lane0_i(&fr, acc);
 }
 
+// lane1 完整执行：prepare → prelude → loop B（线程化时走 cprisk_thread_run_b_i）→ finish。
 static void cprisk_vm_run_program_lane1_i(const struct mach_header_64 *hdr,
                                           const uint8_t *d_sec,
                                           const cprisk_vmp_dispatch_header_t *dhdr,
@@ -4819,6 +5211,7 @@ static void cprisk_vm_run_program_lane1_i(const struct mach_header_64 *hdr,
     cprisk_vm_run_finish_lane1_i(&fr, acc);
 }
 
+// lane2 完整执行：prepare → prelude → loop B（与 lane1 共用循环，但 prelude/finish 不同）→ finish。
 static void cprisk_vm_run_program_lane2_i(const struct mach_header_64 *hdr,
                                           const uint8_t *d_sec,
                                           const cprisk_vmp_dispatch_header_t *dhdr,
@@ -4841,17 +5234,23 @@ static void cprisk_vm_run_program_lane2_i(const struct mach_header_64 *hdr,
     cprisk_vm_run_finish_lane2_i(&fr, acc);
 }
 
+// lane0 顶层入口（调试/普通执行）：清零结果 → 用 runtime material 播种 acc → 独立做
+// sysctl/mach/聚合三重反调试检查 → Frida 快照 → 定位自身 Mach-O 与 VMP 段 → 校验头部 → 执行。
+// 非模拟器检测到调试时短路返回 0（status=TRACED_SHORTCIRCUIT，结果被 poison/诱饵污染）；
+// 参数/布局错误返回 0 并写 INVALID_DISPATCH；只有 out == NULL 返回 -1。
 static int cprisk_vm_execute_lane0_i(uint64_t func_id,
                                       cprisk_vm_run_result_t *out,
                                      const void *hdr_sym) {
     if (!out)
         return -1;
 
+    // 结果先清零，并把“未执行”哨兵写成全 1；后续成功路径会覆盖 last_opcode/class。
     memset(out, 0, sizeof(*out));
     out->last_opcode = 0xFFFFFFFFu;
     out->last_dispatch_class = 0xFFFFFFFFu;
     out->whitebox_domain_rc = UINT32_MAX;
 
+    // 初始累加器来自 runtime material 而非全零：同一字节码在不同设备/安装上得到不同结果。
     uint8_t acc[32];
     memset(acc, 0, sizeof(acc));
     (void)cprisk_get_runtime_material(acc);
@@ -4862,6 +5261,7 @@ static int cprisk_vm_execute_lane0_i(uint64_t func_id,
      * of the aggregated `cprisk_is_being_traced` return to mitigate single-point
      * hooks returning a false negative.
      */
+    // 除聚合探针外再 OR 上 sysctl 与 Mach 两条单独探针，避免单点 hook 让聚合函数返回假阴性。
     if (cprisk_is_being_traced_sysctl_only() != 0 ||
         cprisk_mach_trace_suspicious() != 0 ||
         cprisk_is_being_traced() != 0) {
@@ -4878,11 +5278,13 @@ static int cprisk_vm_execute_lane0_i(uint64_t func_id,
     }
 #endif
 
+    // Frida 快照失败/不支持时不改变控制流，只把 poison 旗标带上让上层降级处理。
     cprisk_frida_runtime_snapshot_t fr;
     memset(&fr, 0, sizeof(fr));
     if (cprisk_frida_runtime_snapshot(&fr) == 0 && fr.supported != 0u && fr.flags != 0u)
         out->poison_flags |= CPRISK_VM_POISON_FRIDA;
 
+    // 以入口符号反查自身 Mach-O 头，再定位 __DATA 中的 dispatch/bytecode 段。
     const struct mach_header_64 *hdr = cprisk_find_own_header(hdr_sym);
     if (!hdr) {
         out->poison_flags |= CPRISK_VM_POISON_DISPATCH;
@@ -4899,6 +5301,7 @@ static int cprisk_vm_execute_lane0_i(uint64_t func_id,
         cprisk_find_section(hdr, CPRISK_ARMOR_SEGMENT_DATA, CPRISK_ARMOR_SECTION_VMP_BYTECODE, &bsz);
 
     const cprisk_vmp_bytecode_header_t *bh = NULL;
+    // 头部/布局校验失败：同时标记 dispatch 与 bytecode，写 INVALID_DISPATCH 并做白盒收尾。
     if (!cprisk_vmp_headers_ok_i(d_sec, dsz, b_sec, bsz, &bh) || !bh) {
         out->poison_flags |= CPRISK_VM_POISON_DISPATCH | CPRISK_VM_POISON_BYTECODE;
         out->status = CPRISK_VM_STATUS_INVALID_DISPATCH;
@@ -4918,6 +5321,7 @@ static int cprisk_vm_execute_lane0_i(uint64_t func_id,
     return 0;
 }
 
+// lane1 顶层入口：语义同 lane0，但多一个 lane_probe 恒等触碰，并使用 lane1 的 program 路径。
 static int cprisk_vm_execute_lane1_i(uint64_t func_id,
                                      cprisk_vm_run_result_t *out,
                                      const void *hdr_sym) {
@@ -4933,6 +5337,7 @@ static int cprisk_vm_execute_lane1_i(uint64_t func_id,
     memset(acc, 0, sizeof(acc));
     (void)cprisk_get_runtime_material(acc);
 
+    // lane1 专属的恒等触碰：派生 lane_probe 后对 acc 异或 0，仅影响寄存器/数据流形状。
     volatile uint32_t lane_probe =
         cprisk_vmp_avalanche32_i((uint32_t)func_id ^ cprisk_vmp_rotl32_i((uint32_t)(func_id >> 32u), 7u));
     lane_probe ^= cprisk_vm_dispatch_bait_seed_i(1u, (uint32_t)func_id);
@@ -4993,6 +5398,8 @@ static int cprisk_vm_execute_lane1_i(uint64_t func_id,
     return 0;
 }
 
+// lane2 顶层入口：语义同 lane0，但用 hdr_sym/func_id 派生 lane_stamp 做恒等触碰，
+// 并使用 lane2 的 program 路径。
 static int cprisk_vm_execute_lane2_i(uint64_t func_id,
                                      cprisk_vm_run_result_t *out,
                                      const void *hdr_sym) {
@@ -5008,6 +5415,7 @@ static int cprisk_vm_execute_lane2_i(uint64_t func_id,
     memset(acc, 0, sizeof(acc));
     (void)cprisk_get_runtime_material(acc);
 
+    // lane2 专属的恒等触碰：把 hdr_sym/func_id 混成 lane_stamp，再对 acc 异或 0。
     volatile uint64_t lane_stamp =
         ((uint64_t)(uintptr_t)hdr_sym ^ func_id ^ UINT64_C(0xA5A5C3C36D2B79F5));
     lane_stamp ^= lane_stamp >> 29u;
@@ -5068,6 +5476,8 @@ static int cprisk_vm_execute_lane2_i(uint64_t func_id,
     return 0;
 }
 
+// 把 VM 结果折叠成 64 位：acc 前 8 字节 XOR acc_aux 的 lane 7 起的 8 字节。
+// 这只是面向 ABI 的摘要，不是密码学承诺；result 为 NULL 时返回 0。
 static uint64_t cprisk_vm_fold_result_i(const cprisk_vm_run_result_t *result) {
     uint64_t folded = 0u;
     if (!result)
@@ -5077,6 +5487,8 @@ static uint64_t cprisk_vm_fold_result_i(const cprisk_vm_run_result_t *result) {
     return folded;
 }
 
+// 入口票据：把 func_id、入口符号地址、lane 与会话 mix 绑定。finish 函数会重算并比较，
+// 因此调试器不能绕过 entry 直接调用 finish（除非能同步得到当前 session 绑定值）。
 typedef struct {
     uint64_t func_id;
     const void *hdr_sym;
@@ -5084,6 +5496,8 @@ typedef struct {
     uint32_t ticket;
 } cprisk_vm_entry_ticket_t;
 
+// finish 的两种调用形态：结构体票据 或 (lo,hi,lane,ticket,hdr_sym) 拆包；
+// 两者都会重算票据。函数指针间接调用用于 CFF / 链接器 -u 布线。
 typedef uint64_t (*cprisk_vm_entry_finish_ticket_fp_i)(const cprisk_vm_entry_ticket_t *ticket);
 typedef uint64_t (*cprisk_vm_entry_finish_pack32_fp_i)(uint32_t lo,
                                                        uint32_t hi,
@@ -5091,10 +5505,14 @@ typedef uint64_t (*cprisk_vm_entry_finish_pack32_fp_i)(uint32_t lo,
                                                        uint32_t ticket,
                                                        const void *hdr_sym);
 
+// 调试/测试入口：等价于 lane0 执行。成功返回 0；out == NULL 返回 -1。
+// 具体失败原因（检测到调试、布局非法、步数耗尽）体现在 out->status/poison_flags。
 int cprisk_vm_execute(uint64_t func_id, cprisk_vm_run_result_t *out) {
     return cprisk_vm_execute_lane0_i(func_id, out, (const void *)&cprisk_vm_execute);
 }
 
+// 派生入口票据：混合 func_id、入口符号地址、lane、session_mix 与诱饵 seed；
+// 结果为 0 时替换成固定非零值。票据不是秘密，但绑定当前进程的 session。
 static uint32_t cprisk_vm_entry_ticket_i(uint64_t func_id, const void *hdr_sym, uint32_t lane) {
     uint32_t mix =
         (uint32_t)func_id ^
@@ -5109,6 +5527,8 @@ static uint32_t cprisk_vm_entry_ticket_i(uint64_t func_id, const void *hdr_sym, 
     return mix;
 }
 
+// lane0 finish：校验票据 → 执行 lane0 → 折叠 64 位结果。
+// 票据为空/不匹配或执行失败时返回 0。
 __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_ticket_lane0_i(const cprisk_vm_entry_ticket_t *ticket) {
     if (!ticket || !ticket->hdr_sym)
         return 0u;
@@ -5120,6 +5540,7 @@ __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_ticket_lane0_i(
     return cprisk_vm_fold_result_i(&result);
 }
 
+// lane1 finish：由 (hi,lo) 重建 func_id，校验票据后执行 lane1 并折叠结果。
 __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_pack32_lane1_i(uint32_t lo,
                                                                                  uint32_t hi,
                                                                                  uint32_t lane,
@@ -5134,6 +5555,7 @@ __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_pack32_lane1_i(
     return cprisk_vm_fold_result_i(&result);
 }
 
+// lane2 finish：校验票据 → 执行 lane2 → 折叠结果。
 __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_ticket_lane2_i(const cprisk_vm_entry_ticket_t *ticket) {
     if (!ticket || !ticket->hdr_sym)
         return 0u;
@@ -5145,6 +5567,8 @@ __attribute__((noinline)) static uint64_t cprisk_vm_entry_finish_ticket_lane2_i(
     return cprisk_vm_fold_result_i(&result);
 }
 
+// 对外主入口：保留一段可被 Pass9 重写的副作用前奏，然后构造票据并以直接/间接两种方式
+// 调用 lane0 finish（两个调用点用于 CFF/布局）。返回折叠后的 64 位结果。
 CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry(uint64_t func_id) {
 #if defined(__aarch64__)
     __asm__ volatile("add x0, x0, #0");
@@ -5154,6 +5578,7 @@ CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry(uint64_t fun
      * M3: keep a tiny side-effectful entry prelude so policy-guided Pass9 can
      * still find rewritable entry instructions on this wrapper symbol.
      */
+    // 入口前奏：把 func_id 与 session 混合成 volatile 值，为策略重写器留下可改写的指令窗口。
     volatile uint64_t prelude = func_id ^ 0x9E3779B97F4A7C15ULL ^ (uint64_t)cprisk_vm_session_mix_i();
     prelude ^= (prelude >> 17);
     prelude ^= (prelude << 7);
@@ -5161,8 +5586,11 @@ CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry(uint64_t fun
     ticket.func_id = func_id;
     ticket.hdr_sym = (const void *)&cprisk_vm_entry;
     ticket.lane = 0u;
+    // ticket 先与 prelude 异或再异或回来，最终仍等于 cprisk_vm_entry_ticket_i(...)；
+    // 中间表达式只用于混淆数据流。
     ticket.ticket = cprisk_vm_entry_ticket_i(func_id, ticket.hdr_sym, ticket.lane) ^ (uint32_t)prelude;
     ticket.ticket ^= (uint32_t)prelude;
+    // 奇偶分支选择直接/间接调用；两条路径语义相同，用于制造两个调用点。
     if (((uint32_t)prelude & 1u) == 0u) {
         cprisk_vm_entry_finish_ticket_fp_i fp = cprisk_vm_entry_finish_ticket_lane0_i;
         return fp(&ticket);
@@ -5170,12 +5598,15 @@ CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry(uint64_t fun
     return cprisk_vm_entry_finish_ticket_lane0_i(&ticket);
 }
 
+// 备选入口 1：用 (lo,hi) 拆包票据，校验后走 lane1。asm 的 eor x16,x0,x0 是恒等指令，
+// 仅作为 CFF/重写锚点。
 CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry_alt1(uint64_t func_id) {
 #if defined(__aarch64__)
     __asm__ volatile("eor x16, x0, x0");
 #endif
     uint32_t lo = (uint32_t)func_id;
     uint32_t hi = (uint32_t)(func_id >> 32u);
+    // 派生一个 volatile ledger，再以 x ^ x 的方式从票据中抵消，保持票据语义不变。
     volatile uint32_t ledger = cprisk_vmp_avalanche32_i(lo ^ cprisk_vmp_rotl32_i(hi, 7u) ^ 0xA5A5C3C3u);
     ledger ^= cprisk_vm_dispatch_bait_seed_i(1u, hi & 3u);
     cprisk_vm_entry_finish_pack32_fp_i fp = cprisk_vm_entry_finish_pack32_lane1_i;
@@ -5184,11 +5615,13 @@ CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry_alt1(uint64_
     return fp(lo, hi, 1u, ticket, (const void *)&cprisk_vm_entry_alt1);
 }
 
+// 备选入口 2：先清零票据，再让 func_id 与常量异或两次（恒等），最后走 lane2。
 CPRISK_VM_EXPORT __attribute__((noinline)) uint64_t cprisk_vm_entry_alt2(uint64_t func_id) {
 #if defined(__aarch64__)
     __asm__ volatile("eor x17, x0, x0");
 #endif
     cprisk_vm_entry_ticket_t ticket;
+    // memset + 两次异或常量都是显式的数据流噪声；最终 func_id 不变。
     memset(&ticket, 0, sizeof(ticket));
     ticket.func_id = func_id ^ UINT64_C(0x13579BDF2468ACE1);
     ticket.func_id ^= UINT64_C(0x13579BDF2468ACE1);

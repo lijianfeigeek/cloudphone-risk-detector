@@ -1,15 +1,47 @@
+// Swift 桥接别名导出表。
+//
+// 职责：把 `cprisk_swift_bridge.h` 中的导入索引映射为稳定的 `cpra_NNNN` 符号。
+// Swift 侧通过 `cprisk_resolve_import(index)` 解析到这些别名，再由别名转发到
+// 真正的 `cprisk_*` 实现。
+//
+// 安全目的：
+//   - Swift 二进制中不出现真实 C 符号名，增加静态定位成本；
+//   - 同一实现可被多个调用点使用不同别名，降低单点 Hook 的收益；
+//   - 别名与索引的对应关系是 ABI 契约，允许追加，禁止重排或复用编号。
+//
+// 不变量：
+//   - `cpra_NNNN` 的 NNNN 必须等于 `CPRISK_SWIFT_BRIDGE_IMPORT_* - BASE + 1`；
+//   - 新别名只能追加在表尾，并同步更新头文件索引与 COUNT；
+//   - 转发函数的签名必须与目标函数完全一致，否则是未定义行为。
+
 #include "include/CRiskCore.h"
 
+// 确保别名符号在最终二进制中可见且不会被链接器当成未使用代码删除。
+// `used` 让编译器保留，`visibility("default")` 让运行期导入解析能查找到。
 #if defined(__GNUC__)
 #define CPRISK_ALIAS_EXPORT __attribute__((visibility("default"), used))
 #else
 #define CPRISK_ALIAS_EXPORT
 #endif
 
+// 证书固定（pinning）使用的 SHA-256 摘要长度。
 #define CPRISK_PIN_SHA256_DIGEST_LENGTH 32u
 
-/* Pinset return contract (issue 39): -1 = error, 0 = no match (incl.
- * pin_count == 0, "no pin configured"), 1 = match. */
+// 校验候选 SHA-256 摘要是否命中打包的 pinset。
+//
+// 返回契约：
+//   -1 = 参数错误（候选摘要为 NULL 或长度不是 32 字节；pinset 为 NULL 且 pin_count > 0）
+//    0 = 未命中（包括 pin_count == 0，即“未配置 pin”）
+//    1 = 命中
+//
+// 参数：
+//   - candidate_digest: 候选摘要，必须是 32 字节；调用方保留所有权。
+//   - candidate_len: 候选摘要长度，必须等于 32。
+//   - packed_pins: 连续排列的 32 字节摘要数组；pin_count 为条目数。
+//   - pin_count: pinset 条目数；0 表示未配置，返回 0 而不是错误。
+//
+// 线程安全：纯函数，无全局状态，可并发调用。
+// 平台：全平台可用，无 syscall / 架构依赖。
 int cprisk_pinset_contains_sha256_digest(
     const uint8_t *candidate_digest,
     size_t candidate_len,
@@ -32,6 +64,8 @@ int cprisk_pinset_contains_sha256_digest(
             const uint8_t *slot = packed_pins + (pin_index * CPRISK_PIN_SHA256_DIGEST_LENGTH);
             uint8_t diff = 0u;
             size_t byte_index = 0u;
+            // 常量时间比较：遍历全部 32 字节并累积 XOR，不提前 break，
+            // 避免通过比较耗时推断“命中了哪一位”。
             for (byte_index = 0u; byte_index < CPRISK_PIN_SHA256_DIGEST_LENGTH; ++byte_index) {
                 diff |= (uint8_t)(candidate_digest[byte_index] ^ slot[byte_index]);
             }
@@ -41,16 +75,26 @@ int cprisk_pinset_contains_sha256_digest(
     }
 }
 
+// 生成一个返回 void 的转发别名。
+// - alias:  对外暴露的稳定符号名（cpra_NNNN）
+// - target: 真实实现（cprisk_*）
+// - decl_args: 别名的参数声明，必须与 target 完全一致
+// - call_args: 传给 target 的实参列表
 #define CPRISK_ALIAS_VOID(alias, target, decl_args, call_args) \
     CPRISK_ALIAS_EXPORT void alias decl_args {               \
         target call_args;                                   \
     }
 
+// 生成一个带返回值的转发别名；返回值原样透传，不做任何转换或错误码改写。
 #define CPRISK_ALIAS_RET(ret, alias, target, decl_args, call_args) \
     CPRISK_ALIAS_EXPORT ret alias decl_args {                    \
         return target call_args;                                \
     }
 
+// 以下别名按目标函数名字母序排列，便于合并与审计；
+// 编号一旦分配即冻结，新增条目只能追加到表尾。
+//
+// MARK: - 直 syscall / 地址与页保护（0001–0008）
 CPRISK_ALIAS_RET(int, cpra_0001, cprisk_access_direct,
                  (const char *path, int amode, int *error_out),
                  (path, amode, error_out))
@@ -75,6 +119,7 @@ CPRISK_ALIAS_RET(int, cpra_0007, cprisk_close_direct,
 CPRISK_ALIAS_RET(int, cpra_0008, cprisk_connect_direct,
                  (int sockfd, const struct sockaddr *addr, socklen_t addrlen, int *error_out),
                  (sockfd, addr, addrlen, error_out))
+// MARK: - 密码学追踪 / csops 调试状态（0009–0014）
 CPRISK_ALIAS_RET(uint32_t, cpra_0009, cprisk_crypto_trace_consume_flags_i,
                  (void),
                  ())
@@ -93,6 +138,7 @@ CPRISK_ALIAS_RET(int, cpra_0013, cprisk_csops_debug_check,
 CPRISK_ALIAS_RET(int, cpra_0014, cprisk_csops_status_flags,
                  (uint32_t *flags_out, int *error_out),
                  (flags_out, error_out))
+// MARK: - deny-attach / 设备密钥（0015–0017）
 CPRISK_ALIAS_VOID(cpra_0015, cprisk_deny_attach,
                   (void),
                   ())
@@ -102,6 +148,7 @@ CPRISK_ALIAS_RET(int, cpra_0016, cprisk_deny_attach_status,
 CPRISK_ALIAS_RET(int, cpra_0017, cprisk_derive_device_key,
                  (const uint8_t *root_key, uint8_t out_device_key[CPRISK_ARMOR_KEY_SIZE]),
                  (root_key, out_device_key))
+// MARK: - 调试/JIT/DBI 探针与 Frida 快照（0018–0026）
 CPRISK_ALIAS_RET(int, cpra_0018, cprisk_detect_dbi_markers,
                  (void),
                  ())
@@ -129,6 +176,7 @@ CPRISK_ALIAS_VOID(cpra_0025, cprisk_erase_macho_header,
 CPRISK_ALIAS_RET(int, cpra_0026, cprisk_frida_runtime_snapshot,
                  (cprisk_frida_runtime_snapshot_t *out),
                  (out))
+// MARK: - 运行期快照、时序与 mprotect 诊断（0027–0043）
 CPRISK_ALIAS_RET(int, cpra_0027, cprisk_get_anti_debug_watchdog_snapshot,
                  (cprisk_anti_debug_watchdog_snapshot_t *out_snapshot),
                  (out_snapshot))
@@ -180,6 +228,7 @@ CPRISK_ALIAS_RET(int, cpra_0042, cprisk_get_runtime_material,
 CPRISK_ALIAS_RET(uint32_t, cpra_0043, cprisk_get_vm_mprotect_crosscheck_mismatch_count,
                  (void),
                  ())
+// MARK: - 进程身份、KDF 与完整性状态（0044–0057）
 CPRISK_ALIAS_RET(uint32_t, cpra_0044, cprisk_get_vm_mprotect_mach_trap_mismatch_count,
                  (void),
                  ())
@@ -223,6 +272,7 @@ CPRISK_ALIAS_RET(int, cpra_0056, cprisk_is_device_bound,
 CPRISK_ALIAS_RET(int, cpra_0057, cprisk_is_integrity_poisoned,
                  (void),
                  ())
+// MARK: - MTE / OBF / PAC 辅助（0058–0065）
 CPRISK_ALIAS_RET(int, cpra_0058, cprisk_is_mprotect_tampered,
                  (void),
                  ())
@@ -247,6 +297,7 @@ CPRISK_ALIAS_RET(int, cpra_0064, cprisk_pac_self_test,
 CPRISK_ALIAS_RET(void *, cpra_0065, cprisk_pac_sign_function_pointer,
                  (const void *ptr, uintptr_t discriminator),
                  (ptr, discriminator))
+// MARK: - 信号探针、页保护与完整性重检（0066–0073）
 CPRISK_ALIAS_RET(int, cpra_0066, cprisk_pac_validate_core_callbacks,
                  (void),
                  ())
@@ -271,6 +322,7 @@ CPRISK_ALIAS_VOID(cpra_0072, cprisk_register_exception_handler,
 CPRISK_ALIAS_RET(int, cpra_0073, cprisk_restore_macho_header,
                  (void),
                  ())
+// MARK: - 扫描器、加固模式、签名与生命周期（0074–0087）
 CPRISK_ALIAS_RET(uint32_t, cpra_0074, cprisk_run_all_signal_probes,
                  (void),
                  ())
@@ -316,6 +368,7 @@ CPRISK_ALIAS_RET(int, cpra_0087, cprisk_sysctl_direct,
                  (int *name, unsigned int namelen, void *oldp, size_t *oldlenp,
                   const void *newp, size_t newlen, int *error_out),
                  (name, namelen, oldp, oldlenp, newp, newlen, error_out))
+// MARK: - 测试注入 / 白盒辅助（0088–0099）
 CPRISK_ALIAS_RET(int, cpra_0088, cprisk_sysctlbyname_direct,
                  (const char *name, void *oldp, size_t *oldlenp, const void *newp, size_t newlen, int *error_out),
                  (name, oldp, oldlenp, newp, newlen, error_out))
@@ -355,6 +408,7 @@ CPRISK_ALIAS_RET(int, cpra_0098, cprisk_test_set_whitebox_bundle,
 CPRISK_ALIAS_VOID(cpra_0099, cprisk_test_set_whitebox_recompute_mismatch,
                   (int enabled),
                   (enabled))
+// MARK: - 校验器、证书固定与白盒（0100–0117）
 CPRISK_ALIAS_RET(int, cpra_0100, cprisk_test_whitebox_prepare_domain_input,
                  (uint32_t domain_id, const uint8_t input[32], uint8_t out[32]),
                  (domain_id, input, out))
@@ -413,6 +467,7 @@ CPRISK_ALIAS_VOID(cpra_0116, cprisk_integrity_poison_watchdog_lane,
 CPRISK_ALIAS_VOID(cpra_0117, cprisk_test_reset_staged_poison_for_tests,
                   (void),
                   ())
+// MARK: - VM 摘要、掩码路径探针与线程快照（0118–0126）
 CPRISK_ALIAS_RET(int, cpra_0118, cprisk_vm_dyld_image_layout_digest,
                  (uint8_t out_digest[32]),
                  (out_digest))
@@ -448,6 +503,14 @@ CPRISK_ALIAS_RET(int, cpra_0126, cprisk_thread_pc_exec_snapshot,
                   cprisk_thread_pc_exec_snapshot_t *out_snapshot),
                  (out_entries, max_entries, out_snapshot))
 
+// 别名保活表。
+//
+// 这些别名只会在运行期被 `cprisk_resolve_import()` 按索引查找，编译期没有
+// 任何直接调用点。链接器/Dead Code Stripping 可能因此把别名当成未使用符号
+// 删除；这里用取地址的方式建立静态引用，强制它们进入最终二进制。
+//
+// 不变量：数组元素必须与上面的别名一一对应；新增别名时同步追加，
+// 否则新索引在运行期会解析失败。
 static const void *const cprisk_swift_bridge_keepalive_i[] = {
     (const void *)&cpra_0001, (const void *)&cpra_0002, (const void *)&cpra_0003,
     (const void *)&cpra_0004, (const void *)&cpra_0005, (const void *)&cpra_0006,
@@ -502,6 +565,9 @@ static const void *const cprisk_swift_bridge_keepalive_i[] = {
     (const void *)&cpra_0126,
 };
 
+// 强制链接锚点：Swift 侧在启动阶段调用一次，确保保活表所在翻译单元
+// 不会被整个剔除（某些链接配置下仅存在静态数组仍可能被丢弃）。
+// 无副作用；除第 0 个元素外不读取其他别名地址。
 void cprisk_swift_bridge_force_link(void) {
     volatile const void *anchor = cprisk_swift_bridge_keepalive_i[0];
     (void)anchor;

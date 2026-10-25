@@ -1,3 +1,9 @@
+// 文件职责：把 CFF（控制流平坦化）状态机与 VM 解释器融合——用 Feistel 网络对 32 位
+// 状态/PC 做可逆编码，并在 VM 帧字段与独立 ctx 之间同步轮密钥、轨迹环和混淆链。
+// 线程模型：ctx 与帧内 cff_* 字段均为单写者；trace_buffer/trace_pos 每次编码都会推进，
+// 因此不可跨线程并发调用 encode_pc / transition。
+// 平台与失败语义：纯 C 无平台分支；ctx 为 NULL 时静默返回，state_encoded=0 时 encode/decode
+// 原样返回输入（fail-open）；Feistel 用于提高逆向成本，但没有 MAC，integrity 只做自洽检查。
 /*
  *  vm_cff_fusion.c
  *  CRiskCore
@@ -12,7 +18,10 @@
 
 #include <string.h>
 
+// 8 轮 Feistel：左右各 16 位，每轮用 8 位 S-box 混淆后交换两半。
+// 轮数是固定预算，增加轮数会线性增加 VM 每一步的开销。
 #define VM_CFF_FEISTEL_ROUNDS       8
+// cff_magic 的初始/期望值；verify_integrity 以常量时间比较它来发现上下文破坏。
 #define VM_CFF_MAGIC_INIT           0xCFF0CFF0u
 /* Full 32-bit state space (16+16 Feistel halves). The previous 28-bit mask
  * (0x0FFFFFFFu) was an artifact of the 14+14 layout used with the 4-bit
@@ -30,6 +39,9 @@
  * so the outputs are distinct functions of the key schedule even on
  * adversarially chosen keys.
  */
+// 前置白化：rk[0] 与 rk[7] 分别雪崩后，用 XOR + 循环左移 13 位组合。
+// 与 post 使用不同结构（XOR+旋转 vs 加法+旋转），避免密钥满足某种关系时
+// 前后掩码相互抵消（旧实现下概率约 2^-32）。
 static uint32_t vm_cff_whiten_pre_i(const uint32_t *rk) {
     const uint32_t a = cprisk_vmp_avalanche32_i(rk[0]);
     const uint32_t b = cprisk_vmp_avalanche32_i(rk[7]);
@@ -37,6 +49,8 @@ static uint32_t vm_cff_whiten_pre_i(const uint32_t *rk) {
     return cprisk_vmp_avalanche32_i(mix ^ 0x9E3779B9u);
 }
 
+// 后置白化：rk[3] 与 rk[5] 经加法 + 旋转组合后再雪崩；
+// 结构与 pre 不同，保证两端掩码不是同一个函数。
 static uint32_t vm_cff_whiten_post_i(const uint32_t *rk) {
     const uint32_t a = cprisk_vmp_avalanche32_i(rk[3]);
     const uint32_t b = cprisk_vmp_avalanche32_i(rk[5]);
@@ -51,22 +65,29 @@ static uint32_t vm_cff_whiten_post_i(const uint32_t *rk) {
  * round's input bits untouched). Two SPN passes per round + key-schedule
  * folding keep diffusion per-round at full half-block.
  */
+// 16 位轮函数 F(right, round_key)：先用轮密钥低 16 位异或，再做两轮
+// 8 位 S-box 替换与雪崩（混入轮密钥高 16 位），保证每个输入位都能影响整个半块。
+// 返回：新的 16 位半块；无错误路径。S-box 来自 cprisk_cff 的每构建随机置换。
 static uint16_t vm_cff_feistel_f(uint16_t right, uint32_t round_key) {
     const uint16_t kl = (uint16_t)(round_key & 0xFFFFu);
     const uint16_t kh = (uint16_t)((round_key >> 16) & 0xFFFFu);
     uint32_t x = (uint32_t)(right ^ kl);
 
+    // 两个字节分别查 8 位 S-box；相比旧的 4 位 nibble S-box，
+    // 每个半块的两半输入都被替换，单轮即可影响全部 16 位。
     /* First SPN pass on both bytes of the half. */
     const uint8_t s0 = cprisk_cff_spn_sbox_lookup((uint8_t)(x & 0xFFu));
     const uint8_t s1 = cprisk_cff_spn_sbox_lookup((uint8_t)((x >> 8) & 0xFFu));
     uint32_t y = (uint32_t)s0 | ((uint32_t)s1 << 8);
 
+    // 折入轮密钥高半部，使 32 位 round_key 的每一位都参与轮函数。
     /* Avalanche with key-schedule fold (uses high half of round_key). */
     y ^= (uint32_t)kh;
     y = ((y << 7) | (y >> 25)) ^ 0x9E3779B9u;
     y = ((y * 0x85EBCA6Bu) >> 16) ^ y;
     y = ((y << 13) | (y >> 19)) ^ 0xC2B2AE35u;
 
+    // 雪崩后再做一次逐字节替换，提高单轮扩散强度。
     /* Second SPN pass after avalanche — full per-byte substitution. */
     const uint8_t t0 = cprisk_cff_spn_sbox_lookup((uint8_t)(y & 0xFFu));
     const uint8_t t1 = cprisk_cff_spn_sbox_lookup((uint8_t)((y >> 8) & 0xFFu));
@@ -74,6 +95,11 @@ static uint16_t vm_cff_feistel_f(uint16_t right, uint32_t round_key) {
     return (uint16_t)((uint32_t)t0 | ((uint32_t)t1 << 8));
 }
 
+// 状态编码：32 位输入拆成高/低 16 位两半，先整体前置白化，
+// 再做 8 轮 Feistel（new_left = right，new_right = left ^ F(right)），
+// 最后做后置白化并拼回 32 位。
+// 不变量：对固定 rk 是 2^32 上的双射，vm_cff_decode_state_i 是其精确逆。
+// 返回：编码后的 32 位状态；rk 必须指向 8 个有效轮密钥。
 static uint32_t vm_cff_encode_state_i(uint32_t state, const uint32_t *rk) {
     /* 16+16 split — full state space, no truncation. */
     uint16_t left = (uint16_t)((state >> 16) & 0xFFFFu);
@@ -99,6 +125,8 @@ static uint32_t vm_cff_encode_state_i(uint32_t state, const uint32_t *rk) {
     return ((uint32_t)left << 16) | (uint32_t)right;
 }
 
+// 解码：先撤销后置白化，再按相反轮序执行 Feistel 逆变换，最后撤销前置白化。
+// 不变量：decode(encode(x)) == x；rk 的内容与顺序必须和编码端一致。
 static uint32_t vm_cff_decode_state_i(uint32_t encoded, const uint32_t *rk) {
     uint16_t left = (uint16_t)((encoded >> 16) & 0xFFFFu);
     uint16_t right = (uint16_t)(encoded & 0xFFFFu);
@@ -133,6 +161,9 @@ static uint32_t vm_cff_decode_state_i(uint32_t encoded, const uint32_t *rk) {
  * Keystream is reproducible (no per-write nonce) so the in-context format
  * stays read/write symmetric without storing extra state.
  */
+// 轨迹环的按位置密钥流：pos 选择两个轮密钥并混入黄金比例常量，再经两次雪崩。
+// 作用：trace_buffer 不再以明文保存编码后的 PC，内存转储无法直接还原控制流。
+// 不变量：同一 (rk, pos) 必得同一掩码，因此写入与校验无需额外的 nonce/状态。
 static uint32_t vm_cff_trace_keystream_i(const uint32_t *rk, uint32_t pos) {
     const uint32_t base = rk[pos & 7u] ^ (pos * 0x9E3779B9u);
     const uint32_t mix = cprisk_vmp_avalanche32_i(base ^ rk[(pos + 3u) & 7u]);
@@ -154,6 +185,11 @@ static uint32_t vm_cff_trace_keystream_i(const uint32_t *rk, uint32_t pos) {
  *                    domain tags, hardening against truncation attacks
  *                    against any single block.
  */
+// 从 IKM 派生 64 字节：两块 SHA256，各自带不同域标签（"rk\1\0" / "wh\2\0"）。
+// 这不是通用 KDF，而是域分离的哈希扩展；IKM 已是高熵哈希输出，
+// 因此省去 MAC 步骤，只用于对称密钥派生。
+// 参数：ikm_len 超过 60 时截断（为 4 字节域标签留空间），out 必须可写 64 字节。
+// 返回：无；中间缓冲用后清零。输出 [0..31] 是 8 个轮密钥，[32..63] 为预留扩展。
 static void vm_cff_kdf_expand(const uint8_t *ikm, size_t ikm_len, uint8_t out[64]) {
     /* Worst-case input size: 8 (func_id) + 32 (bytecode_hash) + 4 (tag) = 44. */
     uint8_t buf[64];
@@ -179,6 +215,12 @@ static void vm_cff_kdf_expand(const uint8_t *ikm, size_t ikm_len, uint8_t out[64
     cprisk_secure_zero(buf, sizeof(buf));
 }
 
+// 初始化融合上下文：清零 → 记录 func_id/bytecode_hash → 写魔数与初始编码状态 →
+// 构造 40 字节 IKM 并展开为 8 个轮密钥 → 清零敏感中间值 → 标记 state_encoded=1。
+// 参数：ctx 不可为 NULL；bytecode_hash 可为 NULL，此时用 func_id 派生的稳定填充，
+//       避免不同函数共享同一 IKM 前缀。
+// 返回：无；不校验字节码哈希本身的正确性（由调用方负责）。
+// 线程安全：只写 ctx；平台无关。
 void vm_cff_fusion_init(vm_cff_fusion_ctx_t *ctx,
                          uint64_t func_id,
                          const uint8_t *bytecode_hash) {
@@ -233,6 +275,11 @@ void vm_cff_fusion_init(vm_cff_fusion_ctx_t *ctx,
     ctx->state_encoded = 1;
 }
 
+// 编码一个 PC 并追加到 16 槽轨迹环：
+// 返回的是未加掩码的 encoded 值（调用方用作下一个 vpc）；
+// trace_buffer 保存的是 encoded ^ keystream(pos)，pos 单调递增。
+// 返回：ctx 为 NULL 或 state_encoded=0 时原样返回 pc（fail-open）。
+// 线程安全：写 ctx->trace_buffer/trace_pos，必须串行。
 uint32_t vm_cff_fusion_encode_pc(vm_cff_fusion_ctx_t *ctx, uint32_t pc) {
     if (!ctx || !ctx->state_encoded) {
         return pc;
@@ -251,6 +298,8 @@ uint32_t vm_cff_fusion_encode_pc(vm_cff_fusion_ctx_t *ctx, uint32_t pc) {
     return encoded;
 }
 
+// 解码一个编码后的 PC；未初始化时原样返回输入。
+// 返回：解码后的明文 PC；rk 与编码端不一致时得到错误值而不是报错。
 uint32_t vm_cff_fusion_decode_pc(vm_cff_fusion_ctx_t *ctx, uint32_t encoded_pc) {
     if (!ctx || !ctx->state_encoded) {
         return encoded_pc;
@@ -259,6 +308,12 @@ uint32_t vm_cff_fusion_decode_pc(vm_cff_fusion_ctx_t *ctx, uint32_t encoded_pc) 
     return vm_cff_decode_state_i(encoded_pc, ctx->rk);
 }
 
+// 状态迁移：先解码 current_encoded，再按 branch_hint 计算下一明文 PC
+// （hint==0 表示顺序执行 +1，否则 hint 直接作为目标 PC），重新编码写入 *next_encoded，
+// 并把“旧/新编码值”的哈希低 32 位混入 opaque_chain。
+// 参数：ctx/next_encoded 不可为 NULL；branch_hint 是明文 PC，不是编码值。
+// 返回：无；ctx 为 NULL 时静默返回，*next_encoded 不会被写出。
+// 注意：不校验 branch_hint 是否落在字节码范围内，调用方需自行保证。
 void vm_cff_fusion_transition(vm_cff_fusion_ctx_t *ctx,
                                uint32_t current_encoded,
                                uint32_t *next_encoded,
@@ -284,6 +339,8 @@ void vm_cff_fusion_transition(vm_cff_fusion_ctx_t *ctx,
     memcpy(mix_input, &current_encoded, 4);
     memcpy(mix_input + 4, next_encoded, 4);
 
+    // 只取 SHA256 前 4 字节混链：用于把状态迁移绑定到混淆链，
+    // 不提供认证能力，碰撞也不影响正确性。
     uint8_t mix_hash[32];
     cprisk_sha256(mix_input, 8, mix_hash);
 
@@ -296,6 +353,11 @@ void vm_cff_fusion_transition(vm_cff_fusion_ctx_t *ctx,
     cprisk_secure_zero(mix_hash, sizeof(mix_hash));
 }
 
+// VM_OP_CFF_ENCODE：把 acc[slot] 编码后写回 4 个连续槽（slot..slot+3，按 &31 回绕）。
+// imm 位域：bit0–4 槽位，bit5=1 时再把 acc[0..3] 组成的 32 位值异或进结果。
+// 返回：fr 为 NULL 时 LEAVE；否则 CONTINUE。
+// slot 已被 0x1F 掩码，slot>=32 分支不可达，保留它只是防止将来掩码变化。
+// 注意：槽位回绕时 4 个字节可能覆盖 slot 自身或相邻槽，调用方必须预留连续槽。
 cprisk_vm_flow_t vm_op_cff_encode_execute(cprisk_vm_interp_frame_t *fr,
                                            uint64_t imm) {
     if (!fr) {
@@ -332,6 +394,10 @@ cprisk_vm_flow_t vm_op_cff_encode_execute(cprisk_vm_interp_frame_t *fr,
     return CPRISK_VM_FLOW_CONTINUE;
 }
 
+// VM_OP_CFF_DECODE：从 slot..slot+3（&31 回绕）按小端重组 32 位编码值，
+// 解码后写回同一组槽。imm 只有低 5 位有效，其余位忽略。
+// 返回：fr 为 NULL 时 LEAVE；否则 CONTINUE。
+// 与 encode 对称：两端 cff_rk 不一致时得到的是错误明文，而不是失败码。
 cprisk_vm_flow_t vm_op_cff_decode_execute(cprisk_vm_interp_frame_t *fr,
                                            uint64_t imm) {
     if (!fr) {
@@ -362,6 +428,12 @@ cprisk_vm_flow_t vm_op_cff_decode_execute(cprisk_vm_interp_frame_t *fr,
     return CPRISK_VM_FLOW_CONTINUE;
 }
 
+// VM_OP_CFF_TRANSITION：把帧中的 CFF 字段临时打包成 ctx，执行一次 transition 再写回。
+// imm 位域：bits0–23 目标 PC 提示；bit24=1 时改用 acc[0..2] 拼出的 24 位地址作为提示。
+// 关键约束：临时 ctx 里的 bytecode_hash 只被复制，transition 并不读取它；
+//           encoded_state 会随帧中的 cff_encoded_state 一起更新。
+// 返回：fr 为 NULL 时 LEAVE；否则 CONTINUE。临时 ctx 用后 secure_zero。
+// 线程安全：只操作传入帧，可重入。
 cprisk_vm_flow_t vm_op_cff_transition_execute(cprisk_vm_interp_frame_t *fr,
                                                uint64_t imm) {
     if (!fr) {
@@ -377,6 +449,8 @@ cprisk_vm_flow_t vm_op_cff_transition_execute(cprisk_vm_interp_frame_t *fr,
                          (((uint32_t)fr->acc[2]) << 16);
     }
 
+    // 把帧字段逐项搬到临时 ctx；这里用 memcpy 而不是直接传帧指针，
+    // 是为了复用只接受 vm_cff_fusion_ctx_t 的 transition 接口。
     /* Build temporary ctx from flat frame fields */
     vm_cff_fusion_ctx_t tmp;
     memset(&tmp, 0, sizeof(tmp));
@@ -413,6 +487,11 @@ cprisk_vm_flow_t vm_op_cff_transition_execute(cprisk_vm_interp_frame_t *fr,
     return CPRISK_VM_FLOW_CONTINUE;
 }
 
+// 在 VM 帧上启用 CFF：用 (func_id, bytecode_hash) 初始化临时 ctx，
+// 拷入 8 个轮密钥，把初始 cff_vpc 编码后写回，并同步 encoded_state/magic/
+// state_encoded/trace_buffer/trace_pos。
+// 参数：fr 为 NULL 时无操作。返回：无。
+// 注意：应在 VM 开始执行前调用一次；重复调用会把当前（可能已编码的）cff_vpc 再编码一次。
 void vm_cff_fusion_apply_to_interp(cprisk_vm_interp_frame_t *fr) {
     if (!fr) {
         return;
@@ -441,6 +520,12 @@ void vm_cff_fusion_apply_to_interp(cprisk_vm_interp_frame_t *fr) {
     cprisk_secure_zero(&tmp, sizeof(tmp));
 }
 
+// 自检 CFF 上下文是否被破坏：
+// 1) 常量时间比较 cff_magic 与 VM_CFF_MAGIC_INIT（把差异折叠到最低位，避免早退泄露）；
+// 2) 轨迹非空时取最后一条记录，剥掉位置密钥流后做 decode→encode 往返，
+//    任何差异折叠为 1 位并 OR 进 corruption_detected（粘滞标志）。
+// 返回：无；只置位 corruption_detected，不修复状态。
+// 注意：这是自洽性检查，不是 MAC；能发现随机位翻转，无法对抗持有合法密钥的伪造者。
 void vm_cff_fusion_verify_integrity(vm_cff_fusion_ctx_t *ctx) {
     if (!ctx) {
         return;
@@ -476,6 +561,9 @@ void vm_cff_fusion_verify_integrity(vm_cff_fusion_ctx_t *ctx) {
     }
 }
 
+// 从 8 个轮密钥、opaque_chain 与 trace_pos 汇总出一个 32 位不透明度值，
+// 供后续分支/状态混合使用。它是确定性摘要，不是随机数，也不是安全凭据。
+// 返回：ctx 为 NULL 时 0；否则任意 32 位值。
 uint32_t vm_cff_fusion_get_opacity(vm_cff_fusion_ctx_t *ctx) {
     if (!ctx) {
         return 0;

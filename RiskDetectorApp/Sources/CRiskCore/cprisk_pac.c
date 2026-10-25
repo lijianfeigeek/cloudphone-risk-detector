@@ -1,3 +1,12 @@
+// 文件职责：arm64e 指针认证（PAC/CFI）的签名、认证、自检与回调 schema 校验。
+// 关键概念：编译器/系统 ABI 的 C 函数指针使用 discriminator 0 的 standard schema，
+//   本模块存储时改用 ptrauth_blend_discriminator 生成的“storage schema”，进出都要转换。
+// 失败语义：PAC 认证是 fail-stop，无效非 NULL 指针可能直接 trap，没有“可空的有效性查询”；
+//   可用 cprisk_pac_is_arm64e_supported() 与返回值区分“不支持”和“认证通过”。
+// 线程模型：无锁；最近一次操作结果以原子覆盖方式写入 s_last_pac_flags，
+//   并发调用只保证“读到某一次完整结果”，不保证与调用顺序对应。
+// 平台限制：仅 arm64e 且带 ptrauth.h 时真实执行；其他平台为原样返回的降级桩。
+
 #include "include/CRiskCore.h"
 
 #include <stdbool.h>
@@ -16,18 +25,25 @@
 #define CPRISK_HAS_PTRAUTH_HEADER 0
 #endif
 
+// 只有“arm64e 架构 + 工具链提供 ptrauth.h”才认为 PAC 运行时可用。
+// 该宏是编译期常量：为 0 时下面所有签名/认证都退化为原样返回，不能当作验证。
 #if defined(__arm64e__) && CPRISK_HAS_PTRAUTH_HEADER
 #define CPRISK_PAC_RUNTIME_AVAILABLE 1
 #else
 #define CPRISK_PAC_RUNTIME_AVAILABLE 0
 #endif
 
+// 最近一次 PAC/CFI 操作的状态位（CPRISK_PAC_CFI_FLAG_*）。
+// 每次调用整体覆盖而非按位累加；原子类型避免并发写入撕裂。
 static atomic_uint_fast32_t s_last_pac_flags = CPRISK_PAC_CFI_FLAG_NONE;
 
+// 自检用已知函数：输入输出确定，便于验证“签名→认证→调用”链路是否完好。
 static uint64_t cprisk_pac_probe_callback_i(uint64_t seed) {
     return (seed ^ 0x9E3779B97F4A7C15ULL) + 0xA24BAED4963EE407ULL;
 }
 
+// 把调用方提供的 discriminator 与本函数地址混合：地址随 ASLR/进程不同，
+// 使同一逻辑用途在不同进程/不同调用点得到不同签名，降低跨进程伪造价值。
 static inline uintptr_t cprisk_pac_blend_discriminator(uintptr_t discriminator) {
 #if CPRISK_PAC_RUNTIME_AVAILABLE
     return ptrauth_blend_discriminator((void *)&cprisk_pac_blend_discriminator, discriminator);
@@ -36,6 +52,9 @@ static inline uintptr_t cprisk_pac_blend_discriminator(uintptr_t discriminator) 
 #endif
 }
 
+// 把标准 ABI 签名的函数指针转签为“本模块 storage schema”。
+// NULL 原样返回；非 arm64e 原样返回（不做签名，调用方需自行判断能力）。
+// 认证-重签过程对非法输入是 fail-stop，不会返回一个“看起来有效”的指针。
 void *cprisk_pac_sign_function_pointer(const void *ptr, uintptr_t discriminator) {
     if (ptr == NULL) {
         return NULL;
@@ -66,6 +85,10 @@ void *cprisk_pac_sign_function_pointer(const void *ptr, uintptr_t discriminator)
  * a no-op fallback, NOT a verification. Callers that need real validation
  * must check cprisk_pac_is_arm64e_supported() / the -1 return of
  * cprisk_pac_validate_indirect_call_target() instead of trusting this. */
+// 把本模块 storage schema 的指针认证回标准 ABI 签名，供真正调用使用。
+// 非 arm64e 上是 no-op 降级，返回值与输入相同——这不是验证结果；
+// 需要“是否可信”的结论时，必须调用 cprisk_pac_validate_indirect_call_target()。
+// 对已损坏的非 NULL 签名，ptrauth 可能直接 trap（fail-stop），没有可用的非捕获查询。
 void *cprisk_pac_auth_function_pointer(const void *ptr, uintptr_t discriminator) {
     if (ptr == NULL) {
         return NULL;
@@ -84,6 +107,7 @@ void *cprisk_pac_auth_function_pointer(const void *ptr, uintptr_t discriminator)
 #endif
 }
 
+// 编译期能力查询：1 = 真实 PAC 路径；0 = 所有签名/认证都是原样返回的桩。
 int cprisk_pac_is_arm64e_supported(void) {
 #if CPRISK_PAC_RUNTIME_AVAILABLE
     return 1;
@@ -100,6 +124,10 @@ int cprisk_pac_is_arm64e_supported(void) {
  * Returns 0 after authentication, -1 for NULL or an unavailable platform.
  * Invalid non-NULL signatures may trap. There is no supported non-trapping
  * PAC validity query, and no negative-authentication probe is performed. */
+// 对“外部已签名”的间接调用目标做真实认证（按传入 discriminator 原样认证）。
+// 不做 sign-then-auth：自己签自己验恒成功，证明不了输入指针的任何性质。
+// 返回 0 = 认证通过；-1 = NULL 或平台无 PAC（并置 AUTH_FAILED）；
+// 非 NULL 的伪造签名可能触发 PAC trap，不会走到返回值。
 int cprisk_pac_validate_indirect_call_target(const void *func_ptr, uintptr_t discriminator) {
     if (func_ptr == NULL) {
         atomic_store(&s_last_pac_flags, CPRISK_PAC_CFI_FLAG_AUTH_FAILED);
@@ -130,6 +158,9 @@ int cprisk_pac_validate_indirect_call_target(const void *func_ptr, uintptr_t dis
 /* SELF-TEST ONLY (not validation): signs a known-good internal pointer
  * and authenticates it back. A pass here proves the PAC mechanism works;
  * it says nothing about any externally-supplied pointer. */
+// 机制自检（不是指针校验）：内部已知函数 → 签名 → 认证 → 实际调用并比对结果。
+// 返回 0 = 通过，或平台无 PAC（此时置 UNAVAILABLE，0 不代表“安全”）；
+// 返回 1 = 签名/认证/调用结果任一不符，并置 SELFTEST_FAILED。
 int cprisk_pac_self_test(uintptr_t discriminator) {
     uint32_t flags = CPRISK_PAC_CFI_FLAG_NONE;
 #if !CPRISK_PAC_RUNTIME_AVAILABLE
@@ -166,11 +197,16 @@ int cprisk_pac_self_test(uintptr_t discriminator) {
 #endif
 }
 
+// 对四个内置 C 回调做“storage schema 往返”校验：sign→auth 后必须还原为同一指针。
+// 只验证签名编码/解码一致性，不验证回调代码字节或来源，不能当作完整性证明。
+// 返回 0 = 通过或平台无 PAC（置 UNAVAILABLE）；1 = 任一失败（置 CALLBACK_VALIDATION_FAILED）。
 int cprisk_pac_validate_core_callbacks(void) {
 #if !CPRISK_PAC_RUNTIME_AVAILABLE
     atomic_store(&s_last_pac_flags, CPRISK_PAC_CFI_FLAG_UNAVAILABLE);
     return 0;
 #else
+    // 每个内置回调使用独立的 ASCII 常量 discriminator（"CPRISKF" 起递增），
+    // 避免不同回调共用签名、被互相替换后仍能认证通过。
     struct {
         const void *pointer;
         uintptr_t discriminator;
@@ -211,6 +247,8 @@ int cprisk_pac_validate_core_callbacks(void) {
 #endif
 }
 
+// 读取最近一次 PAC/CFI 操作的状态位；0 表示该次操作无错误，
+// 但调用方仍需结合 cprisk_pac_is_arm64e_supported() 判断“无错误”是否来自降级桩。
 uint32_t cprisk_get_last_pac_cfi_flags(void) {
     return (uint32_t)atomic_load(&s_last_pac_flags);
 }

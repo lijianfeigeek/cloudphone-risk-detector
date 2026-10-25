@@ -1,3 +1,9 @@
+// cprisk_vm_oph_dead.c — 死处理器池：32 个签名合法、永不进入真实字节码的 handler。
+// 作用：把可达 handler 地址空间从约 40 扩到 88+，使动态分析无法建立“一个 opcode 一个地址”的映射。
+// 每个 handler 有唯一混合常量与不同指令序列，避免链接器 ICF/去重把它们合并成一个函数。
+// 会话开始时由 cprisk_vm_dead_touch_i 把所有地址折叠进 session_mix，同时防止 --gc-sections 裁剪。
+// 不变量：所有 dead handler 必须与 unknown 行为一致（LEAVE + POISON），否则会被行为特征区分。
+// 线程模型：touch 每次会话调用一次；dead handler 本身无共享状态。
 /*
  * cprisk_vm_oph_dead.c
  * CRiskCore
@@ -32,6 +38,9 @@
 #include "include/cprisk_vm_interpreter_ops.h"
 #include "include/cprisk_vm_oph_dead.h"
 
+// DEAD_BODY(id, K)：生成 cprisk_vm_oph_dead_<id>。宏体使用反斜杠续行，注释只能写在这里，
+// 不能插入宏内部；K 必须全局唯一，否则 32 个函数体可能被编译器合并，削弱地址空间膨胀效果。
+// 宏体内保留一次 opaque_chain 的可见写入，防止编译器把 dead handler 优化成空函数。
 /* Each dead handler uses a unique mixing constant so its code body differs. */
 #define DEAD_BODY(id, K)                                                        \
 static cprisk_vm_flow_t cprisk_vm_oph_dead_##id(                                \
@@ -41,7 +50,7 @@ static cprisk_vm_flow_t cprisk_vm_oph_dead_##id(                                
     (void)logical; (void)imm; (void)pc;                                         \
     const uint32_t fold =                                                        \
         (uint32_t)op_raw ^ hvar ^ fr->opaque_chain ^ fr->session_mix ^ (K);    \
-    fr->opaque_chain ^= fold;   /* visible side-effect prevents elimination */  \
+    fr->opaque_chain ^= fold;     \
     fr->out->poison_flags |= CPRISK_VM_POISON_UNKNOWN_OPCODE;                   \
     return CPRISK_VM_FLOW_LEAVE;                                                 \
 }
@@ -99,15 +108,19 @@ DEAD_BODY(1f, 0xFFFFFFFFu)
  * reference so the address loads do NOT appear as a contiguous block of
  * ADRP+ADD pairs that an attacker could pattern-match in __text.
  */
+// CPRISK_VM_DEAD_FOLD_ONE：取单个 handler 地址，做三段移位异或后再 ROTL32(5)。
+// 同样禁止在宏体内加注释（会截断反斜杠续行）；地址通过 &fn 就地取得，不落任何静态指针表。
 #define CPRISK_VM_DEAD_FOLD_ONE(fold_var, fn)                                  \
     do {                                                                       \
         const uintptr_t _cprisk_addr = (uintptr_t)(const void *)&(fn);          \
         (fold_var) ^= (uint32_t)_cprisk_addr;                                   \
         (fold_var) ^= (uint32_t)(_cprisk_addr >> 17u);                          \
         (fold_var) ^= (uint32_t)(_cprisk_addr >> 32u);                          \
-        (fold_var)  = ((fold_var) << 5u) | ((fold_var) >> 27u);   /* ROTL32 5 */ \
+        (fold_var)  = ((fold_var) << 5u) | ((fold_var) >> 27u);    \
     } while (0)
 
+// 入口约定：帧初始化完成后、第一次分发之前调用一次；只异或 session_mix，不改 acc/steps/PC。
+// 折叠必须覆盖全部 CPRISK_VM_DEAD_HANDLER_COUNT 个地址，漏掉会削弱会话熵与布局绑定强度。
 void cprisk_vm_dead_touch_i(cprisk_vm_interp_frame_t *fr) {
     uint32_t fold = 0x4C4C4C4Cu;
 
@@ -149,6 +162,8 @@ void cprisk_vm_dead_touch_i(cprisk_vm_interp_frame_t *fr) {
     CPRISK_VM_DEAD_FOLD_ONE(fold, cprisk_vm_oph_dead_1e);
     CPRISK_VM_DEAD_FOLD_ONE(fold, cprisk_vm_oph_dead_1f);
 
+    // 折叠结果绑定会话熵：二进制被改写导致地址漂移时 session_mix 随之变化，
+    // 进而影响 vv_select_index 与后续所有变体选择（低强度完整性信号）。
     fr->session_mix ^= fold;
 }
 

@@ -9,6 +9,11 @@
  * currently being traced (debugger attached).
  */
 
+// 本文件是反调试聚合层：直接 SVC 的 deny-attach、sysctl P_TRACED、Mach 异常端口与
+// task_for_pid 观测共同构成快慢两条探针路径，并由交叉校验识别 DBI/注入器。
+// 线程模型：跨调用状态均为 atomic；deny-attach stub 重定位完成后页面只读，可并发调用。
+// 平台：deny-attach 仅 arm64 iOS 真机生效；模拟器与非 arm64 整体降级为返回 0（fail-open）。
+// 失败语义：查询失败按“未附加调试器”处理；只有明确的快慢路径不一致才累计 streak 并投毒。
 #include "include/CRiskCore.h"
 
 #if defined(__APPLE__)
@@ -25,6 +30,8 @@
 #include "include/cprisk_instruction_cache.h"
 #endif
 
+// deny-attach 的设备可用性开关：必须同时满足 arm64、iOS 且非模拟器；
+// 内核 trap 路径在模拟器上不保证存在，强行走 SVC 会得到不可预期的错误。
 #if (defined(__arm64__) || defined(__aarch64__)) && defined(__APPLE__) && \
     (defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && \
     (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
@@ -33,12 +40,22 @@
 #define CPRISK_DENY_ATTACH_DEVICE_AVAILABLE 0
 #endif
 
+/// 尽力拒绝调试器 attach 到当前进程；忽略错误码。
+/// - Returns: 无返回值。失败时进程仍继续运行（fail-open），由上层状态接口另行核对。
+/// - Thread safety: 只调用无状态的 SVC 包装或重定位后的只读 stub，可并发调用。
 void cprisk_deny_attach(void) {
     (void)cprisk_deny_attach_status(NULL);
 }
 
+// 捕获/校验的 stub 快照长度（48 字节 = 3 个 16 字节 chunk），覆盖函数入口到 SVC 的关键指令。
 #define CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES 48u
 
+/// deny-attach 的 SVC 直调模板，也是重定位与完整性校验的原始副本。
+/// - 参数：error_out 可为 NULL；非 NULL 时失败写入内核返回码（即 x0）。
+/// - Returns: 成功返回内核返回值（通常 0）；失败返回 -1 并置 error_out。
+/// - Thread safety: 无全局状态，可重入。
+/// - Platform: 仅 arm64 iOS 真机执行 `svc #0x80`；其他平台写 0 并返回 0。
+/// - 说明：绕过 libc/ptrace 等用户态 hook 面，直接走 BSD syscall 路径。
 static int cprisk_deny_attach_status_template(int *error_out) {
 #if CPRISK_DENY_ATTACH_DEVICE_AVAILABLE
     register long x0 __asm("x0") = 31;  /* PT_DENY_ATTACH */
@@ -77,17 +94,27 @@ static int cprisk_deny_attach_status_template(int *error_out) {
 #endif
 }
 
+// 当前使用的 deny-attach 实现：初始指向模板；constructor(3) 成功后改指向随机偏移的 RX 副本。
+// 写入发生在任何正常调用之前，读取端不加锁；指针本身按机器字对齐，发布是原子的。
 static int (*s_deny_attach_fn)(int *) = cprisk_deny_attach_status_template;
 
 #if CPRISK_DENY_ATTACH_DEVICE_AVAILABLE
 
+// 重定位后的 RX stub 页：pg 由本文件拥有且永不释放（进程生命周期），
+// size 为映射长度，offset 为 stub 在页内的 4 字节对齐偏移（随机化以对抗签名扫描）。
 static void *s_deny_rx_page;
 static size_t s_deny_rx_page_size;
 static uintptr_t s_deny_rx_offset;
+// 页面与 stub 的参考哈希。页面哈希混合了 offset 与固定盐，roll 哈希覆盖 stub 的两个重叠半区，
+// 用于发现页内容被改写或 stub 被整体搬移。
 static uint64_t s_deny_rx_page_hash_ref;
 static uint64_t s_deny_rx_stub_roll_ref;
+// 重定位完成标志：constructor(3) 在所有字段发布后置 1；其他线程据此选择 RX 副本或模板。
 static volatile int s_deny_reloc_ready;
 
+/// FNV-1a 64 位哈希，用于低成本的页/stub 完整性参考值（非密码学用途）。
+/// - Parameters: p/n 为待哈希区间；调用方保证可读。
+/// - Returns: 64 位哈希；无分配、无状态，可重入。
 static uint64_t cprisk_deny_fnv1a64_i(const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *)p;
     uint64_t h = 14695981039346656037ULL;
@@ -98,6 +125,12 @@ static uint64_t cprisk_deny_fnv1a64_i(const void *p, size_t n) {
     return h;
 }
 
+/// constructor(3)：把 deny-attach stub 复制到匿名页的随机偏移，改为 RX 后作为实际实现。
+/// - 优先级 3 保证在常规业务 constructor 之前完成；失败时保留模板指针，功能仍然可用。
+/// - 步骤：匿名可写页 → 随机 4 字节对齐偏移 → 复制 48 字节 → 刷 I-cache →
+///   mprotect(RX) → 计算页/半区哈希 → 发布指针与参考值。
+/// - Thread safety: 仅构造期单线程执行；发布后页面只读，读者无锁。
+/// - 失败语义：任一系统调用失败即回退模板（fail-open），不终止进程。
 __attribute__((constructor(3)))
 static void cprisk_deny_attach_rx_reloc_ctor_i(void) {
     const size_t ps = (size_t)getpagesize();
@@ -117,24 +150,29 @@ static void cprisk_deny_attach_rx_reloc_ctor_i(void) {
     const uintptr_t max_off = ps - CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES - 8u;
     const uintptr_t off = (uintptr_t)((r % (max_off / 4u)) * 4u);
     memcpy((uint8_t *)pg + off, (const void *)&cprisk_deny_attach_status_template, CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES);
+// 必须先刷 I-cache 再改成可执行：否则 CPU 可能执行到该地址上的陈旧指令。
     cprisk_flush_instruction_cache((uint8_t *)pg + off, CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES);
 
     int mperr = 0;
+// 直接 mprotect 避免用户态 hook；失败则丢弃该页并继续使用模板。
     if (cprisk_mprotect_direct(pg, ps, PROT_READ | PROT_EXEC, &mperr) != 0) {
         munmap(pg, ps);
         return;
     }
 
+// 页面哈希混入随机偏移与固定盐，防止攻击者把 stub 原样复制到另一偏移后仍通过校验。
     uint64_t h = cprisk_deny_fnv1a64_i(pg, ps);
     h ^= (uint64_t)off << 40;
     h ^= 0x3D3C2B1A0F0E0D0CULL;
 
+// stub roll 哈希覆盖前半与后半（带重叠），任何局部改写都会改变至少一个半区的哈希。
     const uint8_t *pd = (const uint8_t *)pg + off;
     uint64_t roll = cprisk_deny_fnv1a64_i(pd, CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES);
     roll ^= cprisk_deny_fnv1a64_i(
         pd + CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES / 4u,
         CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES - CPRISK_DENY_ATTACH_STUB_SNAPSHOT_BYTES / 4u);
 
+// 先写页面/哈希等从属字段，最后发布函数指针和 ready 标志，避免读者看到半初始化状态。
     s_deny_rx_page = pg;
     s_deny_rx_page_size = ps;
     s_deny_rx_offset = off;
@@ -145,20 +183,36 @@ static void cprisk_deny_attach_rx_reloc_ctor_i(void) {
 }
 #endif
 
+/// 调用当前的 deny-attach 实现并返回其结果。
+/// - Parameters: error_out 语义同 cprisk_deny_attach_status_template()，允许 NULL。
+/// - Returns: 成功为内核返回值；失败为 -1。构造期之前调用会自动落到模板，仍然安全。
+/// - Thread safety: 可并发调用；实现指针只在构造期切换一次。
 int cprisk_deny_attach_status(int *error_out) {
     return s_deny_attach_fn(error_out);
 }
 
+// stub 完整性按 3 个 chunk × 16 字节校验；每次检查 1 个 chunk，每第 4 次做全量。
 #define CPRISK_DENY_ATTACH_CHUNKS 3u
 #define CPRISK_DENY_ATTACH_CHUNK 16u
 
+// 构造期(8)计算出的每 chunk 期望哈希；text_ready 置位后只读。
 static uint64_t s_cprisk_deny_attach_chunk_expected[CPRISK_DENY_ATTACH_CHUNKS];
+// 快照采集完成标志：未置位前完整性检查返回 0，避免拿未初始化的期望值误判。
+// 单写多读，arm64 上对齐 int 的发布是原子的。
 static volatile int s_cprisk_deny_attach_text_ready = 0;
+// 检查轮转计数：决定本次校验单个 chunk 还是全部 chunk，兼顾覆盖率与开销。
 static atomic_uint_fast32_t s_cprisk_deny_attach_stub_tick;
 
+// SHA-256 参考值与构造期采集逻辑只在 arm64 Apple 上存在；
+// 其他平台由文件末尾的桩返回 0/零摘要。
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
 static uint8_t s_deny_page_sha256_ref[32];
 
+/// constructor(8)：在 deny-attach 重定位完成之后，冻结 stub 的完整性参考值。
+/// - 源选择：重定位成功则取 RX 页内的实际 stub，否则取 __TEXT 中的模板；
+/// - 记录：3 个 chunk 的 FNV 哈希（混入 stub 基址，防止整段搬移）与整页 SHA-256；
+/// - 最后置 text_ready，之后参考值不再变化。
+/// - Thread safety: 仅构造期单线程执行。
 __attribute__((constructor(8)))
 static void cprisk_svc_stub_capture_deny_attach_i(void) {
 #if CPRISK_DENY_ATTACH_DEVICE_AVAILABLE
@@ -180,6 +234,11 @@ static void cprisk_svc_stub_capture_deny_attach_i(void) {
 }
 #endif
 
+/// 校验 deny-attach stub 是否仍保持构造期形态。
+/// - 检查顺序：页哈希 → stub 半区 roll 哈希 → chunk 哈希（轮转/全量）→ SVC 操作码仍存在；
+/// - Returns: 任一不符返回 1（疑似被 patch/hook/搬移）；未初始化或全部通过返回 0。
+/// - Thread safety: 只读 RX 页与已发布参考值；轮转计数为 atomic，可并发调用。
+/// - 失败语义：无法校验时返回 0，不单独作为风险；调用方应结合其它信号判断。
 uint32_t cprisk_deny_attach_stub_integrity_mask(void) {
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     if (!s_cprisk_deny_attach_text_ready) {
@@ -266,6 +325,10 @@ uint32_t cprisk_deny_attach_stub_integrity_mask(void) {
 }
 
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+/// 计算当前实际使用的 deny-attach stub 所在文本页的 SHA-256。
+/// - Parameters: out_digest 为调用方提供的 32 字节缓冲；NULL 时直接返回。
+/// - 源选择：重定位成功取 RX 页内 stub，否则取模板；不可用平台写 32 字节 0。
+/// - Thread safety: 只读，可重入。
 void cprisk_deny_attach_stub_page_sha256_digest(uint8_t out_digest[32]) {
     if (!out_digest) {
         return;
@@ -283,6 +346,8 @@ void cprisk_deny_attach_stub_page_sha256_digest(uint8_t out_digest[32]) {
 #endif
 }
 
+/// 比较当前 stub 页的 SHA-256 与构造期参考值。
+/// - Returns: 不一致返回 (1u << 5) 作为异常位；一致或不支持返回 0。
 uint32_t cprisk_deny_attach_stub_sha256_page_mask(void) {
 #if (defined(__arm64__) || defined(__aarch64__)) && defined(__APPLE__)
     uint8_t live[32];
@@ -293,18 +358,22 @@ uint32_t cprisk_deny_attach_stub_sha256_page_mask(void) {
 #endif
 }
 #else
+// 非 arm64 Apple：无法读取/校验 stub 页，摘要写零。
 void cprisk_deny_attach_stub_page_sha256_digest(uint8_t out_digest[32]) {
     if (out_digest) {
         memset(out_digest, 0, 32);
     }
 }
 
+// 非 arm64 Apple：不产生页级异常位。
 uint32_t cprisk_deny_attach_stub_sha256_page_mask(void) {
     return 0u;
 }
 #endif
 
+// 最近一次 fast/slow 交叉校验是否不一致（1=不一致），供聚合入口无重复探测地读取。
 static atomic_uint_fast32_t s_trace_crosscheck_inconsistent = 0u;
+// 连续不一致的观测次数；达到 2 次且 slow 路径也判定可疑时触发 anti-debug 通道投毒。
 static atomic_uint_fast32_t s_trace_crosscheck_streak = 0u;
 /*
  * Anti-debug review weakness #2: previously `s_mach_port_baseline` was
@@ -322,11 +391,18 @@ static atomic_uint_fast32_t s_trace_crosscheck_streak = 0u;
  * least 5–6 of the 8 samples.
  */
 #define CPRISK_MACH_PORT_BASELINE_CALIB_SAMPLES 8u
+// Mach 端口基线：baseline 为校准后提交的稳态端口数，baseline_min 为校准窗口内的运行最小值，
+// baseline_samples 为已完成的校准样本数。最小值模型使攻击者无法通过持续高端口数压低基线。
 static atomic_uint_fast32_t s_mach_port_baseline = 0u;
 static atomic_uint_fast32_t s_mach_port_baseline_min = 0u;
 static atomic_uint_fast32_t s_mach_port_baseline_samples = 0u;
+// slow 路径调用计数：用于让线程异常端口检查与 DBI 足迹检查按固定周期抽样，控制开销。
 static atomic_uint_fast32_t s_trace_probe_counter = 0u;
 
+/// 仅通过 sysctl(KERN_PROC_PID) 检查 P_TRACED。
+/// - Returns: P_TRACED 置位返回 1；未置位或查询失败返回 0（失败不判风险）。
+/// - Thread safety: 无全局状态，可并发调用。
+/// - 说明：MIB 常量在运行时用 XOR 还原，避免静态整数特征被直接匹配。
 int cprisk_is_being_traced_sysctl_only(void) {
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
     int mib[4];
@@ -351,6 +427,12 @@ int cprisk_is_being_traced_sysctl_only(void) {
 #endif
 }
 
+/// Mach 层可疑度聚合：异常端口、task_for_pid 计数、线程端口、端口数量突增。
+/// - 计分：task_get_exception_ports 查询失败 +1；extmod 中 task_for_pid_count>0 +1；
+///   线程级异常端口不匹配 +2；端口数超过基线 64 个 +1；
+/// - 端口基线采用前 8 次观测的最小值，校准窗口内不告警，防止 attach 发生在首次探测前；
+/// - Returns: 任一项计分大于 0 返回 1，否则 0。
+/// - Thread safety: 校准与基线均为 atomic，CAS 收敛；查询得到的端口权在函数内释放。
 int cprisk_mach_trace_suspicious(void) {
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
     int suspicious = 0;
@@ -473,14 +555,21 @@ int cprisk_mach_trace_suspicious(void) {
 #endif
 }
 
+/// 返回最近一次交叉校验的不一致状态：1=fast/slow 结果相反，0=一致或尚未运行。
 int cprisk_trace_crosscheck_inconsistent(void) {
     return atomic_load(&s_trace_crosscheck_inconsistent) != 0u ? 1 : 0;
 }
 
+/// fast 路径：只做 sysctl P_TRACED，开销最小，可高频调用。
+/// - Returns: 1=已附加调试器，0=未发现或查询失败。
 static int cprisk_trace_probe_fast_i(void) {
     return cprisk_is_being_traced_sysctl_only() != 0 ? 1 : 0;
 }
 
+/// slow 路径：Mach 可疑度 + 周期性线程异常端口检查 + 周期性 DBI 足迹检查。
+/// - 抽样：每第 4 次检查线程异常端口，每第 8 次检查 DBI 标记，兼顾覆盖与开销；
+/// - Returns: 1=发现任一可疑信号，0=全部正常。
+/// - Thread safety: 计数器 atomic；内部查询均只读。
 static int cprisk_trace_probe_slow_i(void) {
     int suspicious = 0;
     if (cprisk_mach_trace_suspicious() != 0) {
@@ -503,6 +592,12 @@ static int cprisk_trace_probe_slow_i(void) {
     return suspicious;
 }
 
+/// fast/slow 聚合与 streak 维护。
+/// - inconsistent 时 streak++，连续 2 次且 slow 路径也可疑时调用
+///   cprisk_integrity_poison_antidebug_lane()，让绕过方拿到被污染的结果；
+/// - 一致时清零 streak；
+/// - Returns: fast 或 slow 任一路径判定，或 streak>=2 时返回 1。
+/// - Thread safety: 状态均为 atomic；并发调用可能重复投毒，但语义幂等。
 static int cprisk_trace_eval_aggregate_i(void) {
 #if defined(__APPLE__) && (!defined(TARGET_OS_SIMULATOR) || !TARGET_OS_SIMULATOR)
     const int fast_traced = cprisk_trace_probe_fast_i();
@@ -530,6 +625,8 @@ static int cprisk_trace_eval_aggregate_i(void) {
 #endif
 }
 
+/// 反调试主入口：执行 fast/slow 聚合。
+/// - Returns: 1=疑似调试/注入，0=未发现。查询失败不会单独导致 1。
 int cprisk_is_being_traced(void) {
     return cprisk_trace_eval_aggregate_i();
 }
@@ -538,10 +635,14 @@ int cprisk_is_being_traced(void) {
  * Redundant export: identical semantics via shared static aggregate to dilute
  * single-symbol hook value (call-sites can alternate without changing logic).
  */
+/// 与 cprisk_is_being_traced() 同语义的冗余导出；
+/// 多一个调用符号可稀释单点 hook 的价值，调用方可交替使用。
 int cprisk_is_being_traced_alt(void) {
     return cprisk_trace_eval_aggregate_i();
 }
 
+/// 冗余入口：先看 sysctl 与 Mach 直接信号，再回退到聚合入口。
+/// - Returns: 任一直接检查命中返回 1；否则返回 cprisk_is_being_traced_alt()。
 int cprisk_is_being_traced_redundant(void) {
     const int traced_sys = cprisk_is_being_traced_sysctl_only();
     const int traced_mach = cprisk_mach_trace_suspicious();
@@ -551,6 +652,12 @@ int cprisk_is_being_traced_redundant(void) {
     return cprisk_is_being_traced_alt();
 }
 
+/// 校验 deny-attach 是否真正生效，并检测 sysctl 读取结果是否稳定。
+/// - 参数：deny_attach_rc / deny_attach_errno 来自调用方的 deny-attach 结果；detail_bits_out 可为 NULL。
+/// - 检查：连续 3 次读取自身 kinfo_proc 的 pid/flag 一致性、大小、P_TRACED、
+///   第 4 次读取的 PID/P_TRACED 是否漂移，以及 deny-attach 是否返回错误。
+/// - Returns: detail_bits 非零返回 1（疑似 hook/绕过或 deny-attach 失效）；rc!=0 直接返回 0。
+/// - Thread safety: 无共享状态；sysctl 为只读查询，可并发调用。
 int cprisk_deny_attach_effective_verify(int deny_attach_rc, int deny_attach_errno, uint32_t *detail_bits_out) {
     uint32_t detail_bits = 0u;
     if (detail_bits_out != NULL) {
@@ -595,6 +702,8 @@ int cprisk_deny_attach_effective_verify(int deny_attach_rc, int deny_attach_errn
             detail_bits |= CPRISK_DENY_ATTACH_VERIFY_SELF_PID_MISMATCH;
         }
     }
+// 第 4 次读取用于发现 sysctl 返回值在多次调用间漂移（典型 hook 特征），
+// 命名沿用历史 "libc_shadow"，实际同样走直调包装。
     int libc_sys_err = 0;
     if (cprisk_sysctl_direct(mib, 4, &libc_shadow, &sz_libc, NULL, 0, &libc_sys_err) == 0) {
         if ((pid_t)libc_shadow.kp_proc.p_pid != (pid_t)a.kp_proc.p_pid ||
@@ -619,6 +728,7 @@ int cprisk_deny_attach_effective_verify(int deny_attach_rc, int deny_attach_errn
         ((uint32_t)b.kp_proc.p_flag & (uint32_t)P_TRACED) != 0u) {
         detail_bits |= CPRISK_DENY_ATTACH_VERIFY_TRACE_FLAG_SET;
     }
+// deny-attach 自身返回错误也视为失败/绕过信号，而不只是 sysctl 不一致。
     if (deny_attach_errno != 0) {
         detail_bits |= CPRISK_DENY_ATTACH_VERIFY_LIBC_DIRECT_DIVERGENCE;
     }
@@ -634,6 +744,13 @@ int cprisk_deny_attach_effective_verify(int deny_attach_rc, int deny_attach_errn
 #endif
 }
 
+/// AMFI/code-signing 看门狗探针：采集 csops 状态与 task_for_pid 是否意外成功。
+/// - 输出（均可为 NULL，进入时先清零）：
+///   - cs_flags_out：csops 返回的 CS_* 位；
+///   - get_task_allow_suspect_out：task_for_pid(self) 成功时置 1，暗示具备 get-task-allow 类能力；
+///   - amfi_anomaly_bits_out：CS_DEBUGGED、CS_VALID/CS_HARD/CS_KILL 缺失等异常位。
+/// - Thread safety: 无共享状态，可并发调用。
+/// - Platform: 仅 arm64 iOS 真机分支有实际逻辑；其他平台只清零输出。
 void cprisk_amfi_entitlement_watchdog_probe(
     uint32_t *cs_flags_out,
     uint32_t *get_task_allow_suspect_out,
@@ -650,6 +767,7 @@ void cprisk_amfi_entitlement_watchdog_probe(
     }
 
 #if CPRISK_DENY_ATTACH_DEVICE_AVAILABLE
+// 旧 SDK 兜底定义；数值与 XNU cs_blobs.h 保持一致，仅本文件使用。
 #ifndef CS_VALID
 #define CS_VALID 0x00000001u
 #endif
@@ -686,7 +804,10 @@ void cprisk_amfi_entitlement_watchdog_probe(
     }
 
     mach_port_t tport = MACH_PORT_NULL;
+// 正常第三方 App（无 get-task-allow）对自身调用 task_for_pid 也应失败；
+// KERN_SUCCESS 说明存在调试类 entitlement 或能力被暴露到用户态，因此记为可疑。
     const kern_return_t kr = task_for_pid(mach_task_self(), cprisk_getpid_direct(), &tport);
+// 成功拿到的端口若不是当前任务端口，需要归还端口权，避免端口权泄漏。
     if (tport != MACH_PORT_NULL && tport != mach_task_self()) {
         (void)mach_port_deallocate(mach_task_self(), tport);
     }
